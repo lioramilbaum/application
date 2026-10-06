@@ -29,24 +29,31 @@ The key concept is **digest-pinned images**. At build time, the OCM component re
 
 ## Prerequisites
 
-- OCM CLI v2 ≥ 0.17.0 (`make tools` downloads it into `bin/`)
+- OCM CLI v2 ≥ 0.17.0
+- kind
+- `make`
+- `shellcheck` (for linting)
 - `jq`
 - `openssl`
-- `curl` (for fetching OCM binary)
 - `kubectl` (for deploying)
-- `docker` (for `make e2e` only)
-- darwin/arm64 or linux/amd64 platform (for `make tools`)
+- `docker` (for `make e2e` or `make e2e-run` only)
 - Docker Hub access for `make build` and `make test` (to resolve `nginx:1.27-alpine`)
+
+OCM CLI and kind are provided by the devcontainer image. Outside the devcontainer, put `ocm` and `kind` on your PATH.
+
+The `.devcontainer/` directory provides all required tools when used with Docker Desktop or a compatible Docker host and devcontainers CLI.
 
 ## Lifecycle
 
 ```bash
-make tools           # download OCM CLI and kind binary
 make build           # build the OCM component archive (CTF)
 make sign            # sign with an auto-generated dev RSA key
 make verify          # verify the signature
 make manifests       # download and render app manifests from the component
 make deploy          # deploy the application to the current cluster (requires KUBECONFIG)
+make cluster-up      # create or reuse the kind cluster; writes build/e2e/kubeconfig (requires docker)
+make e2e-run         # run e2e against an existing cluster
+make cluster-down    # delete the kind cluster
 make e2e             # spin up kind cluster, deploy, verify pod ready, tear down (requires docker)
 make publish OCM_REPO=ghcr.io/<you>/ocm  # transfer to an OCI registry
 ```
@@ -94,9 +101,20 @@ make e2e KEEP_CLUSTER=1
 # To delete: kind delete cluster --name ocm-application
 ```
 
+For advanced scenarios (e.g., CI with a pre-provisioned cluster), use the separate targets:
+
+```bash
+make cluster-up      # Create or reuse the ocm-application cluster
+make build sign      # Build and sign the component
+make e2e-run         # Run e2e tests against the cluster (only tears down if it created the cluster)
+make cluster-down    # Delete the cluster
+```
+
+The `e2e.sh` script automatically detects whether the cluster existed before this run and only tears it down if this run created it. This allows reusing pre-existing clusters in CI environments.
+
 ## Version management
 
-When Renovate bumps the OCM CLI version in `scripts/fetch-ocm.sh` or the kind version in `scripts/fetch-kind.sh`, the corresponding SHA256 constant (`OCM_CLI_SHA256_DARWIN_ARM64` or `KIND_SHA256_DARWIN_ARM64`) must be manually updated to match the new release. Renovate can only update version numbers; computing and verifying SHA256 checksums requires manual verification against the release artifacts.
+Renovate bumps `OCM_CLI_VERSION` and `KIND_VERSION` in `.devcontainer/Dockerfile`. The matching `*_SHA256_LINUX_{AMD64,ARM64}` ARGs must be updated by hand to match the new release. Renovate can only update version numbers; computing and verifying SHA256 checksums requires manual verification against the release artifacts.
 
 ## Real signing keys
 
@@ -118,13 +136,17 @@ Tests include:
 - Manifest rendering with digest-pinned images
 - Deploy workflow and error handling
 - Script resource download and bundle self-containedness
-- Checksum validation for binary downloads
 
 ## CI
 
-CI runs on `ubuntu-latest` (linux/amd64). Lint and test run on every push and pull request. Tests require Docker Hub access to resolve the nginx image. E2E tests are not run in CI (no Docker in the runner).
+CI runs on `ubuntu-latest` (linux/amd64) inside the devcontainer across three workflows:
+
+- **`ci.yaml`** — runs on every push and pull request to `main`: lint and unit tests.
+- **`release.yaml`** — triggered by a `v*.*.*` tag or `workflow_dispatch` with a semver `version` input. Runs tests, then builds and signs the OCM component with `OCM_SIGNING_KEY`, uploads a `application-ctf` artifact, and on tags publishes the component to `ghcr.io/<owner>/ocm` and creates a GitHub release.
+- **`e2e.yaml`** — runs on every push and pull request to `main`. A `package` job builds and signs the component with an auto-generated dev key and uploads it; a `deploy` job downloads it and verifies the signature and deploys it to a kind cluster.
+
+Required repository secrets: `OCM_SIGNING_KEY` (RSA private key PEM).
 
 ## Notes
 
 - `make build` and `make test` require Docker Hub access to resolve `nginx:1.27-alpine`. If Docker Hub is unavailable, builds will fail.
-- `scripts/fetch-ocm.sh` and `scripts/fetch-kind.sh` support darwin/arm64 and linux/amd64. Add a new `case` entry to extend to other platforms.

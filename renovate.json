@@ -7,18 +7,18 @@
   "customManagers": [
     {
       "customType": "regex",
-      "fileMatch": ["^scripts/fetch-ocm\\.sh$"],
+      "fileMatch": ["^\\.devcontainer/Dockerfile$"],
       "matchStrings": [
-        "OCM_CLI_VERSION=\"(?<currentValue>v[0-9.]+)\""
+        "ARG OCM_CLI_VERSION=(?<currentValue>v[0-9]+\\.[0-9]+\\.[0-9]+)"
       ],
       "depNameTemplate": "open-component-model/open-component-model",
       "datasourceTemplate": "github-releases"
     },
     {
       "customType": "regex",
-      "fileMatch": ["^scripts/fetch-kind\\.sh$"],
+      "fileMatch": ["^\\.devcontainer/Dockerfile$"],
       "matchStrings": [
-        "KIND_VERSION=\"(?<currentValue>v[0-9.]+)\""
+        "ARG KIND_VERSION=(?<currentValue>v[0-9]+\\.[0-9]+\\.[0-9]+)"
       ],
       "depNameTemplate": "kubernetes-sigs/kind",
       "datasourceTemplate": "github-releases"

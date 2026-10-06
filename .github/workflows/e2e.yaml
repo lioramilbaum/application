@@ -1,0 +1,76 @@
+name: E2E
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+    branches: ["main"]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: e2e-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  package:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Build, sign, and verify
+        uses: devcontainers/ci@513af61f4de4f75d37e4438f184ba4358f0fc1ca # v0.3.1900000450
+        with:
+          push: never
+          runCmd: make build sign verify
+      - name: Upload signed component
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: application-ctf-dev
+          path: |
+            build/ctf
+            build/keys/public.pem
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 0
+
+  deploy:
+    needs: package
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Download signed component
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: application-ctf-dev
+          path: build
+      - name: Verify artifact contents
+        run: |
+          [[ -d build/ctf && -f build/keys/public.pem ]] || \
+            { echo '::error::signed component or public key missing from artifact'; exit 1; }
+      - name: E2E in devcontainer
+        uses: devcontainers/ci@513af61f4de4f75d37e4438f184ba4358f0fc1ca # v0.3.1900000450
+        with:
+          push: never
+          runCmd: |
+            set -euo pipefail
+            cat > build/verify.ocmconfig <<EOF
+            type: generic.config.ocm.software/v1
+            configurations:
+              - type: credentials.config.ocm.software
+                consumers:
+                  - identity:
+                      type: RSA/v1alpha1
+                      algorithm: RSASSA-PSS
+                      signature: default
+                    credentials:
+                      - type: RSACredentials/v1
+                        publicKeyPEMFile: $PWD/build/keys/public.pem
+            EOF
+            make e2e-run

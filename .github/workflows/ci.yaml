@@ -11,11 +11,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - name: Install dependencies
-        run: sudo apt-get install -y shellcheck jq
-      - name: Install tools
-        run: make tools
-      - name: Lint
-        run: make lint OCM=bin/ocm
-      - name: Test
-        run: make test OCM=bin/ocm
+      - name: Lint and test
+        uses: devcontainers/ci@513af61f4de4f75d37e4438f184ba4358f0fc1ca # v0.3.1900000450
+        with:
+          push: never
+          runCmd: make lint test
