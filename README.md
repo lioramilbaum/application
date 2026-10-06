@@ -34,8 +34,8 @@ The key concept is **digest-pinned images**. At build time, the OCM component re
 - `openssl`
 - `curl` (for fetching OCM binary)
 - `kubectl` (for deploying)
-- `docker` (for `make e2e` only; requires macOS 26 Apple Silicon/darwin-arm64)
-- darwin/arm64 platform (for `make tools`)
+- `docker` (for `make e2e` only)
+- darwin/arm64 or linux/amd64 platform (for `make tools`)
 - Docker Hub access for `make build` and `make test` (to resolve `nginx:1.27-alpine`)
 
 ## Lifecycle
@@ -122,9 +122,9 @@ Tests include:
 
 ## CI
 
-CI runs on macOS 26 Apple Silicon (darwin/arm64). Lint and test run on every push and pull request. Tests require Docker Hub access to resolve the nginx image.
+CI runs on `ubuntu-latest` (linux/amd64). Lint and test run on every push and pull request. Tests require Docker Hub access to resolve the nginx image. E2E tests are not run in CI (no Docker in the runner).
 
 ## Notes
 
 - `make build` and `make test` require Docker Hub access to resolve `nginx:1.27-alpine`. If Docker Hub is unavailable, builds will fail.
-- The OCM binary is platform-specific (darwin/arm64 only). To support other platforms, add additional fetch targets to `scripts/fetch-ocm.sh`.
+- `scripts/fetch-ocm.sh` and `scripts/fetch-kind.sh` support darwin/arm64 and linux/amd64. Add a new `case` entry to extend to other platforms.
