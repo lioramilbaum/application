@@ -6,7 +6,7 @@ RUN apt-get update && export DEBIAN_FRONTEND=noninteractive \
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 
 # Renovate bumps *_VERSION; update the matching *_SHA256_* ARGs by hand.
-ARG OCM_CLI_VERSION=v0.17.0
+ARG OCM_CLI_VERSION=v0.19.0
 ARG OCM_SHA256_LINUX_AMD64=d942e2d5d024e9a5a82f1484ba4303b458d84c0dc9767125bd61cfa96120268f
 ARG OCM_SHA256_LINUX_ARM64=697e44f71ab0dbd02287c6544fa17be0c73c0a9d6e873f9a2c91fd92c9acbc86
 ARG KIND_VERSION=v0.33.0
