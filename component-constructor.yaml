@@ -1,0 +1,60 @@
+components:
+  - name: github.com/lioramilbaum/application
+    version: ${VERSION}
+    provider:
+      name: github.com/lioramilbaum
+    labels:
+      - name: application.lioramilbaum.github.com/tier
+        value: application
+    resources:
+      - name: hello-world-image
+        type: ociImage
+        version: ${VERSION}
+        access:
+          type: OCIImage/v1
+          imageReference: docker.io/library/nginx:1.27-alpine
+      - name: hello-world-manifests
+        type: blob
+        version: ${VERSION}
+        input:
+          type: file
+          path: ./components/hello-world/manifests.yaml
+          mediaType: application/yaml
+      # Deploy-time bundle: consumers download these to deploy the application.
+      # Build-time scripts (build.sh, sign.sh, keys.sh, fetch-ocm.sh, fetch-kind.sh,
+      # publish.sh, e2e.sh) are excluded.
+      - name: component-constructor
+        type: blob
+        version: ${VERSION}
+        input:
+          type: file
+          path: ./component-constructor.yaml
+          mediaType: application/yaml
+      - name: script-lib
+        type: blob
+        version: ${VERSION}
+        input:
+          type: file
+          path: ./scripts/lib.sh
+          mediaType: text/x-shellscript
+      - name: script-verify
+        type: blob
+        version: ${VERSION}
+        input:
+          type: file
+          path: ./scripts/verify.sh
+          mediaType: text/x-shellscript
+      - name: script-manifests
+        type: blob
+        version: ${VERSION}
+        input:
+          type: file
+          path: ./scripts/manifests.sh
+          mediaType: text/x-shellscript
+      - name: script-deploy
+        type: blob
+        version: ${VERSION}
+        input:
+          type: file
+          path: ./scripts/deploy.sh
+          mediaType: text/x-shellscript

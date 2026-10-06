@@ -1,0 +1,36 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": [
+    "config:recommended"
+  ],
+  "separateMajorMinor": false,
+  "customManagers": [
+    {
+      "customType": "regex",
+      "fileMatch": ["^scripts/fetch-ocm\\.sh$"],
+      "matchStrings": [
+        "OCM_CLI_VERSION=\"(?<currentValue>v[0-9.]+)\""
+      ],
+      "depNameTemplate": "open-component-model/open-component-model",
+      "datasourceTemplate": "github-releases"
+    },
+    {
+      "customType": "regex",
+      "fileMatch": ["^scripts/fetch-kind\\.sh$"],
+      "matchStrings": [
+        "KIND_VERSION=\"(?<currentValue>v[0-9.]+)\""
+      ],
+      "depNameTemplate": "kubernetes-sigs/kind",
+      "datasourceTemplate": "github-releases"
+    },
+    {
+      "customType": "regex",
+      "fileMatch": ["^component-constructor\\.yaml$"],
+      "matchStrings": [
+        "imageReference: docker\\.io/library/nginx:(?<currentValue>[^\\s]+)"
+      ],
+      "depNameTemplate": "library/nginx",
+      "datasourceTemplate": "docker"
+    }
+  ]
+}
