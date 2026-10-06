@@ -542,13 +542,48 @@ test_devcontainer_pins_tools() {
   grep -q 'sha256sum -c' "$df" || die "sha256sum -c not found in Dockerfile"
   local rv="$ROOT/renovate.json"
   jq -e '
-    [.customManagers[] | select(.fileMatch[] | test("Dockerfile"))] |
+    [.customManagers[] | select((.managerFilePatterns // .fileMatch)[] | test("Dockerfile"))] |
     (map(select(.matchStrings[] | test("OCM_CLI_VERSION"))) | length) == 1 and
     (map(select(.matchStrings[] | test("KIND_VERSION"))) | length) == 1
   ' "$rv" > /dev/null || die "renovate.json missing Dockerfile ARG managers"
   jq -e '
-    [.customManagers[] | select(.fileMatch[] | test("fetch-"))] | length == 0
+    [.customManagers[] | select((.managerFilePatterns // .fileMatch)[] | test("fetch-"))] | length == 0
   ' "$rv" > /dev/null || die "renovate.json still references fetch- scripts"
+}
+
+test_renovate_updates_ocm_sha256() {
+  local df="$ROOT/.devcontainer/Dockerfile" rv="$ROOT/renovate.json"
+  local ocm_version arch sha
+  ocm_version=$(sed -n 's/^ARG OCM_CLI_VERSION=//p' "$df")
+  [[ -n "$ocm_version" ]] || die "OCM_CLI_VERSION not found in Dockerfile"
+  for arch in AMD64 ARM64; do
+    sha=$(sed -n "s/^ARG OCM_SHA256_LINUX_${arch}=//p" "$df")
+    jq -e -Rs --slurpfile cfg "$rv" --arg arch "$arch" --arg v "$ocm_version" --arg sha "$sha" '
+      . as $df
+      | [ $cfg[0].customManagers[]
+          | select(.datasourceTemplate == "github-release-attachments"
+                   and .depNameTemplate == "open-component-model/open-component-model"
+                   and (.matchStrings[0] | contains("OCM_SHA256_LINUX_" + $arch + "=(?<currentDigest>"))) ]
+      | length == 1
+        and (.[0].matchStrings[0] as $re
+             | [ $df | capture($re; "g") ]
+             | length == 1 and .[0].currentValue == $v and .[0].currentDigest == $sha)
+    ' "$df" > /dev/null || die "renovate.json does not track OCM_SHA256_LINUX_${arch} at ${ocm_version}"
+  done
+  jq -e -Rs --slurpfile cfg "$rv" '
+    . as $df
+    | [ $cfg[0].customManagers[]
+        | select(.depNameTemplate == "open-component-model/open-component-model")
+        | .matchStrings[] as $re
+        | $df | match($re; "g") | [.offset, .offset + .length] ]
+    | sort | . as $s
+    | length == 3 and all(range(1; $s | length); $s[.][0] >= $s[. - 1][1])
+  ' "$df" > /dev/null || die "OCM Renovate matches overlap or are missing"
+  jq -e '
+    [ .packageRules[]?
+      | select((.matchDepNames // []) | index("open-component-model/open-component-model"))
+      | .groupName // empty ] | length == 1
+  ' "$rv" > /dev/null || die "OCM dependencies are not grouped into one PR"
 }
 
 # ── Run all tests ─────────────────────────────────────────────────────────────
@@ -574,6 +609,7 @@ run_test "cluster.sh down deletes cluster" test_cluster_sh_down_deletes_cluster
 run_test "make e2e-run skips build and sign" test_make_e2e_run_skips_build_sign
 run_test "devcontainer config is valid" test_devcontainer_config_is_valid
 run_test "devcontainer pins tools" test_devcontainer_pins_tools
+run_test "renovate updates OCM SHA256 ARGs" test_renovate_updates_ocm_sha256
 
 echo ""
 echo "Results: $PASS passed, $FAIL failed"

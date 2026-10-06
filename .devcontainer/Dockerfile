@@ -5,9 +5,14 @@ RUN apt-get update && export DEBIAN_FRONTEND=noninteractive \
 
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 
-# Renovate bumps *_VERSION; update the matching *_SHA256_* ARGs by hand.
+# Renovate bumps OCM_CLI_VERSION and both OCM_SHA256_* ARGs in one PR (see
+# renovate.json). Each "# renovate: ocm-linux-<arch> <version>" marker must sit
+# directly above its ARG and equal OCM_CLI_VERSION. KIND_SHA256_* ARGs are still
+# updated by hand.
 ARG OCM_CLI_VERSION=v0.17.0
+# renovate: ocm-linux-amd64 v0.17.0
 ARG OCM_SHA256_LINUX_AMD64=d942e2d5d024e9a5a82f1484ba4303b458d84c0dc9767125bd61cfa96120268f
+# renovate: ocm-linux-arm64 v0.17.0
 ARG OCM_SHA256_LINUX_ARM64=697e44f71ab0dbd02287c6544fa17be0c73c0a9d6e873f9a2c91fd92c9acbc86
 ARG KIND_VERSION=v0.33.0
 ARG KIND_SHA256_LINUX_AMD64=aee6151561422756b764a4ae28e7f44cda5af5a9eead3cc9985112b1de8d8e0d
