@@ -105,6 +105,7 @@ _stub_kubectl() {
   cat > "$dir/stub-bin/kubectl" <<'EOF'
 #!/usr/bin/env bash
 echo "$*" >> "$(dirname "$0")/../kubectl.log"
+if [[ "$*" == *" exec "* ]]; then echo "Hello, World!"; exit 0; fi
 if [[ "${KUBECTL_FAIL:-0}" == "1" ]]; then
   exit 1
 else
@@ -112,6 +113,40 @@ else
 fi
 EOF
   chmod 0755 "$dir/stub-bin/kubectl"
+  echo "$dir/stub-bin"
+}
+
+_stub_kind() {
+  local dir="$1"
+  mkdir -p "$dir/stub-bin"
+  cat > "$dir/stub-bin/kind" << 'EOF'
+#!/usr/bin/env bash
+echo "$*" >> "$(dirname "$0")/../kind.log"
+cmd="${1:-}"
+shift || true
+case "$cmd" in
+  get)
+    [[ "${1:-}" == "clusters" ]] && cat "$(dirname "$0")/../kind-clusters" 2>/dev/null || true
+    ;;
+  create)
+    name_next=0
+    for arg in "$@"; do
+      if [[ "$name_next" -eq 1 ]]; then echo "$arg" >> "$(dirname "$0")/../kind-clusters"; name_next=0; fi
+      [[ "$arg" == "--name" ]] && name_next=1
+    done
+    ;;
+  delete)
+    : > "$(dirname "$0")/../kind-clusters"
+    ;;
+  export)
+    ;;
+esac
+EOF
+  chmod 0755 "$dir/stub-bin/kind"
+  touch "$dir/kind-clusters"
+  # stub docker so `require docker` passes
+  printf '#!/usr/bin/env bash\n' > "$dir/stub-bin/docker"
+  chmod 0755 "$dir/stub-bin/docker"
   echo "$dir/stub-bin"
 }
 
@@ -388,7 +423,7 @@ test_script_resources_metadata() {
   assert_eq "$cdigest" "$cexpected" "component-constructor digest"
 
   # Verify build-time scripts are NOT in the component
-  for excl in build sign publish fetch-kind fetch-ocm keys e2e; do
+  for excl in build sign publish keys e2e cluster; do
     local count
     count="$(echo "$cv_json" | jq -r --arg n "script-$excl" '[.[0].component.resources[] | select(.name==$n)] | length')"
     assert_eq "$count" "0" "script-$excl must be absent"
@@ -439,50 +474,81 @@ test_bundle_is_self_contained() {
   )
 }
 
-test_fetch_ocm_rejects_bad_checksum() {
+# Tests for cluster.sh
+
+test_cluster_sh_creates_missing_cluster() {
   local tmp="$1"
-  local binary
-  binary="ocm-$(host_os)-$(host_arch)"
-  mkdir -p "$tmp/release/v0.17.0"
-  echo "fakebinary" > "$tmp/release/v0.17.0/$binary"
-
-  local dest="$tmp/dist/ocm"
-  mkdir -p "$tmp/dist"
-  echo "previous" > "$dest"
-
-  if OCM_CLI_BASE_URL="file://$tmp/release" BIN_DIR="$tmp/dist" \
-    bash "$ROOT/scripts/fetch-ocm.sh" 2>/dev/null; then
-    echo "  Should have failed with bad checksum" >&2
-    return 1
-  fi
-
-  # Verify dest is unchanged
-  if [[ -f "$dest" ]]; then
-    [[ "$(cat "$dest")" == "previous" ]] || { echo "  dest file was modified" >&2; return 1; }
-  fi
+  local stub_dir
+  stub_dir=$(_stub_kind "$tmp")
+  BUILD_DIR="$tmp/build" KIND="$stub_dir/kind" E2E_KUBECONFIG="$tmp/build/e2e/kubeconfig" \
+    PATH="$stub_dir:$PATH" \
+    bash "$ROOT/scripts/cluster.sh" up
+  assert_contains "$(cat "$tmp/kind.log")" "create cluster --name ocm-application"
 }
 
-test_fetch_kind_rejects_bad_checksum() {
+test_cluster_sh_reuses_existing_cluster() {
   local tmp="$1"
-  local binary
-  binary="kind-$(host_os)-$(host_arch)"
-  mkdir -p "$tmp/release/v0.33.0"
-  echo "fakebinary" > "$tmp/release/v0.33.0/$binary"
+  local stub_dir
+  stub_dir=$(_stub_kind "$tmp")
+  echo "ocm-application" > "$tmp/kind-clusters"
+  BUILD_DIR="$tmp/build" KIND="$stub_dir/kind" E2E_KUBECONFIG="$tmp/build/e2e/kubeconfig" \
+    PATH="$stub_dir:$PATH" \
+    bash "$ROOT/scripts/cluster.sh" up
+  assert_not_contains "$(cat "$tmp/kind.log")" "create cluster"
+  assert_contains "$(cat "$tmp/kind.log")" "export kubeconfig --name ocm-application"
+}
 
-  local dest="$tmp/dist/kind"
-  mkdir -p "$tmp/dist"
-  echo "previous" > "$dest"
+test_cluster_sh_down_deletes_cluster() {
+  local tmp="$1"
+  local stub_dir
+  stub_dir=$(_stub_kind "$tmp")
+  echo "ocm-application" > "$tmp/kind-clusters"
+  BUILD_DIR="$tmp/build" KIND="$stub_dir/kind" E2E_KUBECONFIG="$tmp/build/e2e/kubeconfig" \
+    bash "$ROOT/scripts/cluster.sh" down
+  assert_contains "$(cat "$tmp/kind.log")" "delete cluster --name ocm-application"
+}
 
-  if KIND_BASE_URL="file://$tmp/release" BIN_DIR="$tmp/dist" \
-    bash "$ROOT/scripts/fetch-kind.sh" 2>/dev/null; then
-    echo "  Should have failed with bad checksum" >&2
-    return 1
-  fi
+test_make_e2e_run_skips_build_sign() {
+  local tmp="$1"
+  local out
+  out="$(make -s --dry-run -C "$ROOT" e2e-run 2>&1)"
+  assert_contains "$out" "scripts/e2e.sh"
+  assert_not_contains "$out" "scripts/build.sh"
+  assert_not_contains "$out" "scripts/sign.sh"
+}
 
-  # Verify dest is unchanged
-  if [[ -f "$dest" ]]; then
-    [[ "$(cat "$dest")" == "previous" ]] || { echo "  dest file was modified" >&2; return 1; }
-  fi
+test_devcontainer_config_is_valid() {
+  local tmp="$1"
+  local cfg="$ROOT/.devcontainer/devcontainer.json"
+  [[ -f "$cfg" ]] || die "devcontainer.json not found"
+  jq -e '(.features | keys | map(test("docker-outside-of-docker"))) | any' \
+    "$cfg" > /dev/null || die "docker-outside-of-docker feature not found"
+  jq -e '(.features | keys | map(test("docker-in-docker")) | any) | not' \
+    "$cfg" > /dev/null || die "docker-in-docker must not be used"
+  jq -e '.runArgs | index("--network=host") != null' \
+    "$cfg" > /dev/null || die "--network=host missing from runArgs"
+  jq -e 'has("postCreateCommand") | not' "$cfg" > /dev/null || die "postCreateCommand must not be set"
+  jq -e 'has("remoteEnv") | not' "$cfg" > /dev/null || die "remoteEnv must not be set"
+}
+
+test_devcontainer_pins_tools() {
+  local df="$ROOT/.devcontainer/Dockerfile"
+  [[ -f "$df" ]] || die "Dockerfile not found"
+  grep -qE '^ARG OCM_CLI_VERSION=v[0-9.]+$' "$df" || die "OCM_CLI_VERSION ARG not found in Dockerfile"
+  grep -qE '^ARG KIND_VERSION=v[0-9.]+$' "$df" || die "KIND_VERSION ARG not found in Dockerfile"
+  local sha_count
+  sha_count=$(grep -cE '^ARG (OCM|KIND)_SHA256_LINUX_(AMD64|ARM64)=[0-9a-f]{64}$' "$df")
+  [[ "$sha_count" -eq 4 ]] || die "Expected 4 SHA256 ARGs, got $sha_count"
+  grep -q 'sha256sum -c' "$df" || die "sha256sum -c not found in Dockerfile"
+  local rv="$ROOT/renovate.json"
+  jq -e '
+    [.customManagers[] | select(.fileMatch[] | test("Dockerfile"))] |
+    (map(select(.matchStrings[] | test("OCM_CLI_VERSION"))) | length) == 1 and
+    (map(select(.matchStrings[] | test("KIND_VERSION"))) | length) == 1
+  ' "$rv" > /dev/null || die "renovate.json missing Dockerfile ARG managers"
+  jq -e '
+    [.customManagers[] | select(.fileMatch[] | test("fetch-"))] | length == 0
+  ' "$rv" > /dev/null || die "renovate.json still references fetch- scripts"
 }
 
 # ── Run all tests ─────────────────────────────────────────────────────────────
@@ -502,8 +568,12 @@ run_test "deploy fails when rollout fails" test_deploy_fails_when_rollout_fails
 run_test "script resources metadata" test_script_resources_metadata
 run_test "script resources download identical" test_script_resources_download_identical
 run_test "bundle is self-contained" test_bundle_is_self_contained
-run_test "fetch ocm rejects bad checksum" test_fetch_ocm_rejects_bad_checksum
-run_test "fetch kind rejects bad checksum" test_fetch_kind_rejects_bad_checksum
+run_test "cluster.sh creates missing cluster" test_cluster_sh_creates_missing_cluster
+run_test "cluster.sh reuses existing cluster" test_cluster_sh_reuses_existing_cluster
+run_test "cluster.sh down deletes cluster" test_cluster_sh_down_deletes_cluster
+run_test "make e2e-run skips build and sign" test_make_e2e_run_skips_build_sign
+run_test "devcontainer config is valid" test_devcontainer_config_is_valid
+run_test "devcontainer pins tools" test_devcontainer_pins_tools
 
 echo ""
 echo "Results: $PASS passed, $FAIL failed"

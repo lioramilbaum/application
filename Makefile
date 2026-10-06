@@ -1,17 +1,13 @@
 VERSION        ?= 0.1.0
-OCM            ?= $(shell command -v ocm 2>/dev/null || echo bin/ocm)
+OCM            ?= ocm
 
 export VERSION OCM
 
-.PHONY: help tools build sign verify manifests deploy publish lint test e2e clean
+.PHONY: help build sign verify manifests deploy publish lint test e2e cluster-up cluster-down e2e-run clean
 
 help: ## Show this help
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | \
 		awk 'BEGIN {FS = ":.*?## "}; {printf "  %-12s %s\n", $$1, $$2}'
-
-tools: ## Download the OCM CLI and kind binary into bin/
-	@bash scripts/fetch-ocm.sh
-	@bash scripts/fetch-kind.sh
 
 build: ## Build the OCM component archive (CTF)
 	@bash scripts/build.sh
@@ -44,5 +40,14 @@ test: ## Run the test suite
 e2e: build sign ## End-to-end test using kind (requires docker)
 	@bash scripts/e2e.sh
 
+cluster-up: ## Create or reuse the kind cluster; writes build/e2e/kubeconfig (requires docker)
+	@bash scripts/cluster.sh up
+
+cluster-down: ## Delete the kind cluster
+	@bash scripts/cluster.sh down
+
+e2e-run: ## Run e2e against an existing cluster (CI: cluster is created as a separate step)
+	@bash scripts/e2e.sh
+
 clean: ## Remove build artifacts
-	rm -rf build bin
+	rm -rf build

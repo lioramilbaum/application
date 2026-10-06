@@ -3,20 +3,22 @@ set -euo pipefail
 # shellcheck source=scripts/lib.sh
 source "$(dirname "$0")/lib.sh"
 
-KIND="${KIND:-$ROOT/bin/kind}"
+KIND="${KIND:-kind}"
 KIND_CLUSTER="${KIND_CLUSTER:-ocm-application}"
-export KUBECONFIG="${E2E_KUBECONFIG:-$BUILD_DIR/e2e/kubeconfig}"
+export KIND KIND_CLUSTER KUBECONFIG="${E2E_KUBECONFIG:-$BUILD_DIR/e2e/kubeconfig}"
+SCRIPT_DIR="$(dirname "$0")"
 
 require "$OCM" "$KUBECTL" "$KIND" docker
 
-mkdir -p "$(dirname "$KUBECONFIG")"
-
+created=0
 if ! "$KIND" get clusters 2>/dev/null | grep -qx "$KIND_CLUSTER"; then
-  "$KIND" create cluster --name "$KIND_CLUSTER" --kubeconfig "$KUBECONFIG" --wait 60s
+  created=1
 fi
 
-if [[ "${KEEP_CLUSTER:-0}" != "1" ]]; then
-  trap '"$KIND" delete cluster --name "$KIND_CLUSTER" 2>/dev/null || true' EXIT
+bash "$SCRIPT_DIR/cluster.sh" up
+
+if [[ "$created" -eq 1 && "${KEEP_CLUSTER:-0}" != "1" ]]; then
+  trap 'bash "$SCRIPT_DIR/cluster.sh" down >/dev/null 2>&1 || true' EXIT
 fi
 
 bash "$(dirname "$0")/deploy.sh"

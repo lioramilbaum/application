@@ -1,0 +1,119 @@
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Component version (semver without v)
+        required: true
+        type: string
+  push:
+    tags:
+      - 'v*.*.*'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  test:
+    if: github.repository == 'lioramilbaum/application'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Lint and test
+        uses: devcontainers/ci@513af61f4de4f75d37e4438f184ba4358f0fc1ca # v0.3.1900000450
+        with:
+          push: never
+          runCmd: make lint test
+
+  release:
+    needs: test
+    if: github.repository == 'lioramilbaum/application' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      packages: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Select component version
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+        run: |
+          version="${INPUT_VERSION:-${GITHUB_REF_NAME#v}}"
+          if [[ ! "$version" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$ ]]; then
+            echo "::error::Version must be semver without v"
+            exit 1
+          fi
+          echo "VERSION=$version" >> "$GITHUB_ENV"
+
+      - name: Import signing key
+        env:
+          OCM_SIGNING_KEY: ${{ secrets.OCM_SIGNING_KEY }}
+        run: |
+          if [[ -z "$OCM_SIGNING_KEY" ]]; then
+            echo "::error::OCM_SIGNING_KEY secret is not set"
+            exit 1
+          fi
+          mkdir -p build/keys
+          umask 077
+          printf '%s\n' "$OCM_SIGNING_KEY" > build/keys/private.pem
+          chmod 644 build/keys/private.pem
+          openssl rsa -in build/keys/private.pem -pubout -out build/keys/public.pem
+
+      - name: Build, sign, and verify
+        uses: devcontainers/ci@513af61f4de4f75d37e4438f184ba4358f0fc1ca # v0.3.1900000450
+        with:
+          push: never
+          env: |
+            VERSION=${{ env.VERSION }}
+          runCmd: make build sign verify
+
+      - name: Write release metadata
+        run: |
+          jq -n \
+            --arg version "$VERSION" \
+            --arg sha "$GITHUB_SHA" \
+            '{version: $version, sourceRevision: $sha, rootComponent: "github.com/lioramilbaum/application"}' \
+            > build/metadata.json
+
+      - name: Upload signed component
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: application-ctf
+          path: |
+            build/ctf
+            build/metadata.json
+          if-no-files-found: error
+          retention-days: 30
+          compression-level: 0
+
+      - name: Publish component to GHCR
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: devcontainers/ci@513af61f4de4f75d37e4438f184ba4358f0fc1ca # v0.3.1900000450
+        with:
+          push: never
+          env: |
+            OCM_REPO=oci://ghcr.io/${{ github.repository_owner }}/ocm
+            GHCR_USER=${{ github.actor }}
+            GHCR_TOKEN=${{ secrets.GITHUB_TOKEN }}
+          runCmd: |
+            printf '%s' "$GHCR_TOKEN" | docker login ghcr.io -u "$GHCR_USER" --password-stdin
+            make publish
+
+      - name: Create GitHub release
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          flags=(--verify-tag --generate-notes --title "$GITHUB_REF_NAME")
+          [[ "$GITHUB_REF_NAME" == *-* ]] && flags+=(--prerelease)
+          gh release create "$GITHUB_REF_NAME" "${flags[@]}"
+
+      - name: Cleanup signing key
+        if: always()
+        run: rm -f build/keys/private.pem build/keys/public.pem
