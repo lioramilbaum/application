@@ -441,8 +441,10 @@ test_bundle_is_self_contained() {
 
 test_fetch_ocm_rejects_bad_checksum() {
   local tmp="$1"
+  local binary
+  binary="ocm-$(host_os)-$(host_arch)"
   mkdir -p "$tmp/release/v0.17.0"
-  echo "fakebinary" > "$tmp/release/v0.17.0/ocm-darwin-arm64"
+  echo "fakebinary" > "$tmp/release/v0.17.0/$binary"
 
   local dest="$tmp/dist/ocm"
   mkdir -p "$tmp/dist"
@@ -462,8 +464,10 @@ test_fetch_ocm_rejects_bad_checksum() {
 
 test_fetch_kind_rejects_bad_checksum() {
   local tmp="$1"
+  local binary
+  binary="kind-$(host_os)-$(host_arch)"
   mkdir -p "$tmp/release/v0.33.0"
-  echo "fakebinary" > "$tmp/release/v0.33.0/kind-darwin-arm64"
+  echo "fakebinary" > "$tmp/release/v0.33.0/$binary"
 
   local dest="$tmp/dist/kind"
   mkdir -p "$tmp/dist"
