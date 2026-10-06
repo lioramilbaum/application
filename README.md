@@ -114,7 +114,9 @@ The `e2e.sh` script automatically detects whether the cluster existed before thi
 
 ## Version management
 
-Renovate bumps `OCM_CLI_VERSION` and `KIND_VERSION` in `.devcontainer/Dockerfile`. The matching `*_SHA256_LINUX_{AMD64,ARM64}` ARGs must be updated by hand to match the new release. Renovate can only update version numbers; computing and verifying SHA256 checksums requires manual verification against the release artifacts.
+Renovate bumps `OCM_CLI_VERSION` together with both `OCM_SHA256_LINUX_AMD64` and `OCM_SHA256_LINUX_ARM64` in a single PR, using the `github-release-attachments` datasource and `# renovate: ocm-linux-<arch> <version>` marker comments in the Dockerfile.
+
+`KIND_SHA256_*` ARGs are still updated by hand when Renovate bumps `KIND_VERSION`.
 
 ## Real signing keys
 
