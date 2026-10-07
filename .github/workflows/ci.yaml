@@ -6,13 +6,27 @@ on:
   pull_request:
     branches: ["main"]
 
+permissions:
+  contents: read
+  packages: read
+
+env:
+  DEVCONTAINER_IMAGE: ghcr.io/${{ github.repository }}/devcontainer
+
 jobs:
   test:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Log in to GHCR (devcontainer cache)
+        continue-on-error: true
+        env:
+          GHCR_USER: ${{ github.actor }}
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: printf '%s' "$GHCR_TOKEN" | docker login ghcr.io -u "$GHCR_USER" --password-stdin
       - name: Lint and test
         uses: devcontainers/ci@513af61f4de4f75d37e4438f184ba4358f0fc1ca # v0.3.1900000450
         with:
           push: never
+          cacheFrom: ${{ env.DEVCONTAINER_IMAGE }}:latest
           runCmd: make lint test
