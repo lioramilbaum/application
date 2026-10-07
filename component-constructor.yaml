@@ -12,7 +12,7 @@ components:
         version: ${VERSION}
         access:
           type: OCIImage/v1
-          imageReference: docker.io/library/nginx:1.31-alpine
+          imageReference: docker.io/library/nginx:1.31-alpine@sha256:0530961ff0592b58c10f767535cc0abdfccf9e389ff7cc90f87320c1bc7e8506
       - name: hello-world-manifests
         type: blob
         version: ${VERSION}
