@@ -13,6 +13,10 @@ permissions:
 env:
   DEVCONTAINER_IMAGE: ghcr.io/${{ github.repository }}/devcontainer
 
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   test:
     runs-on: ubuntu-latest
