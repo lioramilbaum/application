@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
+# OCM v0.19.0 hangs on open stdin pipes; close stdin for the whole test process.
+exec < /dev/null
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 # shellcheck source=scripts/lib.sh
