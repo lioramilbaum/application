@@ -54,7 +54,7 @@
       "customType": "regex",
       "managerFilePatterns": ["/^component-constructor\\.yaml$/"],
       "matchStrings": [
-        "imageReference: docker\\.io/library/nginx:(?<currentValue>[^\\s]+)"
+        "imageReference: docker\\.io/library/nginx:(?<currentValue>[^@\\s]+)@(?<currentDigest>sha256:[a-f0-9]{64})"
       ],
       "depNameTemplate": "library/nginx",
       "datasourceTemplate": "docker"
