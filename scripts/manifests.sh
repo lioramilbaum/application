@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
+# OCM v0.19.0 hangs on open stdin pipes; close stdin for the whole script.
+exec < /dev/null
 # shellcheck source=scripts/lib.sh
 source "$(dirname "$0")/lib.sh"
 
