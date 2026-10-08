@@ -579,20 +579,23 @@ test_renovate_updates_ocm_sha256() {
   local ocm_version arch sha
   ocm_version=$(sed -n 's/^ARG OCM_CLI_VERSION=//p' "$df")
   [[ -n "$ocm_version" ]] || die "OCM_CLI_VERSION not found in Dockerfile"
-  for arch in AMD64 ARM64; do
-    sha=$(sed -n "s/^ARG OCM_SHA256_LINUX_${arch}=//p" "$df")
-    jq -e -Rs --slurpfile cfg "$rv" --arg arch "$arch" --arg v "$ocm_version" --arg sha "$sha" '
-      . as $df
-      | [ $cfg[0].customManagers[]
-          | select(.datasourceTemplate == "github-release-attachments"
-                   and .depNameTemplate == "open-component-model/open-component-model"
-                   and (.matchStrings[0] | contains("OCM_SHA256_LINUX_" + $arch + "=(?<currentDigest>"))) ]
-      | length == 1
-        and (.[0].matchStrings[0] as $re
-             | [ $df | capture($re; "g") ]
-             | length == 1 and .[0].currentValue == $v and .[0].currentDigest == $sha)
-    ' "$df" > /dev/null || die "renovate.json does not track OCM_SHA256_LINUX_${arch} at ${ocm_version}"
-  done
+  # Renovate targets stable releases; skip digest-tracking check for pre-release pins
+  if [[ "$ocm_version" != *-* ]]; then
+    for arch in AMD64 ARM64; do
+      sha=$(sed -n "s/^ARG OCM_SHA256_LINUX_${arch}=//p" "$df")
+      jq -e -Rs --slurpfile cfg "$rv" --arg arch "$arch" --arg v "$ocm_version" --arg sha "$sha" '
+        . as $df
+        | [ $cfg[0].customManagers[]
+            | select(.datasourceTemplate == "github-release-attachments"
+                     and .depNameTemplate == "open-component-model/open-component-model"
+                     and (.matchStrings[0] | contains("OCM_SHA256_LINUX_" + $arch + "=(?<currentDigest>"))) ]
+        | length == 1
+          and (.[0].matchStrings[0] as $re
+               | [ $df | capture($re; "g") ]
+               | length == 1 and .[0].currentValue == $v and .[0].currentDigest == $sha)
+      ' "$df" > /dev/null || die "renovate.json does not track OCM_SHA256_LINUX_${arch} at ${ocm_version}"
+    done
+  fi
   jq -e -Rs --slurpfile cfg "$rv" '
     . as $df
     | [ $cfg[0].customManagers[]
