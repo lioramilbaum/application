@@ -579,7 +579,7 @@ test_renovate_updates_ocm_sha256() {
   local ocm_version arch sha
   ocm_version=$(sed -n 's/^ARG OCM_CLI_VERSION=//p' "$df")
   [[ -n "$ocm_version" ]] || die "OCM_CLI_VERSION not found in Dockerfile"
-  # Renovate targets stable releases; skip digest-tracking check for pre-release pins
+  # Renovate targets stable releases; skip version-specific checks for pre-release pins
   if [[ "$ocm_version" != *-* ]]; then
     for arch in AMD64 ARM64; do
       sha=$(sed -n "s/^ARG OCM_SHA256_LINUX_${arch}=//p" "$df")
@@ -595,16 +595,16 @@ test_renovate_updates_ocm_sha256() {
                | length == 1 and .[0].currentValue == $v and .[0].currentDigest == $sha)
       ' "$df" > /dev/null || die "renovate.json does not track OCM_SHA256_LINUX_${arch} at ${ocm_version}"
     done
+    jq -e -Rs --slurpfile cfg "$rv" '
+      . as $df
+      | [ $cfg[0].customManagers[]
+          | select(.depNameTemplate == "open-component-model/open-component-model")
+          | .matchStrings[] as $re
+          | $df | match($re; "g") | [.offset, .offset + .length] ]
+      | sort | . as $s
+      | length == 3 and all(range(1; $s | length); $s[.][0] >= $s[. - 1][1])
+    ' "$df" > /dev/null || die "OCM Renovate matches overlap or are missing"
   fi
-  jq -e -Rs --slurpfile cfg "$rv" '
-    . as $df
-    | [ $cfg[0].customManagers[]
-        | select(.depNameTemplate == "open-component-model/open-component-model")
-        | .matchStrings[] as $re
-        | $df | match($re; "g") | [.offset, .offset + .length] ]
-    | sort | . as $s
-    | length == 3 and all(range(1; $s | length); $s[.][0] >= $s[. - 1][1])
-  ' "$df" > /dev/null || die "OCM Renovate matches overlap or are missing"
   jq -e '
     [ .packageRules[]?
       | select((.matchDepNames // []) | index("open-component-model/open-component-model"))
