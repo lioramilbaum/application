@@ -1,7 +1,5 @@
 #!/usr/bin/env bash
 set -euo pipefail
-# OCM v0.19.0 hangs on open stdin pipes; close stdin for the whole test process.
-exec < /dev/null
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 # shellcheck source=scripts/lib.sh
@@ -213,6 +211,29 @@ test_build_produces_application_tree() {
   provider=$("$OCM" get cv "$(cv_ref "$ROOT_COMPONENT")" \
     -o json 2>/dev/null | jq -r '.[0].component.provider')
   assert_eq "$provider" "github.com/lioramilbaum" "provider"
+}
+
+test_ocm_does_not_block_on_open_stdin() {
+  local tmp="$1"
+  _build
+  local fifo="$tmp/stdin.fifo"
+  mkfifo "$fifo"
+  sleep 120 >"$fifo" &
+  local holder=$!
+  "$OCM" get cv "$(cv_ref "$ROOT_COMPONENT")" -o json <"$fifo" >/dev/null 2>&1 &
+  local pid=$! i
+  # shellcheck disable=SC2034
+  for i in $(seq 1 60); do
+    kill -0 "$pid" 2>/dev/null || break
+    sleep 0.5
+  done
+  if kill -0 "$pid" 2>/dev/null; then
+    kill "$pid" "$holder" 2>/dev/null || true
+    echo "  ocm blocked reading an open stdin pipe" >&2
+    return 1
+  fi
+  kill "$holder" 2>/dev/null || true
+  wait "$pid" || true
 }
 
 test_image_resource_is_pinned_by_digest() {
@@ -536,7 +557,7 @@ test_devcontainer_config_is_valid() {
 test_devcontainer_pins_tools() {
   local df="$ROOT/.devcontainer/Dockerfile"
   [[ -f "$df" ]] || die "Dockerfile not found"
-  grep -qE '^ARG OCM_CLI_VERSION=v[0-9.]+$' "$df" || die "OCM_CLI_VERSION ARG not found in Dockerfile"
+  grep -qE '^ARG OCM_CLI_VERSION=v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$' "$df" || die "OCM_CLI_VERSION ARG not found in Dockerfile"
   grep -qE '^ARG KIND_VERSION=v[0-9.]+$' "$df" || die "KIND_VERSION ARG not found in Dockerfile"
   local sha_count
   sha_count=$(grep -cE '^ARG (OCM|KIND)_SHA256_LINUX_(AMD64|ARM64)=[0-9a-f]{64}$' "$df")
@@ -591,6 +612,7 @@ test_renovate_updates_ocm_sha256() {
 # ── Run all tests ─────────────────────────────────────────────────────────────
 
 run_test "build produces application tree" test_build_produces_application_tree
+run_test "ocm does not block on open stdin" test_ocm_does_not_block_on_open_stdin
 run_test "image resource is pinned by digest" test_image_resource_is_pinned_by_digest
 run_test "manifests resource metadata" test_manifests_resource_metadata
 run_test "sign and verify succeed" test_sign_and_verify_succeed
