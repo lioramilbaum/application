@@ -1,4 +1,4 @@
-FROM mcr.microsoft.com/devcontainers/base:3.0.8-ubuntu24.04
+FROM mcr.microsoft.com/devcontainers/base:3.0.9-ubuntu24.04
 RUN apt-get update && export DEBIAN_FRONTEND=noninteractive \
     && apt-get install -y --no-install-recommends make shellcheck jq curl openssl ca-certificates \
     && rm -rf /var/lib/apt/lists/*
