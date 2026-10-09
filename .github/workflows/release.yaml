@@ -50,6 +50,7 @@ jobs:
     permissions:
       contents: write
       packages: write
+      id-token: write
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -92,7 +93,20 @@ jobs:
           cacheFrom: ${{ env.DEVCONTAINER_IMAGE }}:latest
           env: |
             VERSION=${{ env.VERSION }}
+            SOURCE_COMMIT=${{ github.sha }}
           runCmd: make build sign verify
+
+      - name: Sigstore sign and verify
+        uses: devcontainers/ci@513af61f4de4f75d37e4438f184ba4358f0fc1ca # v0.3.1900000450
+        with:
+          push: never
+          cacheFrom: ${{ env.DEVCONTAINER_IMAGE }}:latest
+          env: |
+            VERSION=${{ env.VERSION }}
+            SIGNING_METHOD=sigstore
+            ACTIONS_ID_TOKEN_REQUEST_URL
+            ACTIONS_ID_TOKEN_REQUEST_TOKEN
+          runCmd: make sign verify
 
       - name: Write release metadata
         run: |

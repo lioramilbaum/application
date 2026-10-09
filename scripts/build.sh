@@ -3,7 +3,12 @@ set -euo pipefail
 # shellcheck source=scripts/lib.sh
 source "$(dirname "$0")/lib.sh"
 
-require "$OCM"
+require "$OCM" git
+
+SOURCE_COMMIT="${SOURCE_COMMIT:-$(git -C "$ROOT" rev-parse HEAD 2>/dev/null || true)}"
+[[ "$SOURCE_COMMIT" =~ ^[0-9a-f]{40}$ ]] || \
+  die "SOURCE_COMMIT must be a 40-char git commit SHA (got: '${SOURCE_COMMIT}'); build from a git checkout or set SOURCE_COMMIT"
+export SOURCE_COMMIT
 
 mkdir -p "$BUILD_DIR"
 rm -rf "$CTF"

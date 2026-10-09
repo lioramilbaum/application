@@ -6,6 +6,14 @@ components:
     labels:
       - name: application.lioramilbaum.github.com/tier
         value: application
+    sources:
+      - name: application-source
+        type: git
+        version: ${VERSION}
+        access:
+          type: GitHub/v1
+          repoUrl: https://github.com/lioramilbaum/application
+          commit: ${SOURCE_COMMIT}
     resources:
       - name: hello-world-image
         type: ociImage
@@ -20,41 +28,19 @@ components:
           type: file
           path: ./components/hello-world/manifests.yaml
           mediaType: application/yaml
-      # Deploy-time bundle: consumers download these to deploy the application.
-      # Build-time scripts (build.sh, sign.sh, keys.sh, fetch-ocm.sh, fetch-kind.sh,
-      # publish.sh, e2e.sh) are excluded.
-      - name: component-constructor
-        type: blob
+      # Deploy-time bundle: consumers download this to deploy the application.
+      # Build-time scripts (build.sh, sign.sh, keys.sh, sigstore.sh, fetch-ocm.sh, fetch-kind.sh,
+      # publish.sh, e2e.sh, cluster.sh) are excluded.
+      - name: deploy-bundle
+        type: directoryTree
         version: ${VERSION}
         input:
-          type: file
-          path: ./component-constructor.yaml
-          mediaType: application/yaml
-      - name: script-lib
-        type: blob
-        version: ${VERSION}
-        input:
-          type: file
-          path: ./scripts/lib.sh
-          mediaType: text/x-shellscript
-      - name: script-verify
-        type: blob
-        version: ${VERSION}
-        input:
-          type: file
-          path: ./scripts/verify.sh
-          mediaType: text/x-shellscript
-      - name: script-manifests
-        type: blob
-        version: ${VERSION}
-        input:
-          type: file
-          path: ./scripts/manifests.sh
-          mediaType: text/x-shellscript
-      - name: script-deploy
-        type: blob
-        version: ${VERSION}
-        input:
-          type: file
-          path: ./scripts/deploy.sh
-          mediaType: text/x-shellscript
+          type: Dir/v1
+          path: .
+          includeFiles:
+            - component-constructor.yaml
+            - scripts/lib.sh
+            - scripts/verify.sh
+            - scripts/manifests.sh
+            - scripts/deploy.sh
+          reproducible: true

@@ -34,4 +34,6 @@ jobs:
         with:
           push: never
           cacheFrom: ${{ env.DEVCONTAINER_IMAGE }}:latest
+          env: |
+            SOURCE_COMMIT=${{ github.sha }}
           runCmd: make lint test
