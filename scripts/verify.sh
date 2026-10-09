@@ -8,7 +8,6 @@ require "$OCM"
 VERIFY_CONFIG="${VERIFY_CONFIG:-$BUILD_DIR/verify.ocmconfig}"
 [[ -f "$VERIFY_CONFIG" ]] || die "Verify config not found: $VERIFY_CONFIG (run build and sign first)"
 
-# Redirect stdin from /dev/null: OCM v0.19.0 hangs on open stdin pipes.
 "$OCM" verify cv \
   --config "$VERIFY_CONFIG" \
-  "$(cv_ref "$ROOT_COMPONENT")" < /dev/null
+  "$(cv_ref "$ROOT_COMPONENT")"
