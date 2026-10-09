@@ -176,17 +176,10 @@ OCMEOF
 
 _download_bundle() {
   local dest="$1"
-  mkdir -p "$dest/scripts"
-  local s
-  for s in lib verify manifests deploy; do
-    # ocm v0.17 appends to existing output files
-    rm -f "$dest/scripts/$s.sh"
-    "$OCM" download resource "$(cv_ref "$ROOT_COMPONENT")" \
-      --identity "name=script-$s" --output "$dest/scripts/$s.sh"
-  done
-  rm -f "$dest/component-constructor.yaml"
+  mkdir -p "$dest"
+  # With auto extraction (default), OCM extracts directoryTree into the output directory
   "$OCM" download resource "$(cv_ref "$ROOT_COMPONENT")" \
-    --identity name=component-constructor --output "$dest/component-constructor.yaml"
+    --identity name=deploy-bundle --output "$dest"
 }
 
 # ── Tests ────────────────────────────────────────────────────────────────────
@@ -202,7 +195,7 @@ test_build_produces_application_tree() {
   local resource_names
   resource_names=$("$OCM" get cv "$(cv_ref "$ROOT_COMPONENT")" \
     -o json 2>/dev/null | jq -r '.[0].component.resources[].name' | sort | paste -sd, -)
-  assert_eq "$resource_names" "component-constructor,hello-world-image,hello-world-manifests,script-deploy,script-lib,script-manifests,script-verify" "resource names"
+  assert_eq "$resource_names" "deploy-bundle,hello-world-image,hello-world-manifests" "resource names"
 
   local ref_count
   ref_count=$("$OCM" get cv "$(cv_ref "$ROOT_COMPONENT")" \
@@ -393,46 +386,45 @@ test_deploy_fails_when_rollout_fails() {
   fi
 }
 
-test_script_resources_metadata() {
+test_deploy_bundle_metadata() {
   local tmp="$1"
   _build
   local cv_json
   cv_json="$("$OCM" get cv "$(cv_ref "$ROOT_COMPONENT")" -o json)"
 
-  local s
-  for s in lib verify manifests deploy; do
-    local rname="script-$s"
-    local rtype mediatype rversion digest expected_digest
-    rtype="$(echo "$cv_json" | jq -r --arg n "$rname" '.[0].component.resources[] | select(.name==$n) | .type')"
-    mediatype="$(echo "$cv_json" | jq -r --arg n "$rname" '.[0].component.resources[] | select(.name==$n) | .access.mediaType')"
-    rversion="$(echo "$cv_json" | jq -r --arg n "$rname" '.[0].component.resources[] | select(.name==$n) | .version')"
-    digest="$(echo "$cv_json" | jq -r --arg n "$rname" '.[0].component.resources[] | select(.name==$n) | .digest.value')"
-    expected_digest="$(sha256 "$ROOT/scripts/$s.sh")"
+  local rtype rversion
+  rtype="$(echo "$cv_json" | jq -r '.[0].component.resources[] | select(.name=="deploy-bundle") | .type')"
+  assert_eq "$rtype" "directoryTree" "deploy-bundle type"
 
-    assert_eq "$rtype" "blob" "script-$s type"
-    assert_eq "$mediatype" "text/x-shellscript" "script-$s mediaType"
-    assert_eq "$rversion" "$VERSION" "script-$s version"
-    assert_eq "$digest" "$expected_digest" "script-$s digest"
-  done
+  rversion="$(echo "$cv_json" | jq -r '.[0].component.resources[] | select(.name=="deploy-bundle") | .version')"
+  assert_eq "$rversion" "$VERSION" "deploy-bundle version"
 
-  local ctype cmedia cdigest cexpected
-  ctype="$(echo "$cv_json" | jq -r '.[0].component.resources[] | select(.name=="component-constructor") | .type')"
-  cmedia="$(echo "$cv_json" | jq -r '.[0].component.resources[] | select(.name=="component-constructor") | .access.mediaType')"
-  cdigest="$(echo "$cv_json" | jq -r '.[0].component.resources[] | select(.name=="component-constructor") | .digest.value')"
-  cexpected="$(sha256 "$ROOT/component-constructor.yaml")"
-  assert_eq "$ctype" "blob" "component-constructor type"
-  assert_eq "$cmedia" "application/yaml" "component-constructor mediaType"
-  assert_eq "$cdigest" "$cexpected" "component-constructor digest"
+  # Download deploy-bundle and verify it
+  local bundle tar_file tar_digest expected_digest
+  bundle="$(mktemp -d "$tmp/bundle.XXXXXX")"
+  tar_file="$bundle/deploy-bundle.tar.gz"
+  rm -f "$tar_file"
+  "$OCM" download resource "$(cv_ref "$ROOT_COMPONENT")" \
+    --identity name=deploy-bundle --output "$tar_file" --extraction-policy disable
 
-  # Verify build-time scripts are NOT in the component
-  for excl in build sign publish keys e2e cluster; do
-    local count
-    count="$(echo "$cv_json" | jq -r --arg n "script-$excl" '[.[0].component.resources[] | select(.name==$n)] | length')"
-    assert_eq "$count" "0" "script-$excl must be absent"
+  tar_digest="$(sha256 "$tar_file")"
+  expected_digest="$(echo "$cv_json" | jq -r '.[0].component.resources[] | select(.name=="deploy-bundle") | .digest.value')"
+  # Strip algorithm prefix (e.g., "sha256:...") if present
+  expected_digest="${expected_digest#*:}"
+  assert_eq "$tar_digest" "$expected_digest" "deploy-bundle tar digest match"
+
+  # Verify tar contents
+  local tar_contents
+  tar_contents="$(tar -tzf "$tar_file" | grep -v '/$' | sort | paste -sd, -)"
+  assert_eq "$tar_contents" "component-constructor.yaml,scripts/deploy.sh,scripts/lib.sh,scripts/manifests.sh,scripts/verify.sh" "deploy-bundle contents"
+
+  # Verify build-time scripts are NOT in the tar
+  for script in build sign publish keys sigstore e2e cluster; do
+    assert_not_contains "$tar_contents" "scripts/$script.sh" "scripts/$script.sh must not be in deploy-bundle"
   done
 }
 
-test_script_resources_download_identical() {
+test_deploy_bundle_download_identical() {
   local tmp="$1"
   _build
   local bundle
@@ -446,6 +438,134 @@ test_script_resources_download_identical() {
   done
   cmp "$bundle/component-constructor.yaml" "$ROOT/component-constructor.yaml" || \
     { echo "  component-constructor download differs from repo source" >&2; return 1; }
+}
+
+test_source_references_git_commit() {
+  local tmp="$1"
+  export SOURCE_COMMIT="0123456789abcdef0123456789abcdef01234567"
+  bash "$ROOT/scripts/build.sh" >/dev/null
+  local cv_json
+  cv_json="$("$OCM" get cv "$(cv_ref "$ROOT_COMPONENT")" -o json)"
+
+  local sources_len
+  sources_len="$(echo "$cv_json" | jq '.[0].component.sources // [] | length')"
+  assert_eq "$sources_len" "1" "sources count"
+
+  local src_name src_type src_version repo_url commit
+  src_name="$(echo "$cv_json" | jq -r '.[0].component.sources[0].name')"
+  assert_eq "$src_name" "application-source" "source name"
+
+  src_type="$(echo "$cv_json" | jq -r '.[0].component.sources[0].type')"
+  assert_eq "$src_type" "git" "source type"
+
+  src_version="$(echo "$cv_json" | jq -r '.[0].component.sources[0].version')"
+  assert_eq "$src_version" "$VERSION" "source version"
+
+  src_access_type="$(echo "$cv_json" | jq -r '.[0].component.sources[0].access.type')"
+  assert_eq "$src_access_type" "GitHub/v1" "source access type"
+
+  repo_url="$(echo "$cv_json" | jq -r '.[0].component.sources[0].access.repoUrl')"
+  assert_eq "$repo_url" "https://github.com/lioramilbaum/application" "source repoUrl"
+
+  commit="$(echo "$cv_json" | jq -r '.[0].component.sources[0].access.commit')"
+  assert_eq "$commit" "0123456789abcdef0123456789abcdef01234567" "source commit"
+}
+
+test_build_rejects_invalid_source_commit() {
+  local tmp="$1"
+  if SOURCE_COMMIT="not-a-sha" bash "$ROOT/scripts/build.sh" >/dev/null 2>&1; then
+    echo "  build should reject invalid SOURCE_COMMIT" >&2
+    return 1
+  fi
+  local out
+  out="$(SOURCE_COMMIT="not-a-sha" bash "$ROOT/scripts/build.sh" 2>&1 || true)"
+  assert_contains "$out" "SOURCE_COMMIT must be"
+}
+
+test_verify_ignores_other_signatures() {
+  local tmp="$1"
+  _build
+  bash "$ROOT/scripts/sign.sh" >/dev/null
+
+  # Add a second RSA signature with a different name (should not break verification)
+  local alt_dir="$tmp/alt-keys"
+  mkdir -p "$alt_dir"
+  openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 \
+    -out "$alt_dir/private.pem" 2>/dev/null
+  openssl rsa -pubout -in "$alt_dir/private.pem" \
+    -out "$alt_dir/public.pem" 2>/dev/null
+
+  cat > "$tmp/sign-other.ocmconfig" <<EOF
+type: generic.config.ocm.software/v1
+configurations:
+  - type: credentials.config.ocm.software
+    consumers:
+      - identity:
+          type: RSA/v1alpha1
+          algorithm: RSASSA-PSS
+          signature: other
+        credentials:
+          - type: RSACredentials/v1
+            privateKeyPEMFile: ${alt_dir}/private.pem
+            publicKeyPEMFile: ${alt_dir}/public.pem
+EOF
+
+  # Sign with "other" signature
+  VERIFY_CONFIG="$tmp/sign-other.ocmconfig" "$OCM" sign cv \
+    --config "$tmp/sign-other.ocmconfig" \
+    --signature "other" \
+    "$(cv_ref "$ROOT_COMPONENT")" < /dev/null
+
+  # Assert "other" signature was added
+  local sigs
+  sigs="$("$OCM" get cv "$(cv_ref "$ROOT_COMPONENT")" -o json | jq -r '.[0].signatures[].name' | sort | paste -sd, -)"
+  assert_eq "$sigs" "default,other" "both signatures should be present after alt-sign"
+
+  # Verify should still succeed with the default signature
+  bash "$ROOT/scripts/verify.sh" >/dev/null
+}
+
+test_sigstore_config_generation() {
+  local tmp="$1"
+  bash "$ROOT/scripts/sigstore.sh" >/dev/null
+
+  [[ -f "$tmp/sign-sigstore.ocmconfig" ]] || { echo "  sign-sigstore.ocmconfig not created" >&2; return 1; }
+  [[ -f "$tmp/verify-sigstore.ocmconfig" ]] || { echo "  verify-sigstore.ocmconfig not created" >&2; return 1; }
+
+  local sign_config verify_config
+  sign_config="$(cat "$tmp/sign-sigstore.ocmconfig")"
+  verify_config="$(cat "$tmp/verify-sigstore.ocmconfig")"
+
+  assert_contains "$sign_config" "SigstoreSigningConfiguration"
+  assert_contains "$verify_config" "SigstoreVerificationConfiguration"
+  assert_contains "$verify_config" "certificateOIDCIssuer"
+  assert_contains "$verify_config" "certificateIdentityRegexp"
+}
+
+test_sigstore_sign_requires_oidc_token() {
+  local tmp="$1"
+  _build
+
+  if env -u SIGSTORE_ID_TOKEN -u ACTIONS_ID_TOKEN_REQUEST_TOKEN -u ACTIONS_ID_TOKEN_REQUEST_URL \
+    SIGNING_METHOD=sigstore bash "$ROOT/scripts/sign.sh" >/dev/null 2>&1; then
+    echo "  sigstore sign should require OIDC token" >&2
+    return 1
+  fi
+
+  local out
+  out="$(env -u SIGSTORE_ID_TOKEN -u ACTIONS_ID_TOKEN_REQUEST_TOKEN -u ACTIONS_ID_TOKEN_REQUEST_URL \
+    SIGNING_METHOD=sigstore bash "$ROOT/scripts/sign.sh" 2>&1 || true)"
+  assert_contains "$out" "OIDC token"
+}
+
+test_sign_rejects_unknown_signing_method() {
+  local tmp="$1"
+  _build
+
+  if SIGNING_METHOD=bogus bash "$ROOT/scripts/sign.sh" >/dev/null 2>&1; then
+    echo "  sign should reject unknown SIGNING_METHOD" >&2
+    return 1
+  fi
 }
 
 test_bundle_is_self_contained() {
@@ -602,8 +722,14 @@ run_test "manifests rejects unpinned image" test_manifests_rejects_unpinned_imag
 run_test "deploy verifies before deploying" test_deploy_verifies_before_deploying
 run_test "deploy applies rendered manifests" test_deploy_applies_rendered_manifests
 run_test "deploy fails when rollout fails" test_deploy_fails_when_rollout_fails
-run_test "script resources metadata" test_script_resources_metadata
-run_test "script resources download identical" test_script_resources_download_identical
+run_test "deploy bundle metadata" test_deploy_bundle_metadata
+run_test "deploy bundle download identical" test_deploy_bundle_download_identical
+run_test "source references git commit" test_source_references_git_commit
+run_test "build rejects invalid source commit" test_build_rejects_invalid_source_commit
+run_test "verify ignores other signatures" test_verify_ignores_other_signatures
+run_test "sigstore config generation" test_sigstore_config_generation
+run_test "sigstore sign requires oidc token" test_sigstore_sign_requires_oidc_token
+run_test "sign rejects unknown signing method" test_sign_rejects_unknown_signing_method
 run_test "bundle is self-contained" test_bundle_is_self_contained
 run_test "cluster.sh creates missing cluster" test_cluster_sh_creates_missing_cluster
 run_test "cluster.sh reuses existing cluster" test_cluster_sh_reuses_existing_cluster

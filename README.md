@@ -4,24 +4,29 @@ A minimal HelloWorld application built with the [Open Component Model](https://o
 
 ## Component tree
 
-```
+```text
 github.com/lioramilbaum/application
 ├── hello-world-image  (ociImage, docker.io/library/nginx:1.27-alpine)
 ├── hello-world-manifests  (blob, application/yaml, Kubernetes manifests)
-├── component-constructor  (blob, application/yaml, OCM component descriptor)
-├── script-lib  (blob, text/x-shellscript, shared script functions)
-├── script-verify  (blob, text/x-shellscript, signature verification)
-├── script-manifests  (blob, text/x-shellscript, download and render manifests)
-└── script-deploy  (blob, text/x-shellscript, deploy to Kubernetes)
+└── deploy-bundle  (directoryTree, deployment scripts and descriptor)
+    ├── component-constructor.yaml  (OCM component descriptor)
+    ├── scripts/lib.sh  (shared script functions)
+    ├── scripts/verify.sh  (signature verification)
+    ├── scripts/manifests.sh  (download and render manifests)
+    └── scripts/deploy.sh  (deploy to Kubernetes)
+
+Sources:
+└── application-source  (git, GitHub repository with commit SHA)
 ```
 
 ## How it works
 
-A single OCM component with 7 direct resources (no component references):
+A single OCM component with 3 direct resources and 1 source (no component references):
+
 - **hello-world-image**: nginx container image (digest-pinned from Docker Hub)
 - **hello-world-manifests**: Kubernetes Namespace, ConfigMap, Deployment, and Service manifests
-- **component-constructor**: OCM component descriptor (for bundled deployments)
-- **script-lib, script-verify, script-manifests, script-deploy**: deployment and supporting scripts
+- **deploy-bundle**: directoryTree containing the deployment scripts and OCM component descriptor
+- **application-source**: git source reference with the repository URL and commit SHA
 
 The key concept is **digest-pinned images**. At build time, the OCM component references the nginx image as `docker.io/library/nginx:1.27-alpine`. The OCM build system automatically resolves this to the full digest (e.g., `docker.io/library/nginx:1.27-alpine@sha256:abc123...`). At deploy time, `manifests.sh` downloads the manifest template from the signed component and replaces the `HELLO_WORLD_IMAGE` placeholder with the pinned digest from the component descriptor. This ensures reproducible, tamper-evident deployments: the deployed image is cryptographically tied to the signed component, and no one can swap the image without invalidating the signature.
 
@@ -68,16 +73,11 @@ REF="ctf::./build/ctf//github.com/lioramilbaum/application:0.1.0"
 # Verify the component signature before downloading anything
 OCM verify cv --config /path/to/verify.ocmconfig "$REF"
 
-# Download scripts and constructor into a bundle directory
-mkdir -p bundle/scripts
-for s in lib verify manifests deploy; do
-  rm -f "bundle/scripts/$s.sh"
-  ocm download resource "$REF" --identity name=script-$s \
-    --output bundle/scripts/$s.sh
-done
-rm -f bundle/component-constructor.yaml
-ocm download resource "$REF" --identity name=component-constructor \
-  --output bundle/component-constructor.yaml
+# Download deploy-bundle into a fresh directory
+rm -rf bundle
+mkdir -p bundle
+ocm download resource "$REF" --identity name=deploy-bundle \
+  --output bundle/
 ```
 
 Then deploy:
@@ -87,8 +87,9 @@ CTF=./build/ctf BUILD_DIR=/tmp/deploy VERIFY_CONFIG=/path/to/verify.ocmconfig ba
 ```
 
 Notes:
+
 - Downloaded files are mode 0600. Run them with `bash`, not `./`.
-- OCM 0.17 appends to an existing `--output` file. Always download into a clean directory.
+- The deploy-bundle is a tar.gz archive that is automatically extracted by `ocm download resource`.
 - `deploy.sh` creates the application but does not tear it down. To delete: `kubectl delete ns hello-world`
 
 ## E2E testing
@@ -125,6 +126,44 @@ Dev keys are generated once into `build/keys/` and are gitignored. For productio
 ```bash
 SIGNING_KEY=/path/to/private.pem VERIFY_KEY=/path/to/public.pem make sign verify
 ```
+
+## Source provenance
+
+The component includes a source reference (`application-source`) with:
+
+- **Repository URL**: the GitHub repository
+- **Commit SHA**: the exact git commit used to build the component
+
+The commit SHA is determined by:
+
+1. `SOURCE_COMMIT` environment variable, if set
+2. Otherwise, the current HEAD of the git repository (via `git rev-parse HEAD`)
+
+Note: SOURCE_COMMIT must be a 40-character hex string (a full git commit SHA). A dirty working tree is not reflected in the source reference — only the commit SHA matters.
+
+## Keyless signing (Sigstore)
+
+To sign with Sigstore/Cosign keyless signing (requires OIDC token):
+
+```bash
+SIGNING_METHOD=sigstore make build sign verify
+```
+
+Signature names:
+
+- `default`: RSA signature (default behavior)
+- `sigstore`: Sigstore keyless signature (when `SIGNING_METHOD=sigstore`)
+
+For local testing with Sigstore:
+
+```bash
+export SIGSTORE_ID_TOKEN="<your-oidc-token>"
+SIGNING_METHOD=sigstore make sign verify
+```
+
+In GitHub Actions, add `id-token: write` to the job's `permissions:` block. The CI/CD will use GitHub's OIDC provider to acquire a token automatically.
+
+**Note on certificate validation**: OCM does not currently honour the `tokenFile` configuration option; use `SIGSTORE_ID_TOKEN` environment variable instead.
 
 ## Running tests
 
