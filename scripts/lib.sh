@@ -47,7 +47,9 @@ require_darwin_arm64() {
 
 cv_ref() {
   local component="${1:-$ROOT_COMPONENT}"
-  echo "ctf::${CTF}//${component}:${VERSION}"
+  # OCM_COMPONENT_REPO overrides the CTF for registry-sourced components,
+  # e.g. OCM_COMPONENT_REPO=oci::http://localhost:5001
+  echo "${OCM_COMPONENT_REPO:-ctf::${CTF}}//${component}:${VERSION}"
 }
 
 die() {

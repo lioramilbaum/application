@@ -1,0 +1,229 @@
+# yaml-language-server: $schema=https://json.schemastore.org/github-workflow.json
+name: air-gapped
+
+on:
+  schedule:
+    - cron: "17 2 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: air-gapped-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  DEVCONTAINER_IMAGE: ghcr.io/${{ github.repository }}/devcontainer
+  LOCAL_REGISTRY: localhost:5001
+
+jobs:
+  bundle:
+    name: Build air-gap bundle
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    services:
+      registry:
+        image: registry:2
+        ports:
+          - 5001:5000
+        options: >-
+          --health-cmd "wget --spider --quiet http://localhost:5000/v2/"
+          --health-interval 2s
+          --health-timeout 5s
+          --health-retries 15
+        volumes:
+          - /tmp/airgap-registry:/var/lib/registry
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Log in to GHCR (devcontainer cache)
+        continue-on-error: true
+        env:
+          GHCR_USER: ${{ github.actor }}
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: printf '%s' "$GHCR_TOKEN" | docker login ghcr.io -u "$GHCR_USER" --password-stdin
+      - name: Select version
+        id: version
+        run: echo "version=0.0.0-airgap.${{ github.run_id }}.${{ github.run_attempt }}" >> "$GITHUB_OUTPUT"
+      - name: Build, sign, publish and transfer
+        uses: devcontainers/ci@513af61f4de4f75d37e4438f184ba4358f0fc1ca # v0.3.1900000450
+        with:
+          imageName: ${{ env.DEVCONTAINER_IMAGE }}
+          env: |
+            VERSION=${{ steps.version.outputs.version }}
+            SOURCE_COMMIT=${{ github.sha }}
+            GHCR_USER=${{ github.actor }}
+            GHCR_TOKEN=${{ secrets.GITHUB_TOKEN }}
+            AIRGAP_OCM_REPO=oci://ghcr.io/${{ github.repository_owner }}/ocm-airgap
+            LOCAL_REGISTRY=${{ env.LOCAL_REGISTRY }}
+          runCmd: |
+            set -euo pipefail
+            printf '%s' "$GHCR_TOKEN" | docker login ghcr.io -u "$GHCR_USER" --password-stdin
+            make build
+            make sign
+            make verify
+            OCM_REPO="$AIRGAP_OCM_REPO" make publish
+            OCM_COMPONENT_REPO="$AIRGAP_OCM_REPO" OCM_REPO="oci::http://$LOCAL_REGISTRY" make publish
+            OCM_COMPONENT_REPO="oci::http://$LOCAL_REGISTRY" make verify
+            OCM_COMPONENT_REPO="oci::http://$LOCAL_REGISTRY" SKIP_VERIFY=1 make manifests
+            grep -q "image: $LOCAL_REGISTRY/" build/deploy/hello-world.yaml || \
+              { echo "::error::rendered image is not from the local registry"; exit 1; }
+      - name: Package air-gap bundle
+        run: |
+          mkdir -p build/airgap
+          sudo tar -C /tmp/airgap-registry -cf build/airgap/registry.tar .
+          sudo chown "$(id -u):$(id -g)" build/airgap/registry.tar
+          tar -tf build/airgap/registry.tar | grep -q component-descriptors/github.com/lioramilbaum/application
+      - name: Upload air-gap bundle
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: application-airgap
+          path: |
+            build/airgap/registry.tar
+            build/keys/public.pem
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 0
+
+  isolated-deploy:
+    name: Deploy without external egress
+    needs: bundle
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      packages: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Log in to GHCR (devcontainer cache)
+        continue-on-error: true
+        env:
+          GHCR_USER: ${{ github.actor }}
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: printf '%s' "$GHCR_TOKEN" | docker login ghcr.io -u "$GHCR_USER" --password-stdin
+      - name: Download air-gap bundle
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: application-airgap
+          path: build
+      - name: Restore local registry
+        run: |
+          docker network inspect kind >/dev/null 2>&1 || docker network create kind
+          sudo mkdir -p "$RUNNER_TEMP/airgap-registry"
+          sudo tar -C "$RUNNER_TEMP/airgap-registry" -xf build/airgap/registry.tar
+          docker run -d \
+            --name kind-registry \
+            --network kind \
+            -p 127.0.0.1:5001:5000 \
+            -v "$RUNNER_TEMP/airgap-registry:/var/lib/registry" \
+            registry:2
+          timeout 30 sh -c 'until curl -fsS http://localhost:5001/v2/_catalog 2>/dev/null | grep -q component-descriptors; do sleep 2; done'
+      - name: Block external egress from kind network
+        id: egress
+        run: |
+          network_id=$(docker network inspect kind --format '{{.Id}}')
+          bridge_interface="br-${network_id:0:12}"
+          echo "BRIDGE_INTERFACE=$bridge_interface" >> "$GITHUB_ENV"
+
+          sudo iptables -I DOCKER-USER 1 \
+            -i "$bridge_interface" ! -o "$bridge_interface" \
+            -m conntrack --ctstate NEW \
+            -m comment --comment application-airgap-egress -j DROP
+          if ! sudo iptables -C DOCKER-USER \
+            -i "$bridge_interface" ! -o "$bridge_interface" \
+            -m conntrack --ctstate NEW \
+            -m comment --comment application-airgap-egress -j DROP; then
+            echo "::error::Failed to block external egress from the kind network"
+            exit 1
+          fi
+
+          command -v tcpdump || sudo apt-get install -y tcpdump
+          sudo nohup tcpdump -U \
+            -i "$bridge_interface" \
+            -w "$RUNNER_TEMP/airgap-public-egress.pcap" \
+            '(ip and not dst net 10.0.0.0/8 and not dst net 172.16.0.0/12 and not dst net 192.168.0.0/16 and not dst net 127.0.0.0/8 and not dst net 169.254.0.0/16 and not multicast) or (ip6 and not dst net fc00::/7 and not dst net fe80::/10 and not dst host ::1 and not multicast)' \
+            >"$RUNNER_TEMP/tcpdump.log" 2>&1 &
+          echo "$!" > "$RUNNER_TEMP/tcpdump.pid"
+          sleep 1
+          if ! sudo kill -0 "$(cat "$RUNNER_TEMP/tcpdump.pid")" 2>/dev/null; then
+            echo "::error::Traffic capture failed to start"
+            exit 1
+          fi
+      - name: Deploy from local registry
+        uses: devcontainers/ci@513af61f4de4f75d37e4438f184ba4358f0fc1ca # v0.3.1900000450
+        with:
+          imageName: ${{ env.DEVCONTAINER_IMAGE }}
+          env: |
+            VERSION=${{ needs.bundle.outputs.version }}
+            GHCR_USER=${{ github.actor }}
+            GHCR_TOKEN=${{ secrets.GITHUB_TOKEN }}
+            LOCAL_REGISTRY=${{ env.LOCAL_REGISTRY }}
+            KIND_REGISTRY_HOST=${{ env.LOCAL_REGISTRY }}
+            KIND_REGISTRY_ENDPOINT=http://kind-registry:5000
+          runCmd: |
+            set -euo pipefail
+            cat > build/verify.ocmconfig <<EOF
+            type: generic.config.ocm.software/v1
+            configurations:
+              - type: credentials.config.ocm.software
+                consumers:
+                  - identity:
+                      type: RSA/v1alpha1
+                      algorithm: RSASSA-PSS
+                      signature: default
+                    credentials:
+                      - type: RSACredentials/v1
+                        publicKeyPEMFile: $PWD/build/keys/public.pem
+            EOF
+            export OCM_COMPONENT_REPO="oci::http://$LOCAL_REGISTRY"
+            make cluster-up
+            export KUBECONFIG="$PWD/build/e2e/kubeconfig"
+            make manifests
+            grep -q "image: $LOCAL_REGISTRY/" build/deploy/hello-world.yaml || \
+              { echo "::error::rendered image is not from the local registry"; exit 1; }
+            kubectl apply -f build/deploy/hello-world.yaml
+            kubectl -n hello-world rollout status deployment/hello-world --timeout=180s
+            kubectl -n hello-world exec deploy/hello-world -- wget -qO- http://localhost/ | grep -q Hello
+      - name: Assert no external egress
+        if: always() && steps.egress.outcome == 'success'
+        run: |
+          sudo kill "$(cat "$RUNNER_TEMP/tcpdump.pid")" 2>/dev/null || true
+          wait "$(cat "$RUNNER_TEMP/tcpdump.pid")" 2>/dev/null || true
+          sudo iptables -D DOCKER-USER \
+            -i "$BRIDGE_INTERFACE" ! -o "$BRIDGE_INTERFACE" \
+            -m conntrack --ctstate NEW \
+            -m comment --comment application-airgap-egress -j DROP \
+            2>/dev/null || true
+          if [ -f "$RUNNER_TEMP/airgap-public-egress.pcap" ]; then
+            sudo tcpdump -n -r "$RUNNER_TEMP/airgap-public-egress.pcap" \
+              > "$RUNNER_TEMP/airgap-public-egress.txt" 2>/dev/null || true
+          else
+            echo "::error::Packet capture file not found"
+            exit 1
+          fi
+          if [ -s "$RUNNER_TEMP/airgap-public-egress.txt" ]; then
+            echo "::error::Public network traffic was attempted during the isolated deployment"
+            cat "$RUNNER_TEMP/airgap-public-egress.txt"
+            exit 1
+          fi
+          echo "No external packets captured — isolated deployment confirmed clean."
+      - name: Upload evidence
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: application-airgap-evidence
+          path: |
+            ${{ runner.temp }}/airgap-public-egress.pcap
+            ${{ runner.temp }}/airgap-public-egress.txt
+            ${{ runner.temp }}/tcpdump.log
+          if-no-files-found: warn
+          retention-days: 7

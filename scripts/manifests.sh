@@ -66,13 +66,21 @@ while IFS= read -r rule; do
   [[ -n "$res_entry" ]] || die "localization references unknown resource: $rname"
 
   img="$(echo "$res_entry" | jq -r '.access.imageReference')"
-  [[ "$img" =~ @sha256:[0-9a-f]{64}$ ]] || \
-    die "$rname is not pinned by digest (got: $img)"
-
   expected_digest="$(echo "$res_entry" | jq -r '.digest.value')"
-  actual_digest="${img##*@sha256:}"
-  [[ "$actual_digest" == "$expected_digest" ]] || \
-    die "image digest mismatch (imageReference: $actual_digest, descriptor: $expected_digest)"
+  [[ "$expected_digest" =~ ^[0-9a-f]{64}$ ]] || \
+    die "$rname has no valid sha256 digest in the descriptor"
+
+  # Strip http:// or https:// scheme (present after ocm transfer --copy-resources)
+  img="${img#http://}"
+  img="${img#https://}"
+
+  if [[ "$img" =~ @sha256:[0-9a-f]{64}$ ]]; then
+    actual_digest="${img##*@sha256:}"
+    [[ "$actual_digest" == "$expected_digest" ]] || \
+      die "image digest mismatch (imageReference: $actual_digest, descriptor: $expected_digest)"
+  else
+    img="${img}@sha256:${expected_digest}"
+  fi
 
   tgt_kind="$(echo "$rule" | jq -r '.target.kind')"
   tgt_name="$(echo "$rule" | jq -r '.target.name')"

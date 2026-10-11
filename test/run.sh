@@ -39,7 +39,7 @@ assert_eq() {
 
 assert_contains() {
   local haystack="$1" needle="$2"
-  if ! grep -qF "$needle" <<< "$haystack"; then
+  if ! grep -qF -e "$needle" <<< "$haystack"; then
     echo "  assert_contains failed: '$needle' not found in output" >&2
     return 1
   fi
@@ -47,7 +47,7 @@ assert_contains() {
 
 assert_not_contains() {
   local haystack="$1" needle="$2"
-  if grep -qF "$needle" <<< "$haystack"; then
+  if grep -qF -e "$needle" <<< "$haystack"; then
     echo "  assert_not_contains failed: '$needle' was found in output" >&2
     return 1
   fi
@@ -130,7 +130,10 @@ cmd="${1:-}"
 shift || true
 case "$cmd" in
   get)
-    [[ "${1:-}" == "clusters" ]] && cat "$(dirname "$0")/../kind-clusters" 2>/dev/null || true
+    case "${1:-}" in
+      clusters) cat "$(dirname "$0")/../kind-clusters" 2>/dev/null || true ;;
+      nodes) printf '%s\n' ocm-application-control-plane ocm-application-worker ;;
+    esac
     ;;
   create)
     name_next=0
@@ -144,36 +147,49 @@ case "$cmd" in
     ;;
   export)
     ;;
+  *)
+    echo "unknown kind subcommand: $*" >&2
+    exit 1
+    ;;
 esac
+exit 0
 EOF
   chmod 0755 "$dir/stub-bin/kind"
   touch "$dir/kind-clusters"
-  # stub docker so `require docker` passes
-  printf '#!/usr/bin/env bash\n' > "$dir/stub-bin/docker"
+  # stub docker so `require docker` passes; log its arguments and any stdin
+  cat > "$dir/stub-bin/docker" << 'EOF'
+#!/usr/bin/env bash
+echo "$*" >> "$(dirname "$0")/../docker.log"
+if [[ "${1:-}" == exec && "${2:-}" == -i ]]; then
+  cat >> "$(dirname "$0")/../docker-stdin.log"
+fi
+EOF
   chmod 0755 "$dir/stub-bin/docker"
   echo "$dir/stub-bin"
 }
 
-_stub_ocm_unpinned() {
-  local dir="$1"
+# Wraps the real ocm: "get cv ... -o json" output is piped through the jq
+# filter stored in $dir/stub-bin/image.jq; all other calls pass through.
+_stub_ocm_rewrite_image() {
+  local dir="$1" filter="$2"
   mkdir -p "$dir/stub-bin"
+  printf '%s\n' "$filter" > "$dir/stub-bin/image.jq"
   cat > "$dir/stub-bin/ocm" <<'OCMEOF'
 #!/usr/bin/env bash
-# If this is a "get cv ... -o json" call, return descriptor with imageReference unpinned
+REAL_OCM="${REAL_OCM:-ocm}"
 if [[ "$*" == *"get cv"* ]] && [[ "$*" == *"-o json"* ]]; then
-  # Get real output
-  REAL_OCM="${REAL_OCM:-ocm}"
-  output=$("$REAL_OCM" "$@")
-  # Strip @sha256:... from imageReference
-  echo "$output" | sed '/imageReference/s/@sha256:[a-f0-9]*//'
+  "$REAL_OCM" "$@" | jq -f "$(dirname "$0")/image.jq"
 else
-  # Pass through to real ocm
-  REAL_OCM="${REAL_OCM:-ocm}"
   "$REAL_OCM" "$@"
 fi
 OCMEOF
   chmod 0755 "$dir/stub-bin/ocm"
   echo "$dir/stub-bin"
+}
+
+# Post-transfer shape: imageReference is an http:// URL without a digest
+_stub_ocm_transferred_image() {
+  _stub_ocm_rewrite_image "$1" '(.[0].component.resources[] | select(.name=="hello-world-image") | .access) = {"type":"ociArtifact/v1","imageReference":"http://localhost:5001/library/nginx:1.31-alpine"}'
 }
 
 _stub_ocm_tamper_localization() {
@@ -412,24 +428,96 @@ test_manifests_is_idempotent() {
   assert_eq "$count" "1" "exactly one Deployment in rendered manifest"
 }
 
-test_manifests_rejects_unpinned_image() {
+test_cv_ref_honours_component_repo() {
+  local tmp="$1" ref expected
+  # shellcheck disable=SC2016
+  ref="$(OCM_COMPONENT_REPO=oci::http://localhost:5001 bash -c 'source "$1"; cv_ref' _ "$ROOT/scripts/lib.sh")"
+  expected="oci::http://localhost:5001//${ROOT_COMPONENT}:${VERSION:-0.1.0}"
+  assert_eq "$ref" "$expected" "cv_ref with OCM_COMPONENT_REPO" || return 1
+
+  # shellcheck disable=SC2016
+  ref="$(env -u OCM_COMPONENT_REPO bash -c 'source "$1"; cv_ref' _ "$ROOT/scripts/lib.sh")"
+  expected="ctf::$tmp/ctf//${ROOT_COMPONENT}:${VERSION:-0.1.0}"
+  assert_eq "$ref" "$expected" "cv_ref without OCM_COMPONENT_REPO" || return 1
+}
+
+test_manifests_reads_from_component_repo() {
+  local tmp="$1"
+  _build
+
+  # The original CTF path is gone; the component must come from OCM_COMPONENT_REPO
+  OCM_COMPONENT_REPO="ctf::$tmp/ctf" CTF="$tmp/no-such-ctf" SKIP_VERIFY=1 \
+    bash "$ROOT/scripts/manifests.sh" >/dev/null || return 1
+
+  local rendered
+  rendered="$(cat "$tmp/deploy/hello-world.yaml")"
+  [[ "$rendered" =~ @sha256:[0-9a-f]{64} ]] || { echo "  Pinned image not found" >&2; return 1; }
+}
+
+test_manifests_localizes_transferred_image() {
   local tmp="$1"
   _build
 
   local stub_dir real_ocm
-  stub_dir=$(_stub_ocm_unpinned "$tmp")
+  stub_dir=$(_stub_ocm_transferred_image "$tmp")
   real_ocm="$OCM"
 
   # shellcheck disable=SC2097,SC2098
+  REAL_OCM="$real_ocm" OCM="$stub_dir/ocm" SKIP_VERIFY=1 \
+    bash "$ROOT/scripts/manifests.sh" >/dev/null || return 1
+
+  local digest
+  digest="$("$OCM" get cv "$(cv_ref "$ROOT_COMPONENT")" -o json 2>/dev/null \
+    | jq -r '.[0].component.resources[] | select(.name=="hello-world-image") | .digest.value')"
+
+  local rendered
+  rendered="$(cat "$tmp/deploy/hello-world.yaml")"
+  assert_contains "$rendered" "image: localhost:5001/library/nginx:1.31-alpine@sha256:$digest" "transferred image localized" || return 1
+  assert_not_contains "$rendered" "http://" "scheme stripped" || return 1
+  assert_not_contains "$rendered" "$IMAGE_PLACEHOLDER" "placeholder removed" || return 1
+}
+
+test_manifests_rejects_mismatched_image_digest() {
+  local tmp="$1"
+  _build
+
+  local zeros
+  printf -v zeros '%064d' 0
+  local stub_dir real_ocm
+  stub_dir=$(_stub_ocm_rewrite_image "$tmp" \
+    "(.[0].component.resources[] | select(.name==\"hello-world-image\") | .access.imageReference) = \"ghcr.io/lioramilbaum/application/images/hello-world:latest@sha256:${zeros}\"")
+  real_ocm="$OCM"
+
   local out
+  # shellcheck disable=SC2097,SC2098
   if out=$(REAL_OCM="$real_ocm" OCM="$stub_dir/ocm" SKIP_VERIFY=1 \
     bash "$ROOT/scripts/manifests.sh" 2>&1); then
-    echo "  Should have failed with unpinned image" >&2
+    echo "  Should have failed with mismatched image digest" >&2
     return 1
   fi
 
-  assert_contains "$out" "not pinned by digest"
+  assert_contains "$out" "image digest mismatch" || return 1
+  [[ ! -f "$tmp/deploy/hello-world.yaml" ]] || { echo "  Rendered file should not exist on failure" >&2; return 1; }
+}
 
+test_manifests_rejects_missing_image_digest() {
+  local tmp="$1"
+  _build
+
+  local stub_dir real_ocm
+  stub_dir=$(_stub_ocm_rewrite_image "$tmp" \
+    '(.[0].component.resources[] | select(.name=="hello-world-image") | .digest) = null')
+  real_ocm="$OCM"
+
+  local out
+  # shellcheck disable=SC2097,SC2098
+  if out=$(REAL_OCM="$real_ocm" OCM="$stub_dir/ocm" SKIP_VERIFY=1 \
+    bash "$ROOT/scripts/manifests.sh" 2>&1); then
+    echo "  Should have failed with missing image digest" >&2
+    return 1
+  fi
+
+  assert_contains "$out" "no valid sha256 digest" || return 1
   [[ ! -f "$tmp/deploy/hello-world.yaml" ]] || { echo "  Rendered file should not exist on failure" >&2; return 1; }
 }
 
@@ -797,6 +885,68 @@ test_cluster_sh_down_deletes_cluster() {
   assert_contains "$(cat "$tmp/kind.log")" "delete cluster --name ocm-application"
 }
 
+test_cluster_sh_configures_local_registry_mirror() {
+  local tmp="$1"
+  local stub_dir
+  stub_dir=$(_stub_kind "$tmp")
+  BUILD_DIR="$tmp/build" KIND="$stub_dir/kind" E2E_KUBECONFIG="$tmp/build/e2e/kubeconfig" \
+    KIND_REGISTRY_HOST=localhost:5001 KIND_REGISTRY_ENDPOINT=http://kind-registry:5000 \
+    PATH="$stub_dir:$PATH" \
+    bash "$ROOT/scripts/cluster.sh" up >/dev/null || return 1
+
+  local log
+  log="$(cat "$tmp/docker.log")"
+  assert_contains "$log" "exec ocm-application-control-plane mkdir -p /etc/containerd/certs.d/localhost:5001" || return 1
+  assert_contains "$log" "exec ocm-application-worker mkdir -p /etc/containerd/certs.d/localhost:5001" || return 1
+  assert_contains "$log" "exec -i ocm-application-control-plane tee /etc/containerd/certs.d/localhost:5001/hosts.toml" || return 1
+  assert_contains "$log" "exec -i ocm-application-worker tee /etc/containerd/certs.d/localhost:5001/hosts.toml" || return 1
+  assert_contains "$(cat "$tmp/docker-stdin.log")" '[host."http://kind-registry:5000"]' || return 1
+
+  # Without the registry vars, no containerd certs.d configuration is written
+  rm -f "$tmp/docker.log" "$tmp/docker-stdin.log"
+  BUILD_DIR="$tmp/build" KIND="$stub_dir/kind" E2E_KUBECONFIG="$tmp/build/e2e/kubeconfig" \
+    PATH="$stub_dir:$PATH" \
+    bash "$ROOT/scripts/cluster.sh" up >/dev/null || return 1
+  assert_not_contains "$(cat "$tmp/docker.log" 2>/dev/null || true)" "certs.d" || return 1
+}
+
+test_airgapped_workflow_isolates_deploy() {
+  local wf="$ROOT/.github/workflows/air-gapped.yaml"
+  [[ -f "$wf" ]] || { echo "  air-gapped.yaml not found" >&2; return 1; }
+  local content
+  content="$(cat "$wf")"
+
+  local needle
+  for needle in "schedule:" "workflow_dispatch:" "registry:2" "iptables -I DOCKER-USER" \
+    "--ctstate NEW" "-j DROP" "tcpdump" "OCM_COMPONENT_REPO" "make manifests" "kubectl apply"; do
+    assert_contains "$content" "$needle" || return 1
+  done
+
+  # The isolated deploy job must not run "make deploy" (it would bypass the local-registry render)
+  local isolated
+  isolated="$(sed -n '/^  isolated-deploy:/,$p' "$wf")"
+  assert_not_contains "$isolated" "make deploy" || return 1
+
+  # Transfer happens before egress is blocked, and egress is blocked before the isolated render
+  local publish_line egress_line
+  publish_line="$(grep -n 'make publish' "$wf" | tail -1 | cut -d: -f1)"
+  egress_line="$(grep -n 'iptables -I DOCKER-USER' "$wf" | head -1 | cut -d: -f1)"
+  [[ -n "$publish_line" && -n "$egress_line" ]] || \
+    { echo "  could not locate publish or iptables steps" >&2; return 1; }
+  [[ "$publish_line" -lt "$egress_line" ]] || { echo "  publish must precede egress block" >&2; return 1; }
+
+  # Egress block and isolated render are compared within the isolated-deploy job only,
+  # so a "make manifests" elsewhere in the workflow cannot satisfy the ordering check
+  local scoped iptables_line manifests_line
+  scoped="$(sed -n '/^  isolated-deploy:/,$p' "$wf")"
+  iptables_line="$(echo "$scoped" | grep -n 'iptables -I DOCKER-USER' | head -1 | cut -d: -f1)"
+  manifests_line="$(echo "$scoped" | grep -n 'make manifests' | head -1 | cut -d: -f1)"
+  [[ -n "$iptables_line" ]] || { echo "  FAIL: iptables line not found in isolated-deploy" >&2; return 1; }
+  [[ -n "$manifests_line" ]] || { echo "  FAIL: make manifests line not found in isolated-deploy" >&2; return 1; }
+  [[ "$iptables_line" -lt "$manifests_line" ]] || \
+    { echo "  FAIL: iptables must precede make manifests in isolated-deploy" >&2; return 1; }
+}
+
 test_make_e2e_run_skips_build_sign() {
   local tmp="$1"
   local out
@@ -890,7 +1040,11 @@ run_test "verify rejects wrong key" test_verify_rejects_wrong_key
 run_test "version is propagated" test_version_is_propagated
 run_test "manifests renders pinned image" test_manifests_renders_pinned_image
 run_test "manifests is idempotent" test_manifests_is_idempotent
-run_test "manifests rejects unpinned image" test_manifests_rejects_unpinned_image
+run_test "cv_ref honours OCM_COMPONENT_REPO" test_cv_ref_honours_component_repo
+run_test "manifests reads from OCM_COMPONENT_REPO" test_manifests_reads_from_component_repo
+run_test "manifests localizes transferred image" test_manifests_localizes_transferred_image
+run_test "manifests rejects mismatched image digest" test_manifests_rejects_mismatched_image_digest
+run_test "manifests rejects missing image digest" test_manifests_rejects_missing_image_digest
 run_test "manifests localizes by rule not placeholder" test_manifests_localizes_by_rule_not_placeholder
 run_test "manifests rejects untargeted localization" test_manifests_rejects_untargeted_localization
 run_test "manifests rejects wrong container" test_manifests_rejects_wrong_container
@@ -910,6 +1064,8 @@ run_test "bundle is self-contained" test_bundle_is_self_contained
 run_test "cluster.sh creates missing cluster" test_cluster_sh_creates_missing_cluster
 run_test "cluster.sh reuses existing cluster" test_cluster_sh_reuses_existing_cluster
 run_test "cluster.sh down deletes cluster" test_cluster_sh_down_deletes_cluster
+run_test "cluster.sh configures local registry mirror" test_cluster_sh_configures_local_registry_mirror
+run_test "air-gapped workflow isolates deploy" test_airgapped_workflow_isolates_deploy
 run_test "make e2e-run skips build and sign" test_make_e2e_run_skips_build_sign
 run_test "devcontainer config is valid" test_devcontainer_config_is_valid
 run_test "devcontainer pins tools" test_devcontainer_pins_tools

@@ -19,6 +19,14 @@ case "$cmd" in
       echo "Creating cluster '$KIND_CLUSTER' ..."
       "$KIND" create cluster --name "$KIND_CLUSTER" --kubeconfig "$KUBECONFIG" --wait 60s
     fi
+    if [[ -n "${KIND_REGISTRY_HOST:-}" ]]; then
+      [[ -n "${KIND_REGISTRY_ENDPOINT:-}" ]] || die "KIND_REGISTRY_ENDPOINT must be set when KIND_REGISTRY_HOST is set"
+      while IFS= read -r node; do
+        docker exec "$node" mkdir -p "/etc/containerd/certs.d/${KIND_REGISTRY_HOST}"
+        printf '[host."%s"]\n' "$KIND_REGISTRY_ENDPOINT" | \
+          docker exec -i "$node" tee "/etc/containerd/certs.d/${KIND_REGISTRY_HOST}/hosts.toml" > /dev/null
+      done < <("$KIND" get nodes --name "$KIND_CLUSTER")
+    fi
     ;;
   down)
     require "$KIND"
