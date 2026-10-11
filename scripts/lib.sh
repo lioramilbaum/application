@@ -12,6 +12,8 @@ export DEPLOY_DIR="${DEPLOY_DIR:-$BUILD_DIR/deploy}"
 export APP_NAME="hello-world"
 export APP_NAMESPACE="hello-world"
 export IMAGE_PLACEHOLDER="HELLO_WORLD_IMAGE"
+export MANIFESTS_RESOURCE="hello-world-manifests"
+export LOCALIZATION_RESOURCE="hello-world-localization"
 export KUBECTL="${KUBECTL:-kubectl}"
 
 host_os() {

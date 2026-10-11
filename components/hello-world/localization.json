@@ -1,0 +1,11 @@
+{
+  "apiVersion": "localization.application.lioramilbaum.github.com/v1alpha1",
+  "kind": "LocalizationConfig",
+  "localizations": [
+    {
+      "resource": { "name": "hello-world-image" },
+      "target": { "kind": "Deployment", "name": "hello-world" },
+      "container": { "index": 0, "name": "nginx" }
+    }
+  ]
+}

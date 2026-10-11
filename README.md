@@ -8,6 +8,7 @@ A minimal HelloWorld application built with the [Open Component Model](https://o
 github.com/lioramilbaum/application
 ├── hello-world-image  (ociImage, docker.io/library/nginx:1.27-alpine)
 ├── hello-world-manifests  (blob, application/yaml, Kubernetes manifests)
+├── hello-world-localization  (localizationConfig, application/json, image localization rules)
 └── deploy-bundle  (directoryTree, deployment scripts and descriptor)
     ├── component-constructor.yaml  (OCM component descriptor)
     ├── scripts/lib.sh  (shared script functions)
@@ -21,14 +22,15 @@ Sources:
 
 ## How it works
 
-A single OCM component with 3 direct resources and 1 source (no component references):
+A single OCM component with 4 direct resources and 1 source (no component references):
 
 - **hello-world-image**: nginx container image (digest-pinned from Docker Hub)
 - **hello-world-manifests**: Kubernetes Namespace, ConfigMap, Deployment, and Service manifests
+- **hello-world-localization**: signed localization rules (`components/hello-world/localization.json`) mapping each image resource to a container field in the manifests
 - **deploy-bundle**: directoryTree containing the deployment scripts and OCM component descriptor
 - **application-source**: git source reference with the repository URL and commit SHA
 
-The key concept is **digest-pinned images**. At build time, the OCM component references the nginx image as `docker.io/library/nginx:1.27-alpine`. The OCM build system automatically resolves this to the full digest (e.g., `docker.io/library/nginx:1.27-alpine@sha256:abc123...`). At deploy time, `manifests.sh` downloads the manifest template from the signed component and replaces the `HELLO_WORLD_IMAGE` placeholder with the pinned digest from the component descriptor. This ensures reproducible, tamper-evident deployments: the deployed image is cryptographically tied to the signed component, and no one can swap the image without invalidating the signature.
+The key concept is **digest-pinned images**. At build time, the OCM component references the nginx image as `docker.io/library/nginx:1.27-alpine`. The OCM build system automatically resolves this to the full digest (e.g., `docker.io/library/nginx:1.27-alpine@sha256:abc123...`). At deploy time, `manifests.sh` downloads the manifest template and the localization rules from the signed component and checks both against their descriptor digests. It then generates a `kustomization.yaml` with JSON 6902 patches that set the target container's image to the pinned digest, and renders the result with `kubectl kustomize`. The rules say which container in which workload gets which image resource, so the mapping is covered by the signature too. The `HELLO_WORLD_IMAGE` placeholder in the manifest is a sentinel: rendering fails if it survives. This ensures reproducible, tamper-evident deployments: the deployed image is cryptographically tied to the signed component, and no one can swap the image or its target field without invalidating the signature.
 
 `make deploy` calls `build`, `sign`, then `deploy.sh` to deploy the application. Consumers can also download the full deployment bundle for self-contained execution.
 
@@ -40,7 +42,7 @@ The key concept is **digest-pinned images**. At build time, the OCM component re
 - `shellcheck` (for linting)
 - `jq`
 - `openssl`
-- `kubectl` (for deploying)
+- `kubectl` (for deploying and for `make manifests`, which uses `kubectl kustomize`)
 - `docker` (for `make e2e` or `make e2e-run` only)
 - Docker Hub access for `make build` and `make test` (to resolve `nginx:1.27-alpine`)
 
@@ -175,6 +177,7 @@ Tests include:
 - Component structure and resource metadata
 - Signature verification with correct and wrong keys
 - Manifest rendering with digest-pinned images
+- Localization rules: resource metadata (`localization resource metadata`), rule-based image injection (`manifests localizes by rule not placeholder`), rejection of untargeted rules (`manifests rejects untargeted localization`), wrong container (`manifests rejects wrong container`), and tampered rules (`manifests rejects tampered localization`)
 - Deploy workflow and error handling
 - Script resource download and bundle self-containedness
 

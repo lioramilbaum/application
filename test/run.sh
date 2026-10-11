@@ -100,10 +100,14 @@ EOF
 }
 
 _stub_kubectl() {
-  local dir="$1"
+  local dir="$1" real_kubectl
+  # Resolve the real binary now, before the stub is first on PATH.
+  real_kubectl="$(command -v kubectl)"
   mkdir -p "$dir/stub-bin"
-  cat > "$dir/stub-bin/kubectl" <<'EOF'
-#!/usr/bin/env bash
+  # shellcheck disable=SC2016
+  printf '#!/usr/bin/env bash\nif [[ "${1:-}" == kustomize ]]; then exec %q "$@"; fi\n' \
+    "$real_kubectl" > "$dir/stub-bin/kubectl"
+  cat >> "$dir/stub-bin/kubectl" <<'EOF'
 echo "$*" >> "$(dirname "$0")/../kubectl.log"
 if [[ "$*" == *" exec "* ]]; then echo "Hello, World!"; exit 0; fi
 if [[ "${KUBECTL_FAIL:-0}" == "1" ]]; then
@@ -172,6 +176,51 @@ OCMEOF
   echo "$dir/stub-bin"
 }
 
+_stub_ocm_tamper_localization() {
+  local dir="$1"
+  mkdir -p "$dir/stub-bin"
+  cat > "$dir/stub-bin/ocm" <<'OCMEOF'
+#!/usr/bin/env bash
+REAL_OCM="${REAL_OCM:-ocm}"
+"$REAL_OCM" "$@" || exit $?
+# After downloading the localization blob, append a byte to simulate tampering
+if [[ "$*" == *"download resource"* ]] && [[ "$*" == *"name=hello-world-localization"* ]]; then
+  out=""
+  prev=""
+  for arg in "$@"; do
+    [[ "$prev" == "--output" ]] && out="$arg"
+    prev="$arg"
+  done
+  printf 'x' >> "$out"
+fi
+OCMEOF
+  chmod 0755 "$dir/stub-bin/ocm"
+  echo "$dir/stub-bin"
+}
+
+# Builds a CTF from a copy of the component sources. $2 is an optional sed
+# expression applied to manifests.yaml and $3 an optional jq filter applied
+# to localization.json. Prints the CTF path.
+_build_variant() {
+  local dir="$1" manifest_expr="$2" loc_filter="$3"
+  local repo="$dir/variant-repo"
+  rm -rf "$repo"
+  mkdir -p "$repo"
+  cp -R "$ROOT/component-constructor.yaml" "$ROOT/scripts" "$ROOT/components" "$repo/"
+  if [[ -n "$manifest_expr" ]]; then
+    sed "$manifest_expr" "$ROOT/components/hello-world/manifests.yaml" \
+      > "$repo/components/hello-world/manifests.yaml"
+  fi
+  if [[ -n "$loc_filter" ]]; then
+    jq "$loc_filter" "$ROOT/components/hello-world/localization.json" \
+      > "$repo/components/hello-world/localization.json"
+  fi
+  SOURCE_COMMIT="0123456789abcdef0123456789abcdef01234567" \
+    BUILD_DIR="$dir/variant-build" CTF="$dir/variant-ctf" \
+    bash "$repo/scripts/build.sh" >/dev/null
+  echo "$dir/variant-ctf"
+}
+
 _download_bundle() {
   local dest="$1"
   mkdir -p "$dest"
@@ -193,7 +242,7 @@ test_build_produces_application_tree() {
   local resource_names
   resource_names=$("$OCM" get cv "$(cv_ref "$ROOT_COMPONENT")" \
     -o json 2>/dev/null | jq -r '.[0].component.resources[].name' | sort | paste -sd, -)
-  assert_eq "$resource_names" "deploy-bundle,hello-world-image,hello-world-manifests" "resource names"
+  assert_eq "$resource_names" "deploy-bundle,hello-world-image,hello-world-localization,hello-world-manifests" "resource names"
 
   local ref_count
   ref_count=$("$OCM" get cv "$(cv_ref "$ROOT_COMPONENT")" \
@@ -272,6 +321,27 @@ test_manifests_resource_metadata() {
   assert_eq "$digest" "$expected_digest" "manifests digest"
 }
 
+test_localization_resource_metadata() {
+  local tmp="$1"
+  _build
+  local cv_json
+  cv_json=$("$OCM" get cv "ctf::${tmp}/ctf//github.com/lioramilbaum/application:${VERSION:-0.1.0}" -o json 2>/dev/null)
+
+  local rtype mediatype rversion digest expected_digest
+  rtype=$(echo "$cv_json" | jq -r '.[0].component.resources[] | select(.name=="hello-world-localization") | .type')
+  assert_eq "$rtype" "localizationConfig" "localization resource type"
+
+  mediatype=$(echo "$cv_json" | jq -r '.[0].component.resources[] | select(.name=="hello-world-localization") | .access.mediaType')
+  assert_eq "$mediatype" "application/json" "localization mediaType"
+
+  rversion=$(echo "$cv_json" | jq -r '.[0].component.resources[] | select(.name=="hello-world-localization") | .version')
+  assert_eq "$rversion" "${VERSION:-0.1.0}" "localization version"
+
+  digest=$(echo "$cv_json" | jq -r '.[0].component.resources[] | select(.name=="hello-world-localization") | .digest.value')
+  expected_digest="$(sha256 "$ROOT/components/hello-world/localization.json")"
+  assert_eq "$digest" "$expected_digest" "localization digest"
+}
+
 test_sign_and_verify_succeed() {
   local tmp="$1"
   _build
@@ -319,6 +389,16 @@ test_manifests_renders_pinned_image() {
   assert_contains "$rendered" "Hello, World!" "hello world message"
   assert_not_contains "$rendered" "$IMAGE_PLACEHOLDER" "placeholder removed"
   [[ "$rendered" =~ @sha256:[0-9a-f]{64} ]] || { echo "  Pinned image not found" >&2; return 1; }
+
+  [[ -f "$tmp/deploy/kustomization.yaml" ]] || { echo "  kustomization.yaml not created" >&2; return 1; }
+  local kust
+  kust="$(cat "$tmp/deploy/kustomization.yaml")"
+  assert_contains "$kust" "/spec/template/spec/containers/0/image" "kustomize image patch path"
+
+  local img
+  img=$("$OCM" get cv "$(cv_ref "$ROOT_COMPONENT")" -o json 2>/dev/null \
+    | jq -r '.[0].component.resources[] | select(.name=="hello-world-image") | .access.imageReference')
+  assert_contains "$rendered" "image: $img" "rendered image matches descriptor"
 }
 
 test_manifests_is_idempotent() {
@@ -350,6 +430,72 @@ test_manifests_rejects_unpinned_image() {
 
   assert_contains "$out" "not pinned by digest"
 
+  [[ ! -f "$tmp/deploy/hello-world.yaml" ]] || { echo "  Rendered file should not exist on failure" >&2; return 1; }
+}
+
+test_manifests_localizes_by_rule_not_placeholder() {
+  local tmp="$1"
+  local ctf
+  ctf=$(_build_variant "$tmp" 's|HELLO_WORLD_IMAGE|registry.invalid/not-localized:0|' "")
+
+  local img
+  img=$("$OCM" get cv "ctf::${ctf}//${ROOT_COMPONENT}:${VERSION:-0.1.0}" -o json 2>/dev/null \
+    | jq -r '.[0].component.resources[] | select(.name=="hello-world-image") | .access.imageReference')
+
+  CTF="$ctf" SKIP_VERIFY=1 bash "$ROOT/scripts/manifests.sh" >/dev/null
+
+  local rendered
+  rendered="$(cat "$tmp/deploy/hello-world.yaml")"
+  assert_contains "$rendered" "image: $img" "rule-localized image"
+  assert_not_contains "$rendered" "registry.invalid" "manifest placeholder image must be replaced"
+}
+
+test_manifests_rejects_untargeted_localization() {
+  local tmp="$1"
+  local ctf
+  ctf=$(_build_variant "$tmp" "" '.localizations[0].target.name = "does-not-exist"')
+
+  local out
+  if out=$(CTF="$ctf" SKIP_VERIFY=1 bash "$ROOT/scripts/manifests.sh" 2>&1); then
+    echo "  Should have failed with untargeted localization" >&2
+    return 1
+  fi
+
+  assert_contains "$out" "localization"
+  [[ ! -f "$tmp/deploy/hello-world.yaml" ]] || { echo "  Rendered file should not exist on failure" >&2; return 1; }
+}
+
+test_manifests_rejects_wrong_container() {
+  local tmp="$1"
+  local ctf
+  ctf=$(_build_variant "$tmp" "" '.localizations[0].container.name = "other"')
+
+  local out
+  if out=$(CTF="$ctf" SKIP_VERIFY=1 bash "$ROOT/scripts/manifests.sh" 2>&1); then
+    echo "  Should have failed with wrong container name" >&2
+    return 1
+  fi
+
+  assert_contains "$out" "kustomize localization failed"
+  [[ ! -f "$tmp/deploy/hello-world.yaml" ]] || { echo "  Rendered file should not exist on failure" >&2; return 1; }
+}
+
+test_manifests_rejects_tampered_localization() {
+  local tmp="$1"
+  _build
+
+  local stub_dir
+  stub_dir=$(_stub_ocm_tamper_localization "$tmp")
+
+  local out
+  # shellcheck disable=SC2097,SC2098
+  if out=$(REAL_OCM="$OCM" OCM="$stub_dir/ocm" SKIP_VERIFY=1 \
+    bash "$ROOT/scripts/manifests.sh" 2>&1); then
+    echo "  Should have failed with tampered localization" >&2
+    return 1
+  fi
+
+  assert_contains "$out" "localization blob digest mismatch"
   [[ ! -f "$tmp/deploy/hello-world.yaml" ]] || { echo "  Rendered file should not exist on failure" >&2; return 1; }
 }
 
@@ -738,12 +884,17 @@ run_test "build produces application tree" test_build_produces_application_tree
 run_test "ocm does not block on open stdin" test_ocm_does_not_block_on_open_stdin
 run_test "image resource is pinned by digest" test_image_resource_is_pinned_by_digest
 run_test "manifests resource metadata" test_manifests_resource_metadata
+run_test "localization resource metadata" test_localization_resource_metadata
 run_test "sign and verify succeed" test_sign_and_verify_succeed
 run_test "verify rejects wrong key" test_verify_rejects_wrong_key
 run_test "version is propagated" test_version_is_propagated
 run_test "manifests renders pinned image" test_manifests_renders_pinned_image
 run_test "manifests is idempotent" test_manifests_is_idempotent
 run_test "manifests rejects unpinned image" test_manifests_rejects_unpinned_image
+run_test "manifests localizes by rule not placeholder" test_manifests_localizes_by_rule_not_placeholder
+run_test "manifests rejects untargeted localization" test_manifests_rejects_untargeted_localization
+run_test "manifests rejects wrong container" test_manifests_rejects_wrong_container
+run_test "manifests rejects tampered localization" test_manifests_rejects_tampered_localization
 run_test "deploy verifies before deploying" test_deploy_verifies_before_deploying
 run_test "deploy applies rendered manifests" test_deploy_applies_rendered_manifests
 run_test "deploy fails when rollout fails" test_deploy_fails_when_rollout_fails

@@ -31,7 +31,7 @@ spec:
     spec:
       containers:
         - name: nginx
-          image: HELLO_WORLD_IMAGE
+          image: HELLO_WORLD_IMAGE  # localized via hello-world-localization (components/hello-world/localization.json)
           ports:
             - name: http
               containerPort: 80
