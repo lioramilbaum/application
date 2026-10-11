@@ -991,6 +991,50 @@ test_renovate_updates_ocm_sha256() {
   ' "$rv" > /dev/null || die "OCM dependencies are not grouped into one PR"
 }
 
+test_e2e_workflow_isolates_deploy() {
+  local wf="$ROOT/.github/workflows/e2e.yaml"
+  [[ -f "$wf" ]] || { echo "FAIL: e2e.yaml not found"; return 1; }
+  local deploy
+  deploy="$(sed -n '/^  deploy:/,$p' "$wf")"
+
+  assert_contains "$deploy" "make cluster-up"         || return 1
+  assert_contains "$deploy" "crictl pull"             || return 1
+  assert_contains "$deploy" "iptables -I DOCKER-USER" || return 1
+  assert_contains "$deploy" "--ctstate NEW"           || return 1
+  assert_contains "$deploy" "-j DROP"                 || return 1
+  assert_contains "$deploy" "tcpdump"                 || return 1
+  assert_contains "$deploy" "iptables -D DOCKER-USER" || return 1
+  assert_contains "$deploy" "make e2e-run"            || return 1
+  assert_contains "$deploy" "e2e-public-egress.pcap"  || return 1
+  assert_contains "$deploy" "upload-artifact"         || return 1
+
+  # Ordering: cluster-up < crictl pull < iptables -I < make e2e-run < iptables -D
+  local cluster_line iptables_i_line erun_line iptables_d_line crictl_line
+  cluster_line=$(echo "$deploy"   | grep -n 'make cluster-up'         | head -1 | cut -d: -f1)
+  crictl_line=$(echo "$deploy"    | grep -n 'crictl pull'             | head -1 | cut -d: -f1)
+  iptables_i_line=$(echo "$deploy"| grep -n 'iptables -I DOCKER-USER' | head -1 | cut -d: -f1)
+  erun_line=$(echo "$deploy"      | grep -n 'make e2e-run'            | head -1 | cut -d: -f1)
+  iptables_d_line=$(echo "$deploy"| grep -n 'iptables -D DOCKER-USER' | head -1 | cut -d: -f1)
+
+  [[ -n "$cluster_line" && -n "$crictl_line" && -n "$iptables_i_line" && -n "$erun_line" && -n "$iptables_d_line" ]] || \
+    { echo "FAIL: ordering lines not all found"; return 1; }
+  [[ "$cluster_line" -lt "$crictl_line" ]]     || { echo "FAIL: cluster-up must precede crictl pull"; return 1; }
+  [[ "$crictl_line" -lt "$iptables_i_line" ]]  || { echo "FAIL: crictl pull must precede iptables block"; return 1; }
+  [[ "$iptables_i_line" -lt "$erun_line" ]]    || { echo "FAIL: iptables block must precede make e2e-run"; return 1; }
+  [[ "$erun_line" -lt "$iptables_d_line" ]]    || { echo "FAIL: make e2e-run must precede iptables remove"; return 1; }
+
+  # restore step must have if: always() && steps.egress.outcome
+  assert_contains "$deploy" "always() && steps.egress.outcome" || return 1
+  # upload step must also have if: always()
+  assert_contains "$deploy" "always()" || return 1
+
+  # package job must not contain iptables or tcpdump
+  local pkg
+  pkg="$(sed -n '/^  package:/,/^  deploy:/p' "$wf")"
+  assert_not_contains "$pkg" "iptables" || return 1
+  assert_not_contains "$pkg" "tcpdump"  || return 1
+}
+
 # ── Run all tests ─────────────────────────────────────────────────────────────
 
 run_test "build produces application tree" test_build_produces_application_tree
@@ -1032,6 +1076,7 @@ run_test "make e2e-run skips build and sign" test_make_e2e_run_skips_build_sign
 run_test "devcontainer config is valid" test_devcontainer_config_is_valid
 run_test "devcontainer pins tools" test_devcontainer_pins_tools
 run_test "renovate updates OCM SHA256 ARGs" test_renovate_updates_ocm_sha256
+run_test "e2e workflow isolates deploy" test_e2e_workflow_isolates_deploy
 
 echo ""
 echo "Results: $PASS passed, $FAIL failed"
