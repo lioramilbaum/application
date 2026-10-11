@@ -910,43 +910,6 @@ test_cluster_sh_configures_local_registry_mirror() {
   assert_not_contains "$(cat "$tmp/docker.log" 2>/dev/null || true)" "certs.d" || return 1
 }
 
-test_airgapped_workflow_isolates_deploy() {
-  local wf="$ROOT/.github/workflows/air-gapped.yaml"
-  [[ -f "$wf" ]] || { echo "  air-gapped.yaml not found" >&2; return 1; }
-  local content
-  content="$(cat "$wf")"
-
-  local needle
-  for needle in "schedule:" "workflow_dispatch:" "registry:2" "iptables -I DOCKER-USER" \
-    "--ctstate NEW" "-j DROP" "tcpdump" "OCM_COMPONENT_REPO" "make manifests" "kubectl apply"; do
-    assert_contains "$content" "$needle" || return 1
-  done
-
-  # The isolated deploy job must not run "make deploy" (it would bypass the local-registry render)
-  local isolated
-  isolated="$(sed -n '/^  isolated-deploy:/,$p' "$wf")"
-  assert_not_contains "$isolated" "make deploy" || return 1
-
-  # Transfer happens before egress is blocked, and egress is blocked before the isolated render
-  local publish_line egress_line
-  publish_line="$(grep -n 'make publish' "$wf" | tail -1 | cut -d: -f1)"
-  egress_line="$(grep -n 'iptables -I DOCKER-USER' "$wf" | head -1 | cut -d: -f1)"
-  [[ -n "$publish_line" && -n "$egress_line" ]] || \
-    { echo "  could not locate publish or iptables steps" >&2; return 1; }
-  [[ "$publish_line" -lt "$egress_line" ]] || { echo "  publish must precede egress block" >&2; return 1; }
-
-  # Egress block and isolated render are compared within the isolated-deploy job only,
-  # so a "make manifests" elsewhere in the workflow cannot satisfy the ordering check
-  local scoped iptables_line manifests_line
-  scoped="$(sed -n '/^  isolated-deploy:/,$p' "$wf")"
-  iptables_line="$(echo "$scoped" | grep -n 'iptables -I DOCKER-USER' | head -1 | cut -d: -f1)"
-  manifests_line="$(echo "$scoped" | grep -n 'make manifests' | head -1 | cut -d: -f1)"
-  [[ -n "$iptables_line" ]] || { echo "  FAIL: iptables line not found in isolated-deploy" >&2; return 1; }
-  [[ -n "$manifests_line" ]] || { echo "  FAIL: make manifests line not found in isolated-deploy" >&2; return 1; }
-  [[ "$iptables_line" -lt "$manifests_line" ]] || \
-    { echo "  FAIL: iptables must precede make manifests in isolated-deploy" >&2; return 1; }
-}
-
 test_make_e2e_run_skips_build_sign() {
   local tmp="$1"
   local out
@@ -1065,7 +1028,6 @@ run_test "cluster.sh creates missing cluster" test_cluster_sh_creates_missing_cl
 run_test "cluster.sh reuses existing cluster" test_cluster_sh_reuses_existing_cluster
 run_test "cluster.sh down deletes cluster" test_cluster_sh_down_deletes_cluster
 run_test "cluster.sh configures local registry mirror" test_cluster_sh_configures_local_registry_mirror
-run_test "air-gapped workflow isolates deploy" test_airgapped_workflow_isolates_deploy
 run_test "make e2e-run skips build and sign" test_make_e2e_run_skips_build_sign
 run_test "devcontainer config is valid" test_devcontainer_config_is_valid
 run_test "devcontainer pins tools" test_devcontainer_pins_tools

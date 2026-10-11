@@ -194,7 +194,6 @@ Tests include:
 - Component reference override: `cv_ref honours OCM_COMPONENT_REPO`, `manifests reads from OCM_COMPONENT_REPO`
 - Transferred images: `manifests localizes transferred image`, `manifests rejects mismatched image digest`, `manifests rejects missing image digest`
 - Local registry mirror for kind nodes: `cluster.sh configures local registry mirror`
-- Air-gapped workflow structure: `air-gapped workflow isolates deploy` (static check of the egress block ordering)
 
 ## CI
 
@@ -203,7 +202,6 @@ CI runs on `ubuntu-latest` (linux/amd64) inside the devcontainer across three wo
 - **`ci.yaml`** — runs on every push and pull request to `main`: lint and unit tests.
 - **`release.yaml`** — triggered by a `v*.*.*` tag or `workflow_dispatch` with a semver `version` input. Runs tests, then builds and signs the OCM component with `OCM_SIGNING_KEY`, uploads a `application-ctf` artifact, and on tags publishes the component to `ghcr.io/<owner>/ocm` and creates a GitHub release.
 - **`e2e.yaml`** — runs on every push and pull request to `main`. A `package` job builds and signs the component with an auto-generated dev key and uploads it; a `deploy` job downloads it and verifies the signature and deploys it to a kind cluster.
-- **`air-gapped.yaml`** — runs nightly and on `workflow_dispatch`. A `bundle` job builds, signs and publishes the component to GHCR, then transfers it into a local `registry:2` service and an air-gap bundle artifact. An `isolated-deploy` job restores that registry, blocks outbound traffic from the kind network with an `iptables` rule in `DOCKER-USER`, captures packets with `tcpdump`, deploys from the local registry only (`OCM_COMPONENT_REPO`, `make manifests`, `kubectl apply`), and fails if any non-private packet was captured. The capture is uploaded as evidence.
 
 Required repository secrets: `OCM_SIGNING_KEY` (RSA private key PEM).
 
