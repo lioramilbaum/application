@@ -23,7 +23,6 @@ esac
 
 [[ -f "$VERIFY_CONFIG" ]] || die "Verify config not found: $VERIFY_CONFIG (run build and sign first)"
 
-# Redirect stdin from /dev/null: OCM v0.19.0 hangs on open stdin pipes.
 "$OCM" verify cv \
   --config "$VERIFY_CONFIG" \
   --signature "$VERIFY_SIGNATURE" \
