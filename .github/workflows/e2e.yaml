@@ -104,7 +104,7 @@ jobs:
             EOF
             make cluster-up
             make manifests
-            mapfile -t images < <(sed -n 's/^[[:space:]]*image:[[:space:]]*//p' build/deploy/hello-world.yaml | sort -u)
+            mapfile -t images < <(awk '/image:/{for(i=1;i<=NF;i++) if($i=="image:") print $(i+1)}' build/deploy/hello-world.yaml | sort -u)
             [[ ${#images[@]} -gt 0 ]] || { echo "::error::no images found in rendered manifest"; exit 1; }
             for node in $(kind get nodes --name ocm-application); do
               for img in "${images[@]}"; do
