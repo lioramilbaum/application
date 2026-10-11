@@ -12,6 +12,8 @@ export DEPLOY_DIR="${DEPLOY_DIR:-$BUILD_DIR/deploy}"
 export APP_NAME="hello-world"
 export APP_NAMESPACE="hello-world"
 export IMAGE_PLACEHOLDER="HELLO_WORLD_IMAGE"
+export MANIFESTS_RESOURCE="hello-world-manifests"
+export LOCALIZATION_RESOURCE="hello-world-localization"
 export KUBECTL="${KUBECTL:-kubectl}"
 
 host_os() {
@@ -45,7 +47,9 @@ require_darwin_arm64() {
 
 cv_ref() {
   local component="${1:-$ROOT_COMPONENT}"
-  echo "ctf::${CTF}//${component}:${VERSION}"
+  # OCM_COMPONENT_REPO overrides the CTF for registry-sourced components,
+  # e.g. OCM_COMPONENT_REPO=oci::http://localhost:5001
+  echo "${OCM_COMPONENT_REPO:-ctf::${CTF}}//${component}:${VERSION}"
 }
 
 die() {

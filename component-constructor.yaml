@@ -28,6 +28,13 @@ components:
           type: file
           path: ./components/hello-world/manifests.yaml
           mediaType: application/yaml
+      - name: hello-world-localization
+        type: localizationConfig
+        version: ${VERSION}
+        input:
+          type: file
+          path: ./components/hello-world/localization.json
+          mediaType: application/json
       # Deploy-time bundle: consumers download this to deploy the application.
       # Build-time scripts (build.sh, sign.sh, keys.sh, sigstore.sh, fetch-ocm.sh, fetch-kind.sh,
       # publish.sh, e2e.sh, cluster.sh) are excluded.
