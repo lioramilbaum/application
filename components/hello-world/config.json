@@ -1,0 +1,20 @@
+{
+  "apiVersion": "config.application.lioramilbaum.github.com/v1alpha1",
+  "kind": "ConfigData",
+  "configurations": [
+    {
+      "name": "replicas",
+      "target": { "kind": "Deployment", "name": "hello-world" },
+      "path": "/spec/replicas",
+      "placeholder": "HELLO_WORLD_REPLICAS",
+      "value": 1
+    },
+    {
+      "name": "index-html",
+      "target": { "kind": "ConfigMap", "name": "hello-world-html" },
+      "path": "/data/index.html",
+      "placeholder": "HELLO_WORLD_HTML",
+      "value": "Hello, World!\n"
+    }
+  ]
+}

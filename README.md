@@ -10,6 +10,7 @@ github.com/lioramilbaum/application
 ├── hello-world-image  (ociImage, architecture=arm64, docker.io/library/nginx:1.31-alpine)
 ├── hello-world-manifests  (blob, application/yaml, Kubernetes manifests)
 ├── hello-world-localization  (localizationConfig, application/json, image localization rules)
+├── hello-world-config  (configData, application/json, deploy-time configuration values)
 └── deploy-bundle  (directoryTree, deployment scripts and descriptor)
     ├── component-constructor.yaml  (OCM component descriptor)
     ├── scripts/lib.sh  (shared script functions)
@@ -25,15 +26,28 @@ The names in the tree are artifact identities within `github.com/lioramilbaum/ap
 
 ## How it works
 
-A single OCM component with 5 direct resources and 1 source (no component references):
+A single OCM component with 6 direct resources and 1 source (no component references):
 
 - **hello-world-image**: nginx container image (digest-pinned from Docker Hub)
 - **hello-world-manifests**: Kubernetes Namespace, ConfigMap, Deployment, and Service manifests
 - **hello-world-localization**: signed localization rules (`components/hello-world/localization.json`) mapping each image resource to a container field in the manifests
+- **hello-world-config**: signed deploy-time configuration values (`components/hello-world/config.json`) for the replica count and the served `index.html`
 - **deploy-bundle**: directoryTree containing the deployment scripts and OCM component descriptor
 - **application-source**: git source reference with the repository URL and commit SHA
 
 The key concept is **digest-pinned images**. At build time, the OCM component records the nginx image with the digest already pinned in `component-constructor.yaml` (e.g., `docker.io/library/nginx:1.31-alpine@sha256:138af8...`). At deploy time, `manifests.sh` downloads the manifest template and the localization rules from the signed component and checks both against their descriptor digests. It then generates a `kustomization.yaml` with JSON 6902 patches that set the target container's image to the pinned digest, and renders the result with `kubectl kustomize`. The rules say which container in which workload gets which image resource, so the mapping is covered by the signature too. The `HELLO_WORLD_IMAGE` placeholder in the manifest is a sentinel: rendering fails if it survives. This ensures reproducible, tamper-evident deployments: the deployed image is cryptographically tied to the signed component, and no one can swap the image or its target field without invalidating the signature. See [Signing and verification](#signing-and-verification) for what the signature covers.
+
+### Deploy-time configuration
+
+The `hello-world-config` resource (`components/hello-world/config.json`, `configData`) carries the values that the manifests take at deploy time. Its schema is `config.application.lioramilbaum.github.com/v1alpha1`, kind `ConfigData`, with a `configurations` array. Each entry has:
+
+- `name`: a label for the entry
+- `target`: the `kind` and `name` of the object to patch (for example `Deployment/hello-world`)
+- `path`: the JSON pointer of the field to set (for example `/spec/replicas`)
+- `placeholder`: the sentinel string that the manifest carries at that field (for example `HELLO_WORLD_REPLICAS`)
+- `value`: the signed value to write in place of the placeholder
+
+`components/hello-world/manifests.yaml` contains the placeholders, each annotated with a comment pointing back to the config file. `manifests.sh` downloads the config, checks its sha256 against the descriptor digest, and validates the schema. For each entry it generates a JSON 6902 patch that tests the placeholder and then replaces it with `value`. Rendering fails if any `HELLO_WORLD_*` placeholder survives, so a config entry that does not match its target leaves the placeholder behind and the render stops. Because the values are part of the signed component, changing the replica count or the served page requires rebuilding and re-signing the component.
 
 `make deploy` calls `build`, `sign`, then `deploy.sh` to deploy the application. Consumers can also download the full deployment bundle for self-contained execution.
 
@@ -94,6 +108,7 @@ This component's elements and their identities:
 | resource `hello-world-image` (arm64) | `name=hello-world-image,version=0.1.0,architecture=arm64` | `github.com/lioramilbaum/application:0.1.0:resource/hello-world-image` |
 | resource `hello-world-manifests` | `name=hello-world-manifests,version=0.1.0` | `github.com/lioramilbaum/application:0.1.0:resource/hello-world-manifests` |
 | resource `hello-world-localization` | `name=hello-world-localization,version=0.1.0` | `github.com/lioramilbaum/application:0.1.0:resource/hello-world-localization` |
+| resource `hello-world-config` | `name=hello-world-config,version=0.1.0` | `github.com/lioramilbaum/application:0.1.0:resource/hello-world-config` |
 | resource `deploy-bundle` | `name=deploy-bundle,version=0.1.0` | `github.com/lioramilbaum/application:0.1.0:resource/deploy-bundle` |
 | source `application-source` | `name=application-source,version=0.1.0` | `github.com/lioramilbaum/application:0.1.0:source/application-source` |
 
@@ -115,7 +130,7 @@ back to a subset match, and requires exactly one candidate:
 |---|---|
 | `name=deploy-bundle` | OK (subset match, one candidate) |
 | `name=deploy-bundle,version=0.1.0` | OK (exact match) |
-| `version=0.1.0` | error: `expected exactly one resource candidate to download, got 5` |
+| `version=0.1.0` | error: `expected exactly one resource candidate to download, got 6` |
 | `name=deploy-bundle,version=9.9.9` | error: `expected exactly one resource candidate to download, got 0` |
 | `name=hello-world-image` | error: `expected exactly one resource candidate to download, got 2` |
 | `name=hello-world-image,architecture=amd64` | OK (subset match, one candidate) |
@@ -730,6 +745,7 @@ Tests include:
 - Signature verification with correct and wrong keys
 - Manifest rendering with digest-pinned images
 - Localization rules: resource metadata (`localization resource metadata`), rule-based image injection (`manifests localizes by rule not placeholder`), rejection of untargeted rules (`manifests rejects untargeted localization`), wrong container (`manifests rejects wrong container`), and tampered rules (`manifests rejects tampered localization`)
+- Deploy-time configuration: resource metadata (`config resource metadata`), value injection (`manifests applies config values`), rejection of tampered config (`manifests rejects tampered config`), untargeted config (`manifests rejects untargeted config`), and invalid config (`manifests rejects invalid config`)
 - Deploy workflow and error handling
 - Script resource download and bundle self-containedness
 - Component reference override: `cv_ref honours OCM_COMPONENT_REPO`, `manifests reads from OCM_COMPONENT_REPO`

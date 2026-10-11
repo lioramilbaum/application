@@ -9,8 +9,7 @@ metadata:
   name: hello-world-html
   namespace: hello-world
 data:
-  index.html: |
-    Hello, World!
+  index.html: HELLO_WORLD_HTML  # set via hello-world-config (components/hello-world/config.json)
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -20,7 +19,7 @@ metadata:
   labels:
     app.kubernetes.io/name: hello-world
 spec:
-  replicas: 1
+  replicas: HELLO_WORLD_REPLICAS  # placeholder: set via hello-world-config; not schema-valid pre-render
   selector:
     matchLabels:
       app.kubernetes.io/name: hello-world

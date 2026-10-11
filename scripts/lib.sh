@@ -14,6 +14,8 @@ export APP_NAMESPACE="hello-world"
 export IMAGE_PLACEHOLDER="HELLO_WORLD_IMAGE"
 export MANIFESTS_RESOURCE="hello-world-manifests"
 export LOCALIZATION_RESOURCE="hello-world-localization"
+export CONFIG_RESOURCE="hello-world-config"
+export PLACEHOLDER_PATTERN='HELLO_WORLD_[A-Z0-9_]+'
 export KUBECTL="${KUBECTL:-kubectl}"
 
 host_os() {

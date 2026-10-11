@@ -226,11 +226,34 @@ OCMEOF
   echo "$dir/stub-bin"
 }
 
+_stub_ocm_tamper_config() {
+  local dir="$1"
+  mkdir -p "$dir/stub-bin"
+  cat > "$dir/stub-bin/ocm" <<'OCMEOF'
+#!/usr/bin/env bash
+REAL_OCM="${REAL_OCM:-ocm}"
+"$REAL_OCM" "$@" || exit $?
+# After downloading the config blob, append a byte to simulate tampering
+if [[ "$*" == *"download resource"* ]] && [[ "$*" == *"name=hello-world-config"* ]]; then
+  out=""
+  prev=""
+  for arg in "$@"; do
+    [[ "$prev" == "--output" ]] && out="$arg"
+    prev="$arg"
+  done
+  printf 'x' >> "$out"
+fi
+OCMEOF
+  chmod 0755 "$dir/stub-bin/ocm"
+  echo "$dir/stub-bin"
+}
+
 # Builds a CTF from a copy of the component sources. $2 is an optional sed
-# expression applied to manifests.yaml and $3 an optional jq filter applied
-# to localization.json. Prints the CTF path.
+# expression applied to manifests.yaml, $3 an optional jq filter applied
+# to localization.json and $4 an optional jq filter applied to config.json.
+# Prints the CTF path.
 _build_variant() {
-  local dir="$1" manifest_expr="$2" loc_filter="$3"
+  local dir="$1" manifest_expr="$2" loc_filter="$3" config_filter="${4:-}"
   local repo="$dir/variant-repo"
   rm -rf "$repo"
   mkdir -p "$repo"
@@ -243,6 +266,8 @@ _build_variant() {
     jq "$loc_filter" "$ROOT/components/hello-world/localization.json" \
       > "$repo/components/hello-world/localization.json"
   fi
+  [[ -z "$config_filter" ]] || \
+    jq "$config_filter" "$ROOT/components/hello-world/config.json" > "$repo/components/hello-world/config.json"
   SOURCE_COMMIT="0123456789abcdef0123456789abcdef01234567" \
     BUILD_DIR="$dir/variant-build" CTF="$dir/variant-ctf" \
     bash "$repo/scripts/build.sh" >/dev/null
@@ -309,7 +334,7 @@ test_build_produces_application_tree() {
   local resource_names
   resource_names=$("$OCM" get cv "$(cv_ref "$ROOT_COMPONENT")" \
     -o json 2>/dev/null | jq -r '.[0].component.resources[].name' | sort | paste -sd, -)
-  assert_eq "$resource_names" "deploy-bundle,hello-world-image,hello-world-image,hello-world-localization,hello-world-manifests" "resource names"
+  assert_eq "$resource_names" "deploy-bundle,hello-world-config,hello-world-image,hello-world-image,hello-world-localization,hello-world-manifests" "resource names"
 
   local image_archs
   image_archs=$("$OCM" get cv "$(cv_ref "$ROOT_COMPONENT")" \
@@ -642,6 +667,125 @@ test_manifests_rejects_tampered_localization() {
 
   assert_contains "$out" "localization blob digest mismatch"
   [[ ! -f "$tmp/deploy/hello-world.yaml" ]] || { echo "  Rendered file should not exist on failure" >&2; return 1; }
+}
+
+test_config_resource_metadata() {
+  # uses golden dir directly (read-only; $1 unused)
+  local tmp="$1"
+  require "$OCM" jq
+  local ctf
+  _build_golden
+  ctf="$GOLDEN_DIR/ctf"
+  local cv_json
+  cv_json="$("$OCM" get cv "ctf::${ctf}//${ROOT_COMPONENT}:${VERSION}" -o json)" || return 1
+  local res_json
+  res_json="$(echo "$cv_json" | jq -c '.[0].component.resources[] | select(.name=="hello-world-config")')" || return 1
+  [[ -n "$res_json" ]] || { echo "hello-world-config resource not found"; return 1; }
+  local rtype mediatype rver digest_val expected_digest
+  rtype="$(echo "$res_json" | jq -r '.type')"
+  mediatype="$(echo "$res_json" | jq -r '.access.mediaType')"
+  rver="$(echo "$res_json" | jq -r '.version')"
+  digest_val="$(echo "$res_json" | jq -r '.digest.value')"
+  expected_digest="$(sha256 "$ROOT/components/hello-world/config.json")"
+  [[ "$rtype" == "configData" ]] || { echo "expected type configData, got $rtype"; return 1; }
+  [[ "$mediatype" == "application/json" ]] || { echo "expected mediaType application/json, got $mediatype"; return 1; }
+  [[ "$rver" == "$VERSION" ]] || { echo "expected version $VERSION, got $rver"; return 1; }
+  [[ "$digest_val" == "$expected_digest" ]] || { echo "digest mismatch: expected $expected_digest, got $digest_val"; return 1; }
+}
+
+test_manifests_applies_config_values() {
+  local tmp="$1"
+  require "$OCM" jq "$KUBECTL"
+  local ctf
+  ctf="$(_build_variant "$tmp" \
+    '' \
+    '' \
+    '(.configurations[] | select(.name=="replicas") | .value) = 3 |
+     (.configurations[] | select(.name=="index-html") | .value) = "Hello from signed config!\n"')" || return 1
+  # Verify manifests.yaml has the placeholders (not literal values)
+  grep -q "HELLO_WORLD_REPLICAS" "$ROOT/components/hello-world/manifests.yaml" || \
+    { echo "HELLO_WORLD_REPLICAS placeholder missing from manifests.yaml"; return 1; }
+  grep -q "HELLO_WORLD_HTML" "$ROOT/components/hello-world/manifests.yaml" || \
+    { echo "HELLO_WORLD_HTML placeholder missing from manifests.yaml"; return 1; }
+  local deploy_dir="$tmp/deploy"
+  mkdir -p "$deploy_dir"
+  local out
+  out="$(CTF="$ctf" DEPLOY_DIR="$deploy_dir" SKIP_VERIFY=1 \
+    bash "$ROOT/scripts/manifests.sh" 2>&1)" || \
+    { echo "manifests.sh failed: $out"; return 1; }
+  local rendered="$deploy_dir/hello-world.yaml"
+  [[ -f "$rendered" ]] || { echo "rendered manifest not found"; return 1; }
+  grep -q "replicas: 3" "$rendered" || \
+    { echo "replicas: 3 not found in rendered manifest"; return 1; }
+  grep -q "Hello from signed config!" "$rendered" || \
+    { echo "Hello from signed config! not found in rendered manifest"; return 1; }
+  ! grep -qE "HELLO_WORLD_" "$rendered" || \
+    { echo "unresolved placeholder found in rendered manifest"; return 1; }
+  ! grep -q "Hello, World!" "$rendered" || \
+    { echo "literal Hello, World! still present (config not applied)"; return 1; }
+  grep -q "/spec/replicas" "$deploy_dir/kustomization.yaml" || \
+    { echo "/spec/replicas not in kustomization.yaml"; return 1; }
+  grep -q "/data/index.html" "$deploy_dir/kustomization.yaml" || \
+    { echo "/data/index.html not in kustomization.yaml"; return 1; }
+}
+
+test_manifests_rejects_tampered_config() {
+  local tmp="$1"
+  require "$OCM" jq "$KUBECTL"
+  local ctf
+  ctf="$(_build_variant "$tmp" '' '')" || return 1
+  local stub_dir
+  stub_dir="$(_stub_ocm_tamper_config "$tmp")"
+  local deploy_dir="$tmp/deploy"
+  mkdir -p "$deploy_dir"
+  local out
+  # shellcheck disable=SC2097,SC2098
+  out="$(REAL_OCM="$OCM" OCM="$stub_dir/ocm" CTF="$ctf" DEPLOY_DIR="$deploy_dir" SKIP_VERIFY=1 \
+    bash "$ROOT/scripts/manifests.sh" 2>&1)" && \
+    { echo "expected failure, got success"; return 1; }
+  echo "$out" | grep -q "config blob digest mismatch" || \
+    { echo "expected 'config blob digest mismatch' in output, got: $out"; return 1; }
+  [[ ! -f "$deploy_dir/hello-world.yaml" ]] || \
+    { echo "rendered manifest should not exist after tamper"; return 1; }
+}
+
+test_manifests_rejects_untargeted_config() {
+  local tmp="$1"
+  require "$OCM" jq "$KUBECTL"
+  local ctf
+  ctf="$(_build_variant "$tmp" \
+    '' \
+    '' \
+    '(.configurations[] | select(.name=="replicas") | .target.name) = "does-not-exist"')" || return 1
+  local deploy_dir="$tmp/deploy"
+  mkdir -p "$deploy_dir"
+  local out
+  out="$(CTF="$ctf" DEPLOY_DIR="$deploy_dir" SKIP_VERIFY=1 \
+    bash "$ROOT/scripts/manifests.sh" 2>&1)" && \
+    { echo "expected failure, got success"; return 1; }
+  # kustomize may error on unmatched targets (newer versions) or succeed and leave the
+  # placeholder unreplaced (older versions); either way manifests.sh must reject the result
+  echo "$out" | grep -qE "unresolved placeholder|kustomize localization failed" || \
+    { echo "expected rejection message in output, got: $out"; return 1; }
+  [[ ! -f "$deploy_dir/hello-world.yaml" ]] || \
+    { echo "rendered manifest should not exist after untargeted config"; return 1; }
+}
+
+test_manifests_rejects_invalid_config() {
+  local tmp="$1"
+  require "$OCM" jq "$KUBECTL"
+  local ctf
+  ctf="$(_build_variant "$tmp" '' '' '.kind = "Bogus"')" || return 1
+  local deploy_dir="$tmp/deploy"
+  mkdir -p "$deploy_dir"
+  local out
+  out="$(CTF="$ctf" DEPLOY_DIR="$deploy_dir" SKIP_VERIFY=1 \
+    bash "$ROOT/scripts/manifests.sh" 2>&1)" && \
+    { echo "expected failure, got success"; return 1; }
+  echo "$out" | grep -q "unsupported config data" || \
+    { echo "expected 'unsupported config data' in output, got: $out"; return 1; }
+  [[ ! -f "$deploy_dir/hello-world.yaml" ]] || \
+    { echo "rendered manifest should not exist after invalid config"; return 1; }
 }
 
 # jq must be available; deploy.sh requires it before reaching the verify block
@@ -1900,7 +2044,7 @@ test_component_identity_selects_artifacts() {
   out="$("$OCM" download resource "$(cv_ref)" --identity "version=$VERSION" \
     --output "$tmp/bad.yaml" 2>&1)" \
     && { echo "  version-only identity should fail" >&2; return 1; }
-  assert_contains "$out" "got 5" || return 1
+  assert_contains "$out" "got 6" || return 1
 
   out="$("$OCM" download resource "$(cv_ref)" \
     --identity "name=hello-world-manifests,version=9.9.9" \
@@ -2169,6 +2313,11 @@ run_test "manifests localizes by rule not placeholder" test_manifests_localizes_
 run_test "manifests rejects untargeted localization" test_manifests_rejects_untargeted_localization
 run_test "manifests rejects wrong container" test_manifests_rejects_wrong_container
 run_test "manifests rejects tampered localization" test_manifests_rejects_tampered_localization
+run_test "config resource metadata" test_config_resource_metadata
+run_test "manifests applies config values" test_manifests_applies_config_values
+run_test "manifests rejects tampered config" test_manifests_rejects_tampered_config
+run_test "manifests rejects untargeted config" test_manifests_rejects_untargeted_config
+run_test "manifests rejects invalid config" test_manifests_rejects_invalid_config
 run_test "deploy verifies before deploying" test_deploy_verifies_before_deploying
 run_test "deploy applies rendered manifests" test_deploy_applies_rendered_manifests
 run_test "deploy fails when rollout fails" test_deploy_fails_when_rollout_fails
