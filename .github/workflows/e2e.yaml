@@ -82,7 +82,7 @@ jobs:
         run: |
           [[ -d build/ctf && -f build/keys/public.pem ]] || \
             { echo '::error::signed component or public key missing from artifact'; exit 1; }
-      - name: E2E in devcontainer
+      - name: Create kind cluster and stage images
         uses: devcontainers/ci@513af61f4de4f75d37e4438f184ba4358f0fc1ca # v0.3.1900000450
         with:
           push: never
@@ -102,4 +102,103 @@ jobs:
                       - type: RSACredentials/v1
                         publicKeyPEMFile: $PWD/build/keys/public.pem
             EOF
+            make cluster-up
+            make manifests
+            mapfile -t images < <(awk '/image:/{for(i=1;i<=NF;i++) if($i=="image:") print $(i+1)}' build/deploy/hello-world.yaml | sort -u)
+            [[ ${#images[@]} -gt 0 ]] || { echo "::error::no images found in rendered manifest"; exit 1; }
+            for node in $(kind get nodes --name ocm-application); do
+              for img in "${images[@]}"; do
+                docker exec "$node" crictl pull "$img"
+              done
+            done
+      - name: Block external egress from kind network
+        id: egress
+        run: |
+          bridge=$(docker network inspect kind -f '{{index .Options "com.docker.network.bridge.name"}}' 2>/dev/null)
+          if [[ -z "$bridge" ]]; then
+            bridge="br-$(docker network inspect kind -f '{{.Id}}' | cut -c1-12)"
+          fi
+          ip link show "$bridge" >/dev/null || { echo "::error::kind bridge interface not found: $bridge"; exit 1; }
+          echo "BRIDGE_INTERFACE=$bridge" >> "$GITHUB_ENV"
+
+          sudo iptables -L DOCKER-USER -n >/dev/null || { echo "::error::DOCKER-USER chain not found"; exit 1; }
+          sudo iptables -I DOCKER-USER 1 \
+            -i "$bridge" ! -o "$bridge" \
+            -m conntrack --ctstate NEW \
+            -m comment --comment application-e2e-egress -j DROP
+          if ! sudo iptables -C DOCKER-USER \
+            -i "$bridge" ! -o "$bridge" \
+            -m conntrack --ctstate NEW \
+            -m comment --comment application-e2e-egress -j DROP; then
+            echo "::error::Failed to block external egress from the kind network"
+            exit 1
+          fi
+
+          command -v tcpdump || sudo apt-get install -y tcpdump
+          sudo nohup tcpdump -U -n \
+            -i "$bridge" \
+            -w /tmp/e2e-public-egress.pcap \
+            '(ip and not dst net 10.0.0.0/8 and not dst net 172.16.0.0/12 and not dst net 192.168.0.0/16 and not dst net 127.0.0.0/8 and not dst net 169.254.0.0/16 and not multicast) or (ip6 and not dst net fc00::/7 and not dst net fe80::/10 and not dst host ::1 and not multicast)' \
+            >/tmp/e2e-tcpdump.log 2>&1 &
+          echo "TCPDUMP_PID=$!" >> "$GITHUB_ENV"
+          sleep 1
+          if ! sudo kill -0 "$!" 2>/dev/null; then
+            echo "::error::Traffic capture failed to start"
+            cat /tmp/e2e-tcpdump.log || true
+            exit 1
+          fi
+      - name: E2E in devcontainer
+        uses: devcontainers/ci@513af61f4de4f75d37e4438f184ba4358f0fc1ca # v0.3.1900000450
+        with:
+          push: never
+          cacheFrom: ${{ env.DEVCONTAINER_IMAGE }}:latest
+          runCmd: |
+            set -euo pipefail
             make e2e-run
+      - name: Restore egress and assert no external traffic
+        if: always() && steps.egress.outcome != 'skipped'
+        env:
+          EGRESS_OUTCOME: ${{ steps.egress.outcome }}
+        run: |
+          if [[ -n "${TCPDUMP_PID:-}" ]]; then
+            sudo kill -INT "$TCPDUMP_PID" 2>/dev/null || true
+            for i in $(seq 1 10); do
+              sudo kill -0 "$TCPDUMP_PID" 2>/dev/null || break
+              sleep 1
+            done
+            sudo kill -0 "$TCPDUMP_PID" 2>/dev/null && \
+              echo "::warning::tcpdump did not stop within 10 s; pcap may be incomplete" || true
+          fi
+
+          if [[ -n "${BRIDGE_INTERFACE:-}" ]]; then
+            while sudo iptables -D DOCKER-USER \
+              -i "$BRIDGE_INTERFACE" ! -o "$BRIDGE_INTERFACE" \
+              -m conntrack --ctstate NEW \
+              -m comment --comment application-e2e-egress -j DROP 2>/dev/null; do
+              :
+            done
+          fi
+
+          [[ "$EGRESS_OUTCOME" == "success" ]] || exit 0
+
+          [[ -f /tmp/e2e-public-egress.pcap ]] || { echo "::error::Packet capture file not found"; exit 1; }
+          sudo chmod a+r /tmp/e2e-public-egress.pcap
+          sudo tcpdump -n -r /tmp/e2e-public-egress.pcap > /tmp/e2e-public-egress.txt 2>/dev/null || \
+            { echo "::error::failed to read egress pcap"; exit 1; }
+          if [[ -s /tmp/e2e-public-egress.txt ]]; then
+            echo "::error::Public network traffic was attempted from the kind network during e2e"
+            cat /tmp/e2e-public-egress.txt
+            exit 1
+          fi
+          echo "No external packets captured — isolated e2e confirmed clean."
+      - name: Upload egress evidence
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: application-e2e-egress-evidence
+          path: |
+            /tmp/e2e-public-egress.pcap
+            /tmp/e2e-public-egress.txt
+            /tmp/e2e-tcpdump.log
+          if-no-files-found: warn
+          retention-days: 1

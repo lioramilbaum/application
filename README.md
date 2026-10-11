@@ -194,6 +194,7 @@ Tests include:
 - Component reference override: `cv_ref honours OCM_COMPONENT_REPO`, `manifests reads from OCM_COMPONENT_REPO`
 - Transferred images: `manifests localizes transferred image`, `manifests rejects mismatched image digest`, `manifests rejects missing image digest`
 - Local registry mirror for kind nodes: `cluster.sh configures local registry mirror`
+- CI e2e isolation: `e2e workflow isolates deploy`
 
 ## CI
 
@@ -201,7 +202,7 @@ CI runs on `ubuntu-latest` (linux/amd64) inside the devcontainer across three wo
 
 - **`ci.yaml`** — runs on every push and pull request to `main`: lint and unit tests.
 - **`release.yaml`** — triggered by a `v*.*.*` tag or `workflow_dispatch` with a semver `version` input. Runs tests, then builds and signs the OCM component with `OCM_SIGNING_KEY`, uploads a `application-ctf` artifact, and on tags publishes the component to `ghcr.io/<owner>/ocm` and creates a GitHub release.
-- **`e2e.yaml`** — runs on every push and pull request to `main`. A `package` job builds and signs the component with an auto-generated dev key and uploads it; a `deploy` job downloads it and verifies the signature and deploys it to a kind cluster.
+- **`e2e.yaml`** — runs on every push and pull request to `main`. A `package` job builds and signs the component with an auto-generated dev key and uploads it. A `deploy` job downloads it, verifies the signature, and runs the e2e in isolation: it creates the kind cluster and pre-pulls the rendered manifest images into the kind nodes, then blocks new outbound connections from the kind network with an iptables `DOCKER-USER` rule and starts a `tcpdump` capture on the kind bridge. It runs `make e2e-run` against the cluster, then removes the rule, stops the capture, and fails if any packet left the private ranges for the public internet. The pcap and tcpdump text are uploaded as the `application-e2e-egress-evidence` artifact.
 
 Required repository secrets: `OCM_SIGNING_KEY` (RSA private key PEM).
 
