@@ -24,7 +24,7 @@ manifests: ## Download and render app manifests from the OCM component
 deploy: build sign ## Deploy the application to the current cluster (requires KUBECONFIG)
 	@bash scripts/deploy.sh
 
-publish: ## Transfer the CTF to an OCI registry (requires OCM_REPO=...)
+publish: ## Transfer the CTF to an OCI registry (requires OCM_REPO=...; optional OCM_REGISTRY_USERNAME/OCM_REGISTRY_PASSWORD)
 	@bash scripts/publish.sh
 
 lint: ## Lint shell scripts (if shellcheck is available)
