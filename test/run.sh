@@ -257,6 +257,39 @@ _download_bundle() {
     --identity name=deploy-bundle --output "$dest"
 }
 
+_empty_ocmconfig() {
+  local dir="$1"
+  local path="$dir/empty.ocmconfig"
+  cat > "$path" <<'YAML'
+type: generic.config.ocm.software/v1
+configurations: []
+YAML
+  echo "$path"
+}
+
+# Builds a consumer CTF whose component references the application component
+_resolver_consumer_ctf() {
+  local dir="$1" config="$2"
+  local constructor="$dir/consumer-constructor.yaml"
+  cat > "$constructor" <<YAML
+components:
+  - name: example.com/resolver-demo/consumer
+    version: "1.0.0"
+    provider:
+      name: example.com
+    componentReferences:
+      - name: application
+        componentName: ${ROOT_COMPONENT}
+        version: "${VERSION}"
+YAML
+  "$OCM" add cv \
+    --repository "ctf::$dir/consumer-ctf" \
+    --constructor "$constructor" \
+    --config "$config" \
+    --external-component-version-copy-policy skip >/dev/null
+  echo "$dir/consumer-ctf"
+}
+
 # ── Tests ────────────────────────────────────────────────────────────────────
 
 test_build_produces_application_tree() {
@@ -1166,6 +1199,137 @@ test_release_publishes_with_ocm_credentials() {
   assert_not_contains "$step" "docker login" || return 1
 }
 
+test_resolvers_config_is_valid_for_ocm() {
+  local tmp
+  tmp="$(mktemp -d)"
+  trap 'rm -rf "$tmp"' RETURN
+  GOLDEN_DIR="$tmp" BUILD_DIR="$tmp" _build
+
+  BUILD_DIR="$tmp" bash "$ROOT/scripts/resolvers.sh" >/dev/null
+
+  local cfg="$tmp/resolvers.ocmconfig"
+  [[ -f "$cfg" ]] || { echo "  resolvers.ocmconfig not created" >&2; return 1; }
+  assert_contains "$(cat "$cfg")" "type: resolvers.config.ocm.software/v1alpha1" || return 1
+  assert_contains "$(cat "$cfg")" 'componentNamePattern: "github.com/lioramilbaum/**"' || return 1
+  assert_contains "$(cat "$cfg")" "type: CommonTransportFormat/v1" || return 1
+  assert_contains "$(cat "$cfg")" "filePath: \"${CTF}\"" || return 1
+  # OCM silently ignores unknown keys; prove the correct ones are present
+  assert_not_contains "$(cat "$cfg")" "component:" || return 1
+  assert_not_contains "$(cat "$cfg")" "version:" || return 1
+
+  # ocm get cv compiles the glob and version constraint — use it as the real parse check
+  "$OCM" get cv "$(cv_ref)" --config "$cfg" -o json > /dev/null
+
+  # A bad glob must be rejected when the resolver is invoked
+  local bad_cfg="$tmp/bad.ocmconfig"
+  sed 's|github.com/lioramilbaum/\*\*|github.com/[unclosed|' "$tmp/resolvers.ocmconfig" > "$bad_cfg"
+  local consumer_ctf_bad
+  consumer_ctf_bad="$(_resolver_consumer_ctf "$tmp" "$tmp/resolvers.ocmconfig")"
+  assert_fails "$OCM" get cv "ctf::${consumer_ctf_bad}//example.com/resolver-demo/consumer:1.0.0" \
+    --recursive --config "$bad_cfg" -o json
+}
+
+test_resolvers_resolve_component_reference() {
+  local tmp
+  tmp="$(mktemp -d)"
+  trap 'rm -rf "$tmp"' RETURN
+  GOLDEN_DIR="$tmp" BUILD_DIR="$tmp" _build
+  BUILD_DIR="$tmp" bash "$ROOT/scripts/resolvers.sh" >/dev/null
+
+  local consumer_ctf
+  consumer_ctf="$(_resolver_consumer_ctf "$tmp" "$tmp/resolvers.ocmconfig")"
+
+  # With resolvers: both components appear in recursive get
+  local result
+  result="$("$OCM" get cv "ctf::${consumer_ctf}//example.com/resolver-demo/consumer:1.0.0" \
+    --recursive --config "$tmp/resolvers.ocmconfig" -o json)"
+  local names
+  names="$(printf '%s' "$result" | jq -r '.[].component.name' | sort | paste -sd, -)"
+  assert_eq "$names" "example.com/resolver-demo/consumer,github.com/lioramilbaum/application" "resolved components" || return 1
+
+  # Without resolvers: recursive get fails (reference cannot be resolved)
+  local empty_cfg
+  empty_cfg="$(_empty_ocmconfig "$tmp")"
+  assert_fails "$OCM" get cv "ctf::${consumer_ctf}//example.com/resolver-demo/consumer:1.0.0" \
+    --recursive --config "$empty_cfg" -o json
+}
+
+test_resolvers_honour_version_constraint_and_order() {
+  local tmp
+  tmp="$(mktemp -d)"
+  trap 'rm -rf "$tmp"' RETURN
+  GOLDEN_DIR="$tmp" BUILD_DIR="$tmp" _build
+  BUILD_DIR="$tmp" bash "$ROOT/scripts/resolvers.sh" >/dev/null
+
+  local consumer_ctf
+  consumer_ctf="$(_resolver_consumer_ctf "$tmp" "$tmp/resolvers.ocmconfig")"
+
+  # Version constraint that excludes the application version must fail
+  local constrained_cfg="$tmp/constrained.ocmconfig"
+  cat > "$constrained_cfg" <<YAML
+type: generic.config.ocm.software/v1
+configurations:
+  - type: resolvers.config.ocm.software/v1alpha1
+    resolvers:
+      - repository:
+          type: CommonTransportFormat/v1
+          filePath: "${CTF}"
+          accessMode: readonly
+        componentNamePattern: "github.com/lioramilbaum/**"
+        versionConstraint: ">=99.0.0"
+YAML
+  assert_fails "$OCM" get cv "ctf::${consumer_ctf}//example.com/resolver-demo/consumer:1.0.0" \
+    --recursive --config "$constrained_cfg" -o json
+
+  # First-match-wins: an empty CTF listed before the real one must fail
+  mkdir -p "$tmp/empty-ctf"
+  local order_bad_cfg="$tmp/order-bad.ocmconfig"
+  cat > "$order_bad_cfg" <<YAML
+type: generic.config.ocm.software/v1
+configurations:
+  - type: resolvers.config.ocm.software/v1alpha1
+    resolvers:
+      - repository:
+          type: CommonTransportFormat/v1
+          filePath: "$tmp/empty-ctf"
+          accessMode: readonly
+        componentNamePattern: "github.com/**"
+      - repository:
+          type: CommonTransportFormat/v1
+          filePath: "${CTF}"
+          accessMode: readonly
+        componentNamePattern: "github.com/lioramilbaum/**"
+YAML
+  # OCM selects the first matching entry with no fallback to later ones.
+  assert_fails "$OCM" get cv "ctf::${consumer_ctf}//example.com/resolver-demo/consumer:1.0.0" \
+    --recursive --config "$order_bad_cfg" -o json
+
+  # Same entries in the opposite order must succeed
+  local order_good_cfg="$tmp/order-good.ocmconfig"
+  cat > "$order_good_cfg" <<YAML
+type: generic.config.ocm.software/v1
+configurations:
+  - type: resolvers.config.ocm.software/v1alpha1
+    resolvers:
+      - repository:
+          type: CommonTransportFormat/v1
+          filePath: "${CTF}"
+          accessMode: readonly
+        componentNamePattern: "github.com/lioramilbaum/**"
+      - repository:
+          type: CommonTransportFormat/v1
+          filePath: "$tmp/empty-ctf"
+          accessMode: readonly
+        componentNamePattern: "github.com/**"
+YAML
+  local result
+  result="$("$OCM" get cv "ctf::${consumer_ctf}//example.com/resolver-demo/consumer:1.0.0" \
+    --recursive --config "$order_good_cfg" -o json)"
+  local names
+  names="$(printf '%s' "$result" | jq -r '.[].component.name' | sort | paste -sd, -)"
+  assert_eq "$names" "example.com/resolver-demo/consumer,github.com/lioramilbaum/application" "resolved components in good order" || return 1
+}
+
 # ── Run all tests ─────────────────────────────────────────────────────────────
 
 run_test "build produces application tree" test_build_produces_application_tree
@@ -1215,6 +1379,9 @@ run_test "publish rejects partial registry credentials" test_publish_rejects_par
 run_test "registry identity derived from OCM_REPO" test_registry_identity_derived_from_ocm_repo
 run_test "registry ocmconfig is valid for ocm" test_registry_ocmconfig_is_valid_for_ocm
 run_test "release publishes with OCM credentials" test_release_publishes_with_ocm_credentials
+run_test "resolvers config is valid for ocm" test_resolvers_config_is_valid_for_ocm
+run_test "resolvers resolve component reference" test_resolvers_resolve_component_reference
+run_test "resolvers honour version constraint and order" test_resolvers_honour_version_constraint_and_order
 
 echo ""
 echo "Results: $PASS passed, $FAIL failed"

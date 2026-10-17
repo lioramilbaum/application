@@ -83,6 +83,58 @@ To keep credentials permanently, add the same consumer block to `~/.ocmconfig` u
 
 Note: `--config -` (stdin) requires OCM CLI ≥ 0.19.1. With an older CLI, put the consumer block in `~/.ocmconfig` and omit the environment variables.
 
+## Resolvers
+
+A component reference does not carry a repository address. The repository on the command line locates the root component only. Resolvers map component name patterns to repositories, so `get cv --recursive`, `transfer cv --recursive`, and `add cv` can find the components that a component references. An explicit repository in a `componentReferences` entry always wins for that component. See the [OCM resolvers](https://ocm.software/docs/concepts/resolvers/) documentation for the full model.
+
+This repository has no `componentReferences`, so its own build scripts never consult a resolver. Resolvers matter to consumers that reference `github.com/lioramilbaum/application`.
+
+A resolver entry takes these fields, under `type: resolvers.config.ocm.software/v1alpha1` nested inside a `generic.config.ocm.software/v1` block:
+
+| Field | Required | Description |
+|---|---|---|
+| `repository` | yes | OCM repository target (`CommonTransportFormat/v1`, `OCIRepository/v1`, etc.) |
+| `componentNamePattern` | no (empty = match all) | Glob. Empty matches everything. |
+| `versionConstraint` | no | Semver range (e.g. `>=1.0.0`, `^0.1`) |
+
+Notes:
+
+- `**` matches any depth. The current OCM CLI compiles globs without a path separator, so `*` also crosses `/`. Use `**` when you mean any depth, to be safe.
+- Resolvers are tried in order and the first match wins, with no fallback. Put specific or constrained entries before catch-all entries.
+
+Local workflow with a CTF:
+
+```bash
+make build resolvers
+# build a consumer component that references this one
+ocm add cv \
+  --repository ctf::./build/consumer-ctf \
+  --constructor consumer.yaml \
+  --config build/resolvers.ocmconfig \
+  --external-component-version-copy-policy skip
+# follow the reference recursively
+ocm get cv ctf::./build/consumer-ctf//example.com/your-consumer:1.0.0 \
+  --recursive --config build/resolvers.ocmconfig -o tree
+```
+
+Without `--config build/resolvers.ocmconfig`, both commands fail to resolve the reference.
+
+For a published component, add the resolver to `~/.ocmconfig`:
+
+```yaml
+type: generic.config.ocm.software/v1
+configurations:
+  - type: resolvers.config.ocm.software/v1alpha1
+    resolvers:
+      - repository:
+          type: OCIRepository/v1
+          baseUrl: ghcr.io
+          subPath: lioramilbaum/ocm
+        componentNamePattern: "github.com/lioramilbaum/**"
+```
+
+Validation: unknown keys (for example `component:` or `version:`) are silently ignored. Bad globs and invalid semver constraints are rejected only when OCM runs a command that loads resolvers, not by `ocm version`.
+
 ## Prerequisites
 
 - OCM CLI v2 ≥ 0.17.0 (publishing with `OCM_REGISTRY_USERNAME`/`OCM_REGISTRY_PASSWORD` requires ≥ 0.19.1)
@@ -105,6 +157,7 @@ The `.devcontainer/` directory provides all required tools when used with Docker
 make build           # build the OCM component archive (CTF)
 make sign            # sign with an auto-generated dev RSA key
 make verify          # verify the signature
+make resolvers       # write build/resolvers.ocmconfig mapping github.com/lioramilbaum/** to the local CTF
 make manifests       # download and render app manifests from the component
 make deploy          # deploy the application to the current cluster (requires KUBECONFIG)
 make cluster-up      # create or reuse the kind cluster; writes build/e2e/kubeconfig (requires docker)
