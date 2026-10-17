@@ -2081,6 +2081,73 @@ test_readme_documents_component_identity() {
   assert_contains "$consuming_section" "(#component-identity)" || return 1
 }
 
+test_discovery_selects_image_variants() {
+  local yaml="$ROOT/k8s/discovery.yaml"
+  [[ -f "$yaml" ]] || { echo "  k8s/discovery.yaml not found" >&2; return 1; }
+  assert_contains "$(cat "$yaml")" "apiVersion: delivery.ocm.software/v1alpha1" || return 1
+  assert_contains "$(cat "$yaml")" "kind: Discovery" || return 1
+  assert_contains "$(cat "$yaml")" "name: application" || return 1
+  assert_contains "$(cat "$yaml")" "name: hello-world-image" || return 1
+
+  _build
+
+  local cv_json resources count
+  cv_json="$("$OCM" get cv "$(cv_ref "$ROOT_COMPONENT")" -o json)"
+
+  # Verify the component label matches the componentSelector
+  local tier_label
+  tier_label="$(echo "$cv_json" | jq -r '.[0].component.labels[] | select(.name=="application.lioramilbaum.github.com/tier") | .value')"
+  [[ -n "$tier_label" ]] || { echo "  tier label not found in component descriptor" >&2; return 1; }
+  assert_contains "$(cat "$yaml")" "application.lioramilbaum.github.com/tier: $tier_label" || return 1
+
+  # matchIdentity name: hello-world-image should select exactly 2 resources (amd64 + arm64)
+  resources="$(echo "$cv_json" | jq -c '[.[0].component.resources[] | select(.name=="hello-world-image")]')"
+  count="$(echo "$resources" | jq length)"
+  assert_eq "$count" "2" "expected 2 hello-world-image resources" || return 1
+
+  # Architecture values must be amd64 and arm64
+  local arch_values
+  arch_values="$(echo "$resources" | jq -r '[.[] | .extraIdentity.architecture] | sort | join(",")')"
+  assert_eq "$arch_values" "amd64,arm64" "unexpected architecture values" || return 1
+
+  # Every byResources path must resolve to a non-null value on each selected resource
+  # (guards against silent-omission: a typo in a path drops the field without error)
+  local path null_count
+  while IFS= read -r line; do
+    if [[ "$line" =~ ^[[:space:]]+[a-z]+:[[:space:]]+(resource\..+)$ ]]; then
+      path="${BASH_REMATCH[1]#resource.}"
+      null_count="$(echo "$resources" | jq --arg p "$path" '[.[] | getpath($p | split(".")) | select(. == null)] | length')"
+      [[ "$null_count" -eq 0 ]] || { echo "  byResources path 'resource.$path' resolves to null on at least one resource" >&2; return 1; }
+    fi
+  done < <(awk '/byResources:/{f=1;next} /^    [^ ]/{f=0} f' "$yaml")
+}
+
+test_readme_documents_kubernetes_component_discovery() {
+  local section
+  section="$(awk '/^## Kubernetes component discovery/{f=1;next} /^## /{f=0} f' "$ROOT/README.md")"
+  [[ -n "$section" ]] || { echo "  README missing '## Kubernetes component discovery' section" >&2; return 1; }
+
+  assert_contains "$section" "https://ocm.software/docs/concepts/kubernetes-component-discovery/" || return 1
+  assert_contains "$section" "bindings/go/kubernetes/controller" || return 1
+  assert_contains "$section" "kind: Discovery" || return 1
+  assert_contains "$section" "componentRef:" || return 1
+  assert_contains "$section" "status.extracted" || return 1
+  assert_contains "$section" "status.components" || return 1
+  assert_contains "$section" "observedGeneration" || return 1
+  assert_contains "$section" "v0.15.0" || return 1
+  assert_contains "$section" "manifests.sh" || return 1
+  assert_contains "$section" "interval" || return 1
+
+  assert_not_contains "$section" "kind: ComponentVersion" || return 1
+  assert_not_contains "$section" "ComponentVersionSubscription" || return 1
+
+  # Drift guard: the YAML block in the README must match k8s/discovery.yaml
+  local readme_yaml disk_yaml
+  readme_yaml="$(echo "$section" | awk '/^```yaml/{f=1;next} /^```/{f=0} f' | grep -v '^#')"
+  disk_yaml="$(grep -v '^#' "$ROOT/k8s/discovery.yaml")"
+  [[ "$readme_yaml" = "$disk_yaml" ]] || { echo "  README YAML block differs from k8s/discovery.yaml" >&2; return 1; }
+}
+
 # ── Run all tests ─────────────────────────────────────────────────────────────
 
 run_test "build produces application tree" test_build_produces_application_tree
@@ -2157,6 +2224,8 @@ run_test "component identity selects artifacts" test_component_identity_selects_
 run_test "component identity rules enforced" test_component_identity_rules_enforced
 run_test "readme documents component identity" test_readme_documents_component_identity
 run_test "manifests selects target architecture variant" test_manifests_selects_target_arch_variant
+run_test "discovery selects image variants" test_discovery_selects_image_variants
+run_test "readme documents kubernetes component discovery" test_readme_documents_kubernetes_component_discovery
 
 echo ""
 echo "Results: $PASS passed, $FAIL failed"

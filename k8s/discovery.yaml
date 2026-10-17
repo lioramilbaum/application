@@ -1,0 +1,20 @@
+# Requires OCM controller >= v0.15.0 and the Component "application"
+# from README "Kubernetes controller" in the same namespace.
+apiVersion: delivery.ocm.software/v1alpha1
+kind: Discovery
+metadata:
+  name: hello-world-images
+spec:
+  componentRef:
+    name: application
+  componentSelector:
+    matchLabels:
+      application.lioramilbaum.github.com/tier: application
+  resourceSelector:
+    matchIdentity:
+      name: hello-world-image
+  extract:
+    byResources:
+      architecture: resource.extraIdentity.architecture
+      image: resource.access.imageReference
+      digest: resource.digest.value
