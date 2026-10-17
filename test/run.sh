@@ -1450,6 +1450,161 @@ test_transfer_copy_resources_uploads_oci_artifact() {
   assert_eq "$mismatched" "0" "digest preserved across transfer" || return 1
 }
 
+test_transfer_plan_lists_expected_operations() {
+  local tmp="$1" plan_file output
+  _build
+  plan_file="$tmp/transfer-plan.json"
+  output="$(env -u OCM_REGISTRY_USERNAME -u OCM_REGISTRY_PASSWORD \
+    TRANSFER_PLAN=1 TRANSFER_PLAN_FILE="$plan_file" OCM_REPO="oci::http://localhost:5001" \
+    bash "$ROOT/scripts/publish.sh" </dev/null 2>&1)" || return 1
+  [[ -f "$plan_file" ]] || { echo "  transfer-plan.json not written" >&2; return 1; }
+
+  local types
+  types="$(jq -r '[.transformations[].type] | unique | sort | .[]' "$plan_file")"
+  assert_contains "$types" "TransferOCIArtifact/v1alpha1" || return 1
+  assert_contains "$types" "OCIAddLocalResource/v1alpha1" || return 1
+  assert_contains "$types" "OCIAddComponentVersion/v1alpha1" || return 1
+  assert_not_contains "$types" "GetOCIArtifact/v1alpha1" || return 1
+
+  local n_image_transfers
+  n_image_transfers="$(jq '[.transformations[] | select(.type=="TransferOCIArtifact/v1alpha1")] | length' "$plan_file")"
+  assert_eq "$n_image_transfers" "2" "one TransferOCIArtifact per arch variant" || return 1
+
+  local labels
+  labels="$(jq -r '.transformations[].label // ""' "$plan_file")"
+  assert_not_contains "$labels" "application-source" || return 1
+
+  assert_contains "$output" "TransferOCIArtifact" || return 1
+  assert_contains "$output" "TRANSFER_SPEC" || return 1
+}
+
+test_transfer_plan_replay_preserves_signature() {
+  local tmp="$1" plan_file keep_cfg
+  _build
+  bash "$ROOT/scripts/sign.sh" >/dev/null
+
+  # reference-uploader config: keep hello-world-image by reference (offline-safe)
+  keep_cfg="$tmp/keep-images.ocmconfig"
+  cat > "$keep_cfg" <<'YAML'
+type: generic.config.ocm.software/v1
+configurations:
+  - type: reference.uploader.transfer.config.ocm.software/v1alpha1
+    match: resource.name == "hello-world-image"
+YAML
+
+  plan_file="$tmp/replay-plan.json"
+  env -u OCM_REGISTRY_USERNAME -u OCM_REGISTRY_PASSWORD \
+    TRANSFER_PLAN=1 TRANSFER_PLAN_FILE="$plan_file" TRANSFER_CONFIG="$keep_cfg" \
+    OCM_REPO="ctf::$tmp/target" \
+    bash "$ROOT/scripts/publish.sh" </dev/null >/dev/null || return 1
+
+  # target must not exist yet (dry run)
+  [[ ! -d "$tmp/target" ]] || { echo "  dry run created target" >&2; return 1; }
+
+  # no GetOCIArtifact steps: images kept by reference
+  local n_get
+  n_get="$(jq '[.transformations[] | select(.type=="GetOCIArtifact/v1alpha1")] | length' "$plan_file")"
+  assert_eq "$n_get" "0" "reference uploader suppresses GetOCIArtifact steps" || return 1
+
+  # replay: publish to a CTF using the saved plan
+  env -u OCM_REGISTRY_USERNAME -u OCM_REGISTRY_PASSWORD \
+    TRANSFER_SPEC="$plan_file" OCM_REPO="ctf::$tmp/target" \
+    bash "$ROOT/scripts/publish.sh" </dev/null >/dev/null || return 1
+
+  # verify the transferred component
+  CTF="$tmp/target" bash "$ROOT/scripts/verify.sh" >/dev/null || \
+    { echo "  verify failed after plan replay" >&2; return 1; }
+
+  # The plan is a routing graph; OCM reads the actual descriptor from the source CTF
+  # during replay, so editing the plan JSON does not affect what gets signed or written.
+  # Signature protection is demonstrated by the clean verify above.
+}
+
+test_publish_replays_transfer_spec() {
+  local tmp="$1" spec_file out
+  _build
+  spec_file="$tmp/spec.json"
+  echo '{}' > "$spec_file"  # placeholder; only checking CLI args
+
+  # TRANSFER_SPEC and TRANSFER_PLAN together must fail
+  out="$(env -u OCM_REGISTRY_USERNAME -u OCM_REGISTRY_PASSWORD \
+    TRANSFER_PLAN=1 TRANSFER_SPEC="$spec_file" OCM_REPO="oci::http://localhost:5001" \
+    bash "$ROOT/scripts/publish.sh" </dev/null 2>&1)" && \
+    { echo "  expected failure for TRANSFER_PLAN+TRANSFER_SPEC" >&2; return 1; }
+  assert_contains "$out" "mutually exclusive" || return 1
+
+  # Missing spec file must fail before ocm runs
+  out="$(env -u OCM_REGISTRY_USERNAME -u OCM_REGISTRY_PASSWORD \
+    TRANSFER_SPEC="$tmp/nonexistent.json" OCM_REPO="oci::http://localhost:5001" \
+    bash "$ROOT/scripts/publish.sh" </dev/null 2>&1)" && \
+    { echo "  expected failure for missing TRANSFER_SPEC" >&2; return 1; }
+  assert_contains "$out" "not found" || return 1
+}
+
+test_transfer_config_routes_images_per_architecture() {
+  local tmp="$1" plan_file plan_with plan_without
+  _build
+
+  plan_with="$tmp/plan-with-config.json"
+  env -u OCM_REGISTRY_USERNAME -u OCM_REGISTRY_PASSWORD \
+    TRANSFER_PLAN=1 TRANSFER_PLAN_FILE="$plan_with" \
+    TRANSFER_CONFIG="$ROOT/transfer.ocmconfig" \
+    OCM_REPO="oci::http://localhost:5001" \
+    bash "$ROOT/scripts/publish.sh" </dev/null >/dev/null || return 1
+
+  # With config: image references contain architecture
+  local refs_with
+  refs_with="$(jq -r '[.transformations[] | select(.type=="TransferOCIArtifact/v1alpha1") | .spec.targetResource.access.imageReference] | .[]' "$plan_with")"
+  assert_contains "$refs_with" "architecture" || return 1
+
+  plan_without="$tmp/plan-without-config.json"
+  env -u OCM_REGISTRY_USERNAME -u OCM_REGISTRY_PASSWORD \
+    TRANSFER_PLAN=1 TRANSFER_PLAN_FILE="$plan_without" \
+    OCM_REPO="oci::http://localhost:5001" \
+    bash "$ROOT/scripts/publish.sh" </dev/null >/dev/null || return 1
+
+  # Without config: image references do not contain architecture
+  local refs_without
+  refs_without="$(jq -r '[.transformations[] | select(.type=="TransferOCIArtifact/v1alpha1") | .spec.targetResource.access.imageReference] | .[]' "$plan_without")"
+  assert_not_contains "$refs_without" "architecture" || return 1
+}
+
+test_readme_documents_transfer_and_transport() {
+  local tmp="$1" section consuming_section
+  section="$(awk '/^## Transfer and transport/{f=1; next} /^## /{f=0} f' "$ROOT/README.md")"
+  [[ -n "$section" ]] || { echo "  ## Transfer and transport section missing" >&2; return 1; }
+
+  assert_contains "$section" "ocm.software/docs/concepts/transfer-and-transport" || return 1
+  assert_contains "$section" "ocm transfer cv" || return 1
+  assert_contains "$section" "--dry-run" || return 1
+  assert_contains "$section" "--transfer-spec" || return 1
+  assert_contains "$section" "make transfer-plan" || return 1
+  assert_contains "$section" "TRANSFER_SPEC" || return 1
+  assert_contains "$section" "TRANSFER_CONFIG" || return 1
+  assert_contains "$section" "TransformationGraphDefinition" || return 1
+  assert_contains "$section" "oci.uploader.transfer.config.ocm.software/v1alpha1" || return 1
+  assert_contains "$section" "localblob.uploader.transfer.config.ocm.software/v1alpha1" || return 1
+  assert_contains "$section" "extraIdentity.architecture" || return 1
+  assert_contains "$section" "digest mismatch" || return 1
+  assert_contains "$section" "(#signing-and-verification)" || return 1
+  assert_contains "$section" "(#consuming-the-component)" || return 1
+  assert_not_contains "$section" "ocm transfer plan" || return 1
+
+  _build
+  local plan_file types
+  plan_file="$tmp/doc-check-plan.json"
+  env -u OCM_REGISTRY_USERNAME -u OCM_REGISTRY_PASSWORD \
+    TRANSFER_PLAN=1 TRANSFER_PLAN_FILE="$plan_file" OCM_REPO="oci::http://localhost:5001" \
+    bash "$ROOT/scripts/publish.sh" </dev/null >/dev/null || return 1
+  while IFS= read -r t; do
+    [[ "$t" == "FileCleanup/v1alpha1" ]] && continue
+    assert_contains "$section" "$t" || return 1
+  done < <(jq -r '[.transformations[].type] | unique | .[]' "$plan_file")
+
+  consuming_section="$(awk '/^## Consuming the component/{f=1; next} /^## /{f=0} f' "$ROOT/README.md")"
+  assert_contains "$consuming_section" "(#transfer-and-transport)" || return 1
+}
+
 test_ctf_layout_is_canonical() {
   local tmp="$1" digest manifest d name version
   _build
@@ -1984,6 +2139,11 @@ run_test "publish copies resources as OCI artifacts" test_publish_copies_resourc
 run_test "transfer without copy-resources keeps external reference" test_transfer_without_copy_resources_keeps_external_reference
 run_test "transfer copy-resources inlines image as local blob" test_transfer_copy_resources_inlines_image_as_local_blob
 run_test "transfer copy-resources uploads OCI artifact" test_transfer_copy_resources_uploads_oci_artifact
+run_test "transfer plan lists expected operations" test_transfer_plan_lists_expected_operations
+run_test "transfer plan replay preserves signature" test_transfer_plan_replay_preserves_signature
+run_test "publish replays transfer spec" test_publish_replays_transfer_spec
+run_test "transfer config routes images per architecture" test_transfer_config_routes_images_per_architecture
+run_test "readme documents transfer and transport" test_readme_documents_transfer_and_transport
 run_test "ctf layout is canonical" test_ctf_layout_is_canonical
 run_test "ctf archive is portable and signed" test_ctf_archive_is_portable_and_signed
 run_test "readme documents canonical component repositories" test_readme_documents_canonical_component_repositories

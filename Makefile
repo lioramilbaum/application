@@ -3,7 +3,7 @@ OCM            ?= ocm
 
 export VERSION OCM
 
-.PHONY: help build sign verify resolvers manifests deploy publish lint test e2e cluster-up cluster-down e2e-run clean
+.PHONY: help build sign verify resolvers manifests deploy publish transfer-plan lint test e2e cluster-up cluster-down e2e-run clean
 
 help: ## Show this help
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | \
@@ -29,6 +29,9 @@ deploy: build sign ## Deploy the application to the current cluster (requires KU
 
 publish: ## Transfer the CTF and copy external resources (--copy-resources) to an OCI registry (requires OCM_REPO=...; optional OCM_REGISTRY_USERNAME/OCM_REGISTRY_PASSWORD)
 	@bash scripts/publish.sh
+
+transfer-plan: ## Dry-run the publish transfer and write build/transfer-plan.json (requires OCM_REPO=...; optional TRANSFER_CONFIG=transfer.ocmconfig)
+	@TRANSFER_PLAN=1 bash scripts/publish.sh
 
 lint: ## Lint shell scripts (if shellcheck is available)
 	@if command -v shellcheck >/dev/null 2>&1; then \
