@@ -30,7 +30,7 @@ A single OCM component with 4 direct resources and 1 source (no component refere
 - **deploy-bundle**: directoryTree containing the deployment scripts and OCM component descriptor
 - **application-source**: git source reference with the repository URL and commit SHA
 
-The key concept is **digest-pinned images**. At build time, the OCM component records the nginx image with the digest already pinned in `component-constructor.yaml` (e.g., `docker.io/library/nginx:1.31-alpine@sha256:138af8...`). At deploy time, `manifests.sh` downloads the manifest template and the localization rules from the signed component and checks both against their descriptor digests. It then generates a `kustomization.yaml` with JSON 6902 patches that set the target container's image to the pinned digest, and renders the result with `kubectl kustomize`. The rules say which container in which workload gets which image resource, so the mapping is covered by the signature too. The `HELLO_WORLD_IMAGE` placeholder in the manifest is a sentinel: rendering fails if it survives. This ensures reproducible, tamper-evident deployments: the deployed image is cryptographically tied to the signed component, and no one can swap the image or its target field without invalidating the signature.
+The key concept is **digest-pinned images**. At build time, the OCM component records the nginx image with the digest already pinned in `component-constructor.yaml` (e.g., `docker.io/library/nginx:1.31-alpine@sha256:138af8...`). At deploy time, `manifests.sh` downloads the manifest template and the localization rules from the signed component and checks both against their descriptor digests. It then generates a `kustomization.yaml` with JSON 6902 patches that set the target container's image to the pinned digest, and renders the result with `kubectl kustomize`. The rules say which container in which workload gets which image resource, so the mapping is covered by the signature too. The `HELLO_WORLD_IMAGE` placeholder in the manifest is a sentinel: rendering fails if it survives. This ensures reproducible, tamper-evident deployments: the deployed image is cryptographically tied to the signed component, and no one can swap the image or its target field without invalidating the signature. See [Signing and verification](#signing-and-verification) for what the signature covers.
 
 `make deploy` calls `build`, `sign`, then `deploy.sh` to deploy the application. Consumers can also download the full deployment bundle for self-contained execution.
 
@@ -172,7 +172,7 @@ ocm get cv ctf::./build/ctf//github.com/lioramilbaum/application:0.1.0 -o json \
 
 Sources (`GitHub/v1`) are never copied by any transfer mode.
 
-The signature covers resource digests, not access specs, so `make verify` still passes after transfer — the digest is unchanged even when the image moves to a new registry.
+The signature covers resource digests, not access specs, so `make verify` still passes after transfer — the digest is unchanged even when the image moves to a new registry. See [Signing and verification](#signing-and-verification) for the full list of signed and unsigned fields.
 
 `--copy-resources` reads from Docker Hub, so source-side registry credentials come from the `DockerConfig/v1` fallback described in [Credential system](#credential-system).
 
@@ -300,6 +300,67 @@ let `component-constructor.yaml` reference them with `access:` while `make build
 component versions, so `ocm download plugin` fetches a plugin binary from one into the plugin
 directory.
 
+## Signing and verification
+
+The [OCM signing and verification](https://ocm.software/docs/concepts/signing-and-verification/)
+model signs the component descriptor, not the artifact bytes directly. `ocm sign cv` normalizes
+the descriptor with `jsonNormalisation/v4alpha1` (JSON canonicalization after dropping excluded
+fields), hashes the result with `SHA-256`, and signs the hash with `RSASSA-PSS`. The signature
+is stored in the descriptor's `signatures` list under the name `default` (or `sigstore` for
+keyless signing). `ocm verify cv` recomputes the digest from the normalized descriptor and
+checks it against the stored signature using the public key from `build/verify.ocmconfig`. It
+does not download resources. Content integrity at deploy time is enforced separately by
+`manifests.sh`, which rejects any image reference whose digest differs from the one recorded in
+the component descriptor.
+
+Inspect the signature of the built component:
+
+```bash
+ocm get cv ctf::./build/ctf//github.com/lioramilbaum/application:0.1.0 -o json \
+  | jq '.[0].signatures[0]'
+```
+
+Each resource has a `genericBlobDigest/v1` digest that the signature binds. The signature
+covers only the fields that survive normalization:
+
+### What the signature covers
+
+| Field | Signed? | Effect of changing it after signing |
+|---|---|---|
+| `component.name`, `version`, `provider` | yes | `make verify` fails with `digest mismatch` |
+| Resource `name`, `version`, `type`, `relation`, `digest` | yes | `make verify` fails with `digest mismatch` |
+| Source `name`, `version`, `type` | yes | `make verify` fails with `digest mismatch` |
+| Label with `signing: true` | yes | `make verify` fails with `digest mismatch` |
+| Label **without** `signing: true` | **no** | `make verify` still passes |
+| Resource and source `access` | **no** | `make verify` still passes |
+| `component.repositoryContexts` | **no** | `make verify` still passes (enables transfer) |
+| `srcRefs` | **no** | `make verify` still passes |
+| `signatures` | **no** | not part of what is signed |
+
+Three consequences for this component:
+
+- `application.lioramilbaum.github.com/tier` has no `signing: true`. Anyone who can write to
+  the repository can change its value and `make verify` still passes. Do not base trust
+  decisions on unsigned labels. To protect a label, add `signing: true` to it before signing.
+- The `application-source` commit SHA lives in the source's `access`, so it is not signed.
+  The source entry (name, version, type) is signed; the commit reference is not.
+- The image `access.imageReference` is not signed, which is why transfer can rewrite
+  references without breaking signatures. The image's `digest` is signed, and `manifests.sh`
+  enforces it at deploy time.
+
+### Trust models
+
+| Model | What the verifier trusts | Config in this repo |
+|---|---|---|
+| Key pinning (plain encoding) | The public key file you provide | `RSA/v1alpha1` consumer in `build/verify.ocmconfig` |
+| Certificate chain (PEM encoding, early access) | A certificate chain from a trusted CA | `signatureEncodingPolicy` in `RSASigningConfiguration` |
+| Identity-based (Sigstore keyless) | A Fulcio certificate matching issuer and identity regexp | `SigstoreVerificationConfiguration/v1alpha1` in `build/verify-sigstore.ocmconfig` |
+
+Key pinning is the simplest: rotate the key by deleting the existing key files and re-running
+`scripts/keys.sh`, then re-signing. Sigstore keyless signing records the certificate in a Rekor transparency log, so
+verification does not require a long-lived key: `SIGNING_METHOD=sigstore make sign` uses the
+OIDC token from the CI environment.
+
 ## Prerequisites
 
 - OCM CLI v2 ≥ 0.17.0 (publishing with `OCM_REGISTRY_USERNAME`/`OCM_REGISTRY_PASSWORD` requires ≥ 0.19.1)
@@ -403,6 +464,8 @@ The component includes a source reference (`application-source`) with:
 - **Repository URL**: the GitHub repository
 - **Commit SHA**: the exact git commit used to build the component
 
+The commit SHA is recorded in the source's `access` field, which is excluded from normalization and therefore not signed — see [Signing and verification](#signing-and-verification).
+
 The commit SHA is determined by:
 
 1. `SOURCE_COMMIT` environment variable, if set
@@ -458,6 +521,7 @@ Tests include:
 - Kubernetes controller: `readme documents kubernetes controller`
 - Kubernetes deployer: `readme documents kubernetes deployer`
 - Plugin system: `builtin plugins serve component types`, `readme documents plugin system`
+- Signing and verification: `signature covers normalized descriptor`, `readme documents signing and verification`
 
 ## CI
 

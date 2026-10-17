@@ -1606,6 +1606,106 @@ test_readme_documents_plugin_system() {
   done
 }
 
+# _tamper_descriptor <ctf_dir> <version> <jq_filter> <out_dir>
+# Copies <ctf_dir> to <out_dir>, applies <jq_filter> to the component descriptor of
+# <version>, and re-addresses all blobs so the CTF remains consistent.
+_tamper_descriptor() {
+  local src="$1" ver="$2" filter="$3" out="$4"
+  cp -R "$src" "$out"
+  local idx="$out/artifact-index.json"
+  local mdigest; mdigest="$(jq -r --arg t "$ver" '.artifacts[] | select(.tag==$t) | .digest' "$idx")"
+  local mpath="$out/blobs/${mdigest/:/.}"
+  local cfgdigest; cfgdigest="$(jq -r '.config.digest' "$mpath")"
+  local cfgpath="$out/blobs/${cfgdigest/:/.}"
+  local old; old="$(jq -r '.componentDescriptorLayer.digest' "$cfgpath")"
+  local oldpath="$out/blobs/${old/:/.}"
+
+  jq -c "$filter" "$oldpath" > "$out/new"
+  local d size; d="sha256:$(sha256 "$out/new")"; size="$(wc -c < "$out/new" | tr -d ' ')"
+  [[ "$d" != "$old" ]] || { echo "  _tamper_descriptor: filter changed nothing: $filter" >&2; return 1; }
+  mv "$out/new" "$out/blobs/${d/:/.}"
+
+  jq -c --arg d "$d" --argjson n "$size" \
+    '.componentDescriptorLayer.digest=$d | .componentDescriptorLayer.size=$n' "$cfgpath" > "$out/new"
+  local cd csize; cd="sha256:$(sha256 "$out/new")"; csize="$(wc -c < "$out/new" | tr -d ' ')"
+  mv "$out/new" "$out/blobs/${cd/:/.}"
+
+  jq -c --arg d "$d" --argjson n "$size" --arg cd "$cd" --argjson cn "$csize" --arg old "$old" \
+    '.config.digest=$cd | .config.size=$cn | (.layers[] | select(.digest==$old)) |= (.digest=$d | .size=$n)' \
+    "$mpath" > "$out/new"
+  local md; md="sha256:$(sha256 "$out/new")"
+  mv "$out/new" "$out/blobs/${md/:/.}"
+
+  jq --arg t "$ver" --arg md "$md" \
+    '(.artifacts[] | select(.tag==$t) | .digest) = $md' "$idx" > "$out/new"
+  mv "$out/new" "$idx"
+}
+
+test_signature_covers_normalized_descriptor() {
+  local tmp="$1" expect filter n=0 out work
+  _build
+  bash "$ROOT/scripts/sign.sh" >/dev/null
+
+  assert_eq \
+    "$("$OCM" get cv "$(cv_ref)" -o json | jq '[.[0].component.labels[] | select(.signing == true)] | length')" \
+    "0" "signed labels" || return 1
+
+  while IFS=$'\t' read -r expect filter; do
+    n=$((n + 1)); work="$tmp/tampered-$n"
+    _tamper_descriptor "$CTF" "$VERSION" "$filter" "$work" || return 1
+    if [[ "$expect" == pass ]]; then
+      CTF="$work" bash "$ROOT/scripts/verify.sh" </dev/null >/dev/null 2>&1 \
+        || { echo "  verify rejected unsigned change ($n): $filter" >&2; return 1; }
+    else
+      out="$(CTF="$work" bash "$ROOT/scripts/verify.sh" </dev/null 2>&1)" \
+        && { echo "  verify accepted signed change ($n): $filter" >&2; return 1; }
+      assert_contains "$out" "digest mismatch" || return 1
+    fi
+  done <<'TABLE'
+pass	(.component.labels[] | select(.name=="application.lioramilbaum.github.com/tier") | .value) = "tampered"
+pass	(.component.sources[0].access.commit) = "fedcba9876543210fedcba9876543210fedcba98"
+pass	(.component.resources[] | select(.name=="hello-world-image") | .access.imageReference) |= sub("^docker.io/"; "evil.example/")
+fail	(.component.labels[] | select(.name=="application.lioramilbaum.github.com/tier") | .signing) = true
+fail	(.component.provider) = "github.com/someoneelse"
+fail	(.component.resources[] | select(.name=="hello-world-manifests") | .digest.value) = "0000000000000000000000000000000000000000000000000000000000000000"
+TABLE
+}
+
+test_readme_documents_signing_and_verification() {
+  local tmp="$1" section t algo norm hash
+  section="$(awk '/^## Signing and verification/{f=1; next} /^## /{f=0} f' "$ROOT/README.md")"
+  [[ -n "$section" ]] || { echo "  README has no '## Signing and verification' section" >&2; return 1; }
+  assert_contains "$section" "https://ocm.software/docs/concepts/signing-and-verification/" || return 1
+  assert_contains "$section" "jsonNormalisation/v4alpha1" || return 1
+  assert_contains "$section" "SHA-256" || return 1
+  assert_contains "$section" "RSASSA-PSS" || return 1
+  assert_contains "$section" "genericBlobDigest/v1" || return 1
+  assert_contains "$section" "signing: true" || return 1
+  assert_contains "$section" "application.lioramilbaum.github.com/tier" || return 1
+  assert_contains "$section" "repositoryContexts" || return 1
+  assert_contains "$section" "access" || return 1
+  assert_contains "$section" "commit" || return 1
+  assert_contains "$section" "make verify" || return 1
+  assert_contains "$section" "Sigstore" || return 1
+  assert_contains "$section" "SigstoreVerificationConfiguration/v1alpha1" || return 1
+  assert_contains "$section" "RSA/v1alpha1" || return 1
+  assert_not_contains "$section" 'jsonNormalisation/v1`' || return 1
+
+  _build
+  bash "$ROOT/scripts/sign.sh" >/dev/null
+  norm="$("$OCM" get cv "$(cv_ref)" -o json | jq -r '.[0].signatures[0].digest.normalisationAlgorithm')"
+  hash="$("$OCM" get cv "$(cv_ref)" -o json | jq -r '.[0].signatures[0].digest.hashAlgorithm')"
+  algo="$("$OCM" get cv "$(cv_ref)" -o json | jq -r '.[0].signatures[0].signature.algorithm')"
+  assert_contains "$section" "$norm" || return 1
+  assert_contains "$section" "$hash" || return 1
+  assert_contains "$section" "$algo" || return 1
+
+  while IFS= read -r t; do
+    assert_contains "$section" "$t" || return 1
+  done < <("$OCM" get cv "$(cv_ref)" -o json \
+    | jq -r '[.[0].component.labels[] | select(.signing != true) | .name] | unique[]')
+}
+
 # ── Run all tests ─────────────────────────────────────────────────────────────
 
 run_test "build produces application tree" test_build_produces_application_tree
@@ -1671,6 +1771,8 @@ run_test "readme documents kubernetes controller" test_readme_documents_kubernet
 run_test "readme documents kubernetes deployer" test_readme_documents_kubernetes_deployer
 run_test "builtin plugins serve component types" test_builtin_plugins_serve_component_types
 run_test "readme documents plugin system" test_readme_documents_plugin_system
+run_test "signature covers normalized descriptor" test_signature_covers_normalized_descriptor
+run_test "readme documents signing and verification" test_readme_documents_signing_and_verification
 
 echo ""
 echo "Results: $PASS passed, $FAIL failed"
