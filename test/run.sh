@@ -1437,6 +1437,95 @@ test_transfer_copy_resources_uploads_oci_artifact() {
   assert_eq "$target_digest" "$source_digest" "digest preserved across transfer" || return 1
 }
 
+test_ctf_layout_is_canonical() {
+  local tmp="$1" digest manifest d name version
+  _build
+
+  # Root must contain exactly artifact-index.json and blobs/
+  # shellcheck disable=SC2012
+  assert_eq "$(ls -A "$CTF" | sort | paste -sd, -)" "artifact-index.json,blobs" "ctf root entries" || return 1
+  assert_eq "$(jq -r .schemaVersion "$CTF/artifact-index.json")" "1" "index schemaVersion" || return 1
+
+  # Find the manifest for this component version by repository+tag (not by array position,
+  # since sign.sh adds an extra untagged entry).
+  digest="$(jq -r --arg r "component-descriptors/$ROOT_COMPONENT" --arg t "$VERSION" \
+    '.artifacts[] | select(.repository==$r and .tag==$t) | .digest' \
+    "$CTF/artifact-index.json")"
+  [[ -n "$digest" ]] || { echo "  no manifest digest for $ROOT_COMPONENT:$VERSION"; return 1; }
+  [[ "$digest" == sha256:* ]] || { echo "  digest does not start with sha256:"; return 1; }
+
+  manifest="$CTF/blobs/${digest/:/.}"
+  [[ -f "$manifest" ]] || { echo "  manifest blob missing: $manifest"; return 1; }
+  assert_eq "$(jq -r .artifactType "$manifest")" \
+    "application/vnd.ocm.software.component-descriptor.v2" "manifest artifactType" || return 1
+
+  # Every blob referenced by the manifest must exist
+  while IFS= read -r d; do
+    [[ -f "$CTF/blobs/${d/:/.}" ]] || { echo "  referenced blob missing: $d"; return 1; }
+  done < <(jq -r '.config.digest, .layers[].digest' "$manifest")
+
+  # Descriptor layer contains the correct component name and version
+  local desc_digest
+  desc_digest="$(jq -r '.layers[] | select(.mediaType=="application/vnd.ocm.software.component-descriptor.v2+json") | .digest' "$manifest")"
+  [[ -n "$desc_digest" ]] || { echo "  no descriptor layer digest"; return 1; }
+  name="$(jq -r .component.name "$CTF/blobs/${desc_digest/:/.}")"
+  version="$(jq -r .component.version "$CTF/blobs/${desc_digest/:/.}")"
+  assert_eq "$name" "$ROOT_COMPONENT" "component name in descriptor" || return 1
+  assert_eq "$version" "$VERSION" "component version in descriptor" || return 1
+
+  # Every blob file is content-addressed (filename == sha256 of content)
+  local f actual expected
+  while IFS= read -r f; do
+    actual="$(sha256 "$f")"
+    expected="${f##*/sha256.}"
+    assert_eq "$actual" "$expected" "content-address of $(basename "$f")" || return 1
+  done < <(find "$CTF/blobs" -maxdepth 1 -type f)
+}
+
+test_ctf_archive_is_portable_and_signed() {
+  local tmp="$1" archive target
+  _build
+  bash "$ROOT/scripts/sign.sh" >/dev/null
+
+  archive="$tmp/application.ctf.tar"
+  tar -C "$CTF" -cf "$archive" artifact-index.json blobs
+
+  # Delete the original CTF to prove the archive is self-contained
+  rm -rf "$CTF"
+
+  # Signature survives in the archive
+  CTF="$archive" bash "$ROOT/scripts/verify.sh" >/dev/null || \
+    { echo "  verify.sh failed on CTF archive"; return 1; }
+
+  # This component has no references; the assertion verifies OCM does not spuriously require
+  # resolvers for a leaf component (any single-component CTF trivially satisfies canonicality).
+  local names
+  names="$("$OCM" get cv "ctf::$archive//${ROOT_COMPONENT}:${VERSION}" \
+    --recursive --config "$(_empty_ocmconfig "$tmp")" -o json \
+    | jq -r '.[].component.name' | sort | paste -sd, -)"
+  assert_eq "$names" "$ROOT_COMPONENT" "canonical: all components present without resolvers" || return 1
+
+  # Signature survives CTF-to-CTF transfer
+  target="$tmp/target-ctf"
+  "$OCM" transfer cv "ctf::$archive//${ROOT_COMPONENT}:${VERSION}" "ctf::$target" \
+    >/dev/null 2>&1 || { echo "  ctf-to-ctf transfer failed"; return 1; }
+  CTF="$target" bash "$ROOT/scripts/verify.sh" >/dev/null || \
+    { echo "  verify.sh failed on transferred CTF"; return 1; }
+}
+
+test_readme_documents_canonical_component_repositories() {
+  local tmp="$1" section
+  section="$(awk '/^## Canonical component repositories/{f=1; next} /^## /{f=0} f' "$ROOT/README.md")"
+  [[ -n "$section" ]] || { echo "  README has no ## Canonical component repositories section"; return 1; }
+  assert_contains "$section" "Common Transport Format" || return 1
+  assert_contains "$section" "build/ctf/" || return 1
+  assert_contains "$section" "artifact-index.json" || return 1
+  assert_contains "$section" "blobs/" || return 1
+  assert_contains "$section" "ctf::" || return 1
+  assert_contains "$section" "oci::" || return 1
+  assert_contains "$section" "--recursive" || return 1
+}
+
 # ── Run all tests ─────────────────────────────────────────────────────────────
 
 run_test "build produces application tree" test_build_produces_application_tree
@@ -1495,6 +1584,9 @@ run_test "publish copies resources as OCI artifacts" test_publish_copies_resourc
 run_test "transfer without copy-resources keeps external reference" test_transfer_without_copy_resources_keeps_external_reference
 run_test "transfer copy-resources inlines image as local blob" test_transfer_copy_resources_inlines_image_as_local_blob
 run_test "transfer copy-resources uploads OCI artifact" test_transfer_copy_resources_uploads_oci_artifact
+run_test "ctf layout is canonical" test_ctf_layout_is_canonical
+run_test "ctf archive is portable and signed" test_ctf_archive_is_portable_and_signed
+run_test "readme documents canonical component repositories" test_readme_documents_canonical_component_repositories
 
 echo ""
 echo "Results: $PASS passed, $FAIL failed"
