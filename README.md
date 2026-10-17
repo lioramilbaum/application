@@ -184,6 +184,31 @@ ocm transfer cv "$REF" oci::http://localhost:5001 \
   --copy-resources --upload-as ociArtifact --dry-run -o yaml
 ```
 
+## Canonical component repositories
+
+A [canonical repository](https://ocm.software/docs/concepts/canonical-component-repositories/)
+holds every component of a component graph, so `get cv --recursive` and `transfer cv --recursive`
+need no resolvers. This component has no references, so any repository that holds it is canonical.
+
+`make build` always writes it to `build/ctf/` in the
+[Common Transport Format](https://ocm.software/docs/concepts/transfer-and-transport/) (CTF),
+a filesystem OCM repository of OCI-compatible content:
+
+```text
+build/ctf/
+├── artifact-index.json   # maps component-descriptors/<name>:<version> to a manifest digest
+└── blobs/                # content-addressed files (sha256.<hex>): manifests, descriptor, resources
+```
+
+A CTF is self-contained: every blob its manifests reference is in `blobs/`, so it works as a
+directory or a tar archive (`ctf::application.ctf.tar`) on any host, including offline. External
+resources (the nginx image) stay as references unless transferred with `--copy-resources`.
+Sign before the CTF leaves the build host — the signature travels inside the descriptor, so
+`CTF=application.ctf.tar make verify` passes on any copy.
+
+An OCI registry (`oci::`) stores the same manifests and blobs behind a network API for online
+consumers. `make publish` transfers the CTF to a registry (`ctf::build/ctf` → `oci::<registry>`).
+
 ## Prerequisites
 
 - OCM CLI v2 ≥ 0.17.0 (publishing with `OCM_REGISTRY_USERNAME`/`OCM_REGISTRY_PASSWORD` requires ≥ 0.19.1)
@@ -338,6 +363,7 @@ Tests include:
 - Resource access types: `resource access types`, `readme documents resource access types`
 - Publish copies resources: `publish copies resources as OCI artifacts`
 - Transfer plans: `transfer without copy-resources keeps external reference`, `transfer copy-resources inlines image as local blob`, `transfer copy-resources uploads OCI artifact`
+- Canonical component repositories (CTF): `ctf layout is canonical`, `ctf archive is portable and signed`, `readme documents canonical component repositories`
 
 ## CI
 
