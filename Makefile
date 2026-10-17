@@ -3,7 +3,7 @@ OCM            ?= ocm
 
 export VERSION OCM
 
-.PHONY: help build sign verify manifests deploy publish lint test e2e cluster-up cluster-down e2e-run clean
+.PHONY: help build sign verify resolvers manifests deploy publish lint test e2e cluster-up cluster-down e2e-run clean
 
 help: ## Show this help
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | \
@@ -17,6 +17,9 @@ sign: ## Sign the component archive
 
 verify: ## Verify signatures on the component archive
 	@bash scripts/verify.sh
+
+resolvers: ## Write build/resolvers.ocmconfig mapping github.com/lioramilbaum/** to the local CTF
+	@bash scripts/resolvers.sh
 
 manifests: ## Download and render app manifests from the OCM component
 	@bash scripts/manifests.sh
