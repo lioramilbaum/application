@@ -6,7 +6,7 @@ A minimal HelloWorld application built with the [Open Component Model](https://o
 
 ```text
 github.com/lioramilbaum/application
-├── hello-world-image  (ociImage, docker.io/library/nginx:1.27-alpine)
+├── hello-world-image  (ociImage, docker.io/library/nginx:1.31-alpine)
 ├── hello-world-manifests  (blob, application/yaml, Kubernetes manifests)
 ├── hello-world-localization  (localizationConfig, application/json, image localization rules)
 └── deploy-bundle  (directoryTree, deployment scripts and descriptor)
@@ -30,7 +30,7 @@ A single OCM component with 4 direct resources and 1 source (no component refere
 - **deploy-bundle**: directoryTree containing the deployment scripts and OCM component descriptor
 - **application-source**: git source reference with the repository URL and commit SHA
 
-The key concept is **digest-pinned images**. At build time, the OCM component references the nginx image as `docker.io/library/nginx:1.27-alpine`. The OCM build system automatically resolves this to the full digest (e.g., `docker.io/library/nginx:1.27-alpine@sha256:abc123...`). At deploy time, `manifests.sh` downloads the manifest template and the localization rules from the signed component and checks both against their descriptor digests. It then generates a `kustomization.yaml` with JSON 6902 patches that set the target container's image to the pinned digest, and renders the result with `kubectl kustomize`. The rules say which container in which workload gets which image resource, so the mapping is covered by the signature too. The `HELLO_WORLD_IMAGE` placeholder in the manifest is a sentinel: rendering fails if it survives. This ensures reproducible, tamper-evident deployments: the deployed image is cryptographically tied to the signed component, and no one can swap the image or its target field without invalidating the signature.
+The key concept is **digest-pinned images**. At build time, the OCM component records the nginx image with the digest already pinned in `component-constructor.yaml` (e.g., `docker.io/library/nginx:1.31-alpine@sha256:138af8...`). At deploy time, `manifests.sh` downloads the manifest template and the localization rules from the signed component and checks both against their descriptor digests. It then generates a `kustomization.yaml` with JSON 6902 patches that set the target container's image to the pinned digest, and renders the result with `kubectl kustomize`. The rules say which container in which workload gets which image resource, so the mapping is covered by the signature too. The `HELLO_WORLD_IMAGE` placeholder in the manifest is a sentinel: rendering fails if it survives. This ensures reproducible, tamper-evident deployments: the deployed image is cryptographically tied to the signed component, and no one can swap the image or its target field without invalidating the signature.
 
 `make deploy` calls `build`, `sign`, then `deploy.sh` to deploy the application. Consumers can also download the full deployment bundle for self-contained execution.
 
@@ -135,6 +135,55 @@ configurations:
 
 Validation: unknown keys (for example `component:` or `version:`) are silently ignored. Bad globs and invalid semver constraints are rejected only when OCM runs a command that loads resolvers, not by `ocm version`.
 
+## Resource repositories
+
+Each resource in a component descriptor has an [`access:`](https://ocm.software/docs/concepts/resource-repositories/) specification that says where the artifact lives and how to retrieve it. OCM uses that type to route downloads and uploads to the right backend — an OCI registry, a Helm repository, cloud storage, or a plugin-backed store.
+
+### Resources in this component
+
+| Resource | Relation | Access type | Where the bytes live |
+|---|---|---|---|
+| `hello-world-image` | external | `OCIImage/v1` | Docker Hub — `docker.io/library/nginx:1.31-alpine@sha256:…` |
+| `hello-world-manifests` | local | `LocalBlob/v1` | inside the component repository (CTF or OCI layer) |
+| `hello-world-localization` | local | `LocalBlob/v1` | inside the component repository |
+| `deploy-bundle` | local | `LocalBlob/v1` | inside the component repository |
+| `application-source` (source) | — | `GitHub/v1` | GitHub — referenced only, never copied |
+
+**`input:` vs `access:`** in `component-constructor.yaml`: an `input:` block is read at build time and stored as a `LocalBlob/v1` in the component repository. An `access:` block points at an artifact already in an external resource repository; OCM records only the reference and its digest. The nginx image digest is already pinned in `component-constructor.yaml`; OCM records it as-is without re-resolving it from Docker Hub.
+
+Inspect the built descriptor:
+
+```bash
+ocm get cv ctf::./build/ctf//github.com/lioramilbaum/application:0.1.0 -o json \
+  | jq -r '.[0].component.resources[] | [.name, .relation, .access.type] | @tsv'
+```
+
+### Transfer behaviour
+
+`ocm transfer cv` copies the component descriptor and local blobs by default. The `--copy-resources` flag also downloads external resources and re-uploads them to the target:
+
+| Flags | Image after transfer | Air-gap safe? |
+|---|---|---|
+| *(none)* | still at `docker.io/library/nginx:1.31-alpine@sha256:…` (`OCIImage/v1`) | no |
+| `--copy-resources` | inlined as `LocalBlob/v1` in the component layer | yes (carry the archive) |
+| `--copy-resources --upload-as ociArtifact` | pushed as its own artifact (`ociArtifact/v1`), pullable by kubelet | yes (push to registry) |
+
+`make publish` uses `--copy-resources --upload-as ociArtifact` so the published component doesn't depend on Docker Hub and the image remains pullable.
+
+Sources (`GitHub/v1`) are never copied by any transfer mode.
+
+The signature covers resource digests, not access specs, so `make verify` still passes after transfer — the digest is unchanged even when the image moves to a new registry.
+
+`--copy-resources` reads from Docker Hub, so source-side registry credentials come from the `DockerConfig/v1` fallback described in [Credential system](#credential-system).
+
+Preview a transfer plan without running it:
+
+```bash
+REF="ctf::./build/ctf//github.com/lioramilbaum/application:0.1.0"
+ocm transfer cv "$REF" oci::http://localhost:5001 \
+  --copy-resources --upload-as ociArtifact --dry-run -o yaml
+```
+
 ## Prerequisites
 
 - OCM CLI v2 ≥ 0.17.0 (publishing with `OCM_REGISTRY_USERNAME`/`OCM_REGISTRY_PASSWORD` requires ≥ 0.19.1)
@@ -145,7 +194,7 @@ Validation: unknown keys (for example `component:` or `version:`) are silently i
 - `openssl`
 - `kubectl` (for deploying and for `make manifests`, which uses `kubectl kustomize`)
 - `docker` (for `make e2e` or `make e2e-run` only)
-- Docker Hub access for `make build` and `make test` (to resolve `nginx:1.27-alpine`)
+- Docker Hub access for `make build` and `make test` (to resolve `nginx:1.31-alpine`)
 
 OCM CLI and kind are provided by the devcontainer image. Outside the devcontainer, put `ocm` and `kind` on your PATH.
 
@@ -164,7 +213,7 @@ make cluster-up      # create or reuse the kind cluster; writes build/e2e/kubeco
 make e2e-run         # run e2e against an existing cluster
 make cluster-down    # delete the kind cluster
 make e2e             # spin up kind cluster, deploy, verify pod ready, tear down (requires docker)
-make publish OCM_REPO=ghcr.io/<you>/ocm  # transfer to an OCI registry; optional OCM_REGISTRY_USERNAME/OCM_REGISTRY_PASSWORD
+make publish OCM_REPO=ghcr.io/<you>/ocm  # transfer to an OCI registry, copying external resources (e.g. the nginx image) as OCI artifacts; optional OCM_REGISTRY_USERNAME/OCM_REGISTRY_PASSWORD
 ```
 
 ## Consuming the component
@@ -286,6 +335,9 @@ Tests include:
 - Transferred images: `manifests localizes transferred image`, `manifests rejects mismatched image digest`, `manifests rejects missing image digest`
 - Local registry mirror for kind nodes: `cluster.sh configures local registry mirror`
 - CI e2e isolation: `e2e workflow isolates deploy`
+- Resource access types: `resource access types`, `readme documents resource access types`
+- Publish copies resources: `publish copies resources as OCI artifacts`
+- Transfer plans: `transfer without copy-resources keeps external reference`, `transfer copy-resources inlines image as local blob`, `transfer copy-resources uploads OCI artifact`
 
 ## CI
 
@@ -299,4 +351,4 @@ Required repository secrets: `OCM_SIGNING_KEY` (RSA private key PEM).
 
 ## Notes
 
-- `make build` and `make test` require Docker Hub access to resolve `nginx:1.27-alpine`. If Docker Hub is unavailable, builds will fail.
+- `make build` and `make test` require Docker Hub access to resolve `nginx:1.31-alpine`. If Docker Hub is unavailable, builds will fail.
