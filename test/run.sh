@@ -1526,6 +1526,24 @@ test_readme_documents_canonical_component_repositories() {
   assert_contains "$section" "--recursive" || return 1
 }
 
+test_readme_documents_kubernetes_controller() {
+  local tmp="$1" section
+  section="$(awk '/^## Kubernetes controller/{f=1; next} /^## /{f=0} f' "$ROOT/README.md")"
+  [[ -n "$section" ]] || { echo "  README has no '## Kubernetes controller' section" >&2; return 1; }
+  assert_contains "$section" "apiVersion: delivery.ocm.software/v1alpha1" || return 1
+  assert_contains "$section" "kind: Repository" || return 1
+  assert_contains "$section" "kind: Component" || return 1
+  assert_not_contains "$section" "kind: ComponentVersion" || return 1
+  assert_contains "$section" "type: OCIRegistry" || return 1
+  assert_contains "$section" "baseUrl: ghcr.io/lioramilbaum/ocm" || return 1
+  assert_contains "$section" "component: $ROOT_COMPONENT" || return 1
+  assert_contains "$section" "repositoryRef:" || return 1
+  assert_contains "$section" "semver:" || return 1
+  assert_contains "$section" "interval:" || return 1
+  assert_contains "$section" "https://ocm.software/docs/concepts/kubernetes-controllers/" || return 1
+  assert_contains "$section" "bindings/go/kubernetes/controller" || return 1
+}
+
 # ── Run all tests ─────────────────────────────────────────────────────────────
 
 run_test "build produces application tree" test_build_produces_application_tree
@@ -1587,6 +1605,7 @@ run_test "transfer copy-resources uploads OCI artifact" test_transfer_copy_resou
 run_test "ctf layout is canonical" test_ctf_layout_is_canonical
 run_test "ctf archive is portable and signed" test_ctf_archive_is_portable_and_signed
 run_test "readme documents canonical component repositories" test_readme_documents_canonical_component_repositories
+run_test "readme documents kubernetes controller" test_readme_documents_kubernetes_controller
 
 echo ""
 echo "Results: $PASS passed, $FAIL failed"
