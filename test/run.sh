@@ -168,6 +168,18 @@ EOF
   echo "$dir/stub-bin"
 }
 
+# Records ocm argv and stdin instead of running ocm
+_stub_ocm_record() {
+  local dir="$1"
+  mkdir -p "$dir/stub-bin"
+  cat > "$dir/stub-bin/ocm" <<'EOF'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "$(dirname "$0")/../ocm-args.log"
+cat >> "$(dirname "$0")/../ocm-stdin.log"
+EOF
+  chmod 0755 "$dir/stub-bin/ocm"
+}
+
 # Wraps the real ocm: "get cv ... -o json" output is piped through the jq
 # filter stored in $dir/stub-bin/image.jq; all other calls pass through.
 _stub_ocm_rewrite_image() {
@@ -1035,6 +1047,125 @@ test_e2e_workflow_isolates_deploy() {
   assert_not_contains "$pkg" "tcpdump"  || return 1
 }
 
+# Tests for registry credential publishing
+
+# Runs publish.sh against the recording ocm stub; extra args are VAR=value pairs.
+# stdin is /dev/null so the stub never blocks when no credentials are piped in.
+_run_publish_stubbed() {
+  local tmp="$1"
+  shift
+  _stub_ocm_record "$tmp"
+  env -u OCM_REGISTRY_USERNAME -u OCM_REGISTRY_PASSWORD -u OCM_REGISTRY_HOST \
+    OCM=ocm PATH="$tmp/stub-bin:$PATH" OCM_REPO=oci://ghcr.io/example/ocm "$@" \
+    bash "$ROOT/scripts/publish.sh" < /dev/null
+}
+
+test_publish_passes_registry_credentials_via_ocm_config() {
+  local tmp="$1"
+  _run_publish_stubbed "$tmp" OCM_REGISTRY_USERNAME=demo-user OCM_REGISTRY_PASSWORD=demo-secret >/dev/null || return 1
+
+  local args stdin
+  args="$(cat "$tmp/ocm-args.log")"
+  stdin="$(cat "$tmp/ocm-stdin.log")"
+  assert_contains "$args" "--config -" || return 1
+  assert_contains "$args" "transfer cv" || return 1
+  assert_contains "$args" "ghcr.io/example/ocm" || return 1
+  assert_contains "$stdin" "type: OCIRegistry" || return 1
+  assert_contains "$stdin" "hostname: 'ghcr.io'" || return 1
+  assert_contains "$stdin" "type: OCICredentials/v1" || return 1
+  assert_contains "$stdin" "demo-user" || return 1
+  assert_contains "$stdin" "demo-secret" || return 1
+  assert_contains "$stdin" "type: DockerConfig/v1" || return 1
+}
+
+test_publish_does_not_write_registry_secret() {
+  local tmp="$1"
+  _run_publish_stubbed "$tmp" OCM_REGISTRY_USERNAME=demo-user OCM_REGISTRY_PASSWORD=demo-secret >/dev/null || return 1
+
+  if grep -rl demo-secret "$tmp" --exclude=ocm-stdin.log; then
+    echo "  registry password was written to disk" >&2
+    return 1
+  fi
+}
+
+test_publish_without_registry_credentials_uses_discovery() {
+  local tmp="$1"
+  _run_publish_stubbed "$tmp" >/dev/null || return 1
+
+  local args
+  args="$(cat "$tmp/ocm-args.log")"
+  assert_contains "$args" "transfer cv" || return 1
+  assert_not_contains "$args" "--config" || return 1
+}
+
+test_publish_rejects_partial_registry_credentials() {
+  local tmp="$1" out
+  if out="$(_run_publish_stubbed "$tmp" OCM_REGISTRY_USERNAME=demo-user 2>&1)"; then
+    echo "  publish should fail when only the username is set" >&2
+    return 1
+  fi
+
+  assert_contains "$out" "OCM_REGISTRY_PASSWORD" || return 1
+  [[ ! -f "$tmp/ocm-args.log" ]] || { echo "  ocm must not run with partial credentials" >&2; return 1; }
+}
+
+test_registry_identity_derived_from_ocm_repo() {
+  local tmp="$1" input want got
+  unset OCM_REGISTRY_HOST
+  source "$ROOT/scripts/lib.sh"
+  source "$ROOT/scripts/registry-credentials.sh"
+
+  while IFS='|' read -r input want; do
+    got="$(registry_endpoint "$input" | paste -sd/ -)"
+    assert_eq "$got" "$want" "registry identity for $input" || return 1
+  done <<'TABLE'
+ghcr.io/x/ocm|ghcr.io/
+oci://ghcr.io/x/ocm|ghcr.io/
+oci::http://localhost:5001|localhost/5001
+http://localhost:5001/x|localhost/5001
+TABLE
+
+  got="$(OCM_REGISTRY_HOST=registry.example.com registry_endpoint "oci::http://localhost:5001" | paste -sd/ -)"
+  assert_eq "$got" "registry.example.com/" "OCM_REGISTRY_HOST override" || return 1
+}
+
+test_registry_ocmconfig_is_valid_for_ocm() {
+  local tmp="$1"
+  source "$ROOT/scripts/lib.sh"
+  source "$ROOT/scripts/registry-credentials.sh"
+
+  OCM_REPO=oci://ghcr.io/example/ocm OCM_REGISTRY_USERNAME=demo OCM_REGISTRY_PASSWORD="p'a#s: s" \
+    render_registry_ocmconfig > "$tmp/registry.ocmconfig" || return 1
+  assert_contains "$(cat "$tmp/registry.ocmconfig")" "password: 'p''a#s: s'" || return 1
+
+  if ! command -v "$OCM" >/dev/null 2>&1; then
+    echo "  skip: ocm not found in PATH, skipping real-binary parse check"
+  else
+    "$OCM" --config "$tmp/registry.ocmconfig" version >/dev/null 2>&1 || {
+      echo "  ocm rejected the rendered registry config" >&2
+      return 1
+    }
+  fi
+
+  # A fresh bash process: errexit is suppressed inside an if/|| context, which would mask the failure
+  if OCM_REPO=oci://ghcr.io/example/ocm OCM_REGISTRY_USERNAME=demo OCM_REGISTRY_PASSWORD=$'p\nw' \
+    bash -c 'source "$1"; source "$2"; render_registry_ocmconfig' _ \
+    "$ROOT/scripts/lib.sh" "$ROOT/scripts/registry-credentials.sh" >/dev/null 2>&1; then
+    echo "  rendering a password with a newline should fail" >&2
+    return 1
+  fi
+}
+
+test_release_publishes_with_ocm_credentials() {
+  local tmp="$1" step
+  step="$(sed -n '/- name: Publish component to GHCR/,/- name:/p' "$ROOT/.github/workflows/release.yaml")"
+  assert_contains "$step" "OCM_REGISTRY_USERNAME:" || return 1
+  assert_contains "$step" "OCM_REGISTRY_PASSWORD:" || return 1
+  assert_contains "$step" "secrets.GITHUB_TOKEN" || return 1
+  assert_contains "$step" "make publish" || return 1
+  assert_not_contains "$step" "docker login" || return 1
+}
+
 # ── Run all tests ─────────────────────────────────────────────────────────────
 
 run_test "build produces application tree" test_build_produces_application_tree
@@ -1077,6 +1208,13 @@ run_test "devcontainer config is valid" test_devcontainer_config_is_valid
 run_test "devcontainer pins tools" test_devcontainer_pins_tools
 run_test "renovate updates OCM SHA256 ARGs" test_renovate_updates_ocm_sha256
 run_test "e2e workflow isolates deploy" test_e2e_workflow_isolates_deploy
+run_test "publish passes registry credentials via ocm config" test_publish_passes_registry_credentials_via_ocm_config
+run_test "publish does not write registry secret" test_publish_does_not_write_registry_secret
+run_test "publish without registry credentials uses discovery" test_publish_without_registry_credentials_uses_discovery
+run_test "publish rejects partial registry credentials" test_publish_rejects_partial_registry_credentials
+run_test "registry identity derived from OCM_REPO" test_registry_identity_derived_from_ocm_repo
+run_test "registry ocmconfig is valid for ocm" test_registry_ocmconfig_is_valid_for_ocm
+run_test "release publishes with OCM credentials" test_release_publishes_with_ocm_credentials
 
 echo ""
 echo "Results: $PASS passed, $FAIL failed"
