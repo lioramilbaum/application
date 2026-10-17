@@ -209,6 +209,42 @@ Sign before the CTF leaves the build host — the signature travels inside the d
 An OCI registry (`oci::`) stores the same manifests and blobs behind a network API for online
 consumers. `make publish` transfers the CTF to a registry (`ctf::build/ctf` → `oci::<registry>`).
 
+## Kubernetes controller
+
+The [OCM controllers](https://ocm.software/docs/concepts/kubernetes-controllers/) are a
+Kubernetes operator that manages component versions declaratively. A `Repository` custom
+resource points at an OCM registry and a `Component` custom resource names a component
+and a semver constraint; the controller resolves and verifies the highest matching version,
+records it in `status.component`, and re-checks every `interval`. This inverts `make deploy`:
+instead of scripts pushing into the cluster, the cluster pulls new releases from the registry
+(GitOps style). Minimal CRs for the component `release.yaml` publishes:
+
+```yaml
+apiVersion: delivery.ocm.software/v1alpha1
+kind: Repository
+metadata: {name: application-repository}
+spec:
+  repositorySpec:
+    type: OCIRegistry
+    baseUrl: ghcr.io/lioramilbaum/ocm
+  interval: 10m
+---
+apiVersion: delivery.ocm.software/v1alpha1
+kind: Component
+metadata: {name: application}
+spec:
+  component: github.com/lioramilbaum/application
+  repositoryRef: {name: application-repository}
+  semver: ">=0.1.0"
+  interval: 10m
+```
+
+This repository installs no controller or CRDs; the source is
+[`bindings/go/kubernetes/controller`](https://github.com/open-component-model/open-component-model/tree/main/bindings/go/kubernetes/controller).
+A `Resource` + `NamespacedDeployer` chain could apply `hello-world-manifests`, but it would
+not run `manifests.sh` localization, so the `HELLO_WORLD_IMAGE` sentinel would reach the
+cluster unpatched.
+
 ## Prerequisites
 
 - OCM CLI v2 ≥ 0.17.0 (publishing with `OCM_REGISTRY_USERNAME`/`OCM_REGISTRY_PASSWORD` requires ≥ 0.19.1)
@@ -364,6 +400,7 @@ Tests include:
 - Publish copies resources: `publish copies resources as OCI artifacts`
 - Transfer plans: `transfer without copy-resources keeps external reference`, `transfer copy-resources inlines image as local blob`, `transfer copy-resources uploads OCI artifact`
 - Canonical component repositories (CTF): `ctf layout is canonical`, `ctf archive is portable and signed`, `readme documents canonical component repositories`
+- Kubernetes controller: `readme documents kubernetes controller`
 
 ## CI
 
