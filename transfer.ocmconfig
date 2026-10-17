@@ -1,0 +1,8 @@
+# Routes each hello-world-image architecture variant to its own tag during transfer.
+# Without this, --copy-resources --upload-as ociArtifact pushes both variants to the
+# same tag (last write wins). Apply with: TRANSFER_CONFIG=transfer.ocmconfig
+type: generic.config.ocm.software/v1
+configurations:
+  - type: oci.uploader.transfer.config.ocm.software/v1alpha1
+    match: resource.name == "hello-world-image"
+    imageReference: '${target.baseUrl + (target.subPath == "" ? "" : "/" + target.subPath) + "/" + resource.access.toOCI().repository + ":" + resource.access.toOCI().tag + "-" + resource.extraIdentity.architecture}'
