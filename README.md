@@ -241,9 +241,36 @@ spec:
 
 This repository installs no controller or CRDs; the source is
 [`bindings/go/kubernetes/controller`](https://github.com/open-component-model/open-component-model/tree/main/bindings/go/kubernetes/controller).
-A `Resource` + `NamespacedDeployer` chain could apply `hello-world-manifests`, but it would
-not run `manifests.sh` localization, so the `HELLO_WORLD_IMAGE` sentinel would reach the
-cluster unpatched.
+[Kubernetes deployer](#kubernetes-deployer) shows how to apply the manifests from the cluster.
+
+## Kubernetes deployer
+
+The [deployer](https://ocm.software/docs/concepts/kubernetes-deployer/) ends the controller
+chain above: a `Resource` picks one resource of the `Component`, and once it is ready a
+`NamespacedDeployer` server-side applies its manifests impersonating the service account named by `spec.serviceAccountName`, then
+prunes and reverts drift with ApplySets. `deploy.sh` instead runs a one-shot `kubectl apply`
+with the caller's credentials; here the cluster holds the desired state. The deprecated
+cluster-scoped `Deployer` uses the controller's own permissions.
+
+```yaml
+apiVersion: delivery.ocm.software/v1alpha1
+kind: Resource
+metadata: {name: hello-world-manifests}
+spec:
+  componentRef: {name: application}
+  resource: {byReference: {resource: {name: hello-world-manifests}}}
+---
+apiVersion: delivery.ocm.software/v1alpha1
+kind: NamespacedDeployer
+metadata: {name: hello-world}
+spec: {resourceRef: {name: hello-world-manifests}, serviceAccountName: hello-world-deployer}
+```
+
+The manifests create the `hello-world` Namespace, so `hello-world-deployer` needs a `ClusterRole`.
+The deployer applies the blob as-is and skips `manifests.sh` localization: `HELLO_WORLD_IMAGE`
+reaches the cluster unpatched, and the controller has no `Localization` CR to fill it in
+([how-to](https://ocm.software/docs/how-to/deploy-manifests-with-deployer/),
+[source](https://github.com/open-component-model/open-component-model/tree/main/bindings/go/kubernetes/controller/internal/controller/deployer)).
 
 ## Prerequisites
 
@@ -401,6 +428,7 @@ Tests include:
 - Transfer plans: `transfer without copy-resources keeps external reference`, `transfer copy-resources inlines image as local blob`, `transfer copy-resources uploads OCI artifact`
 - Canonical component repositories (CTF): `ctf layout is canonical`, `ctf archive is portable and signed`, `readme documents canonical component repositories`
 - Kubernetes controller: `readme documents kubernetes controller`
+- Kubernetes deployer: `readme documents kubernetes deployer`
 
 ## CI
 

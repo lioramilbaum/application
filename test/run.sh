@@ -1544,6 +1544,26 @@ test_readme_documents_kubernetes_controller() {
   assert_contains "$section" "bindings/go/kubernetes/controller" || return 1
 }
 
+test_readme_documents_kubernetes_deployer() {
+  local tmp="$1" section
+  section="$(awk '/^## Kubernetes deployer/{f=1; next} /^## /{f=0} f' "$ROOT/README.md")"
+  [[ -n "$section" ]] || { echo "  README has no '## Kubernetes deployer' section" >&2; return 1; }
+  assert_contains "$section" "apiVersion: delivery.ocm.software/v1alpha1" || return 1
+  assert_contains "$section" "kind: Resource" || return 1
+  assert_contains "$section" "kind: NamespacedDeployer" || return 1
+  assert_contains "$section" "componentRef: {name: application}" || return 1
+  assert_contains "$section" "byReference: {resource: {name: hello-world-manifests}}" || return 1
+  assert_contains "$section" "resourceRef: {name: hello-world-manifests}" || return 1
+  assert_contains "$section" "serviceAccountName:" || return 1
+  assert_contains "$section" "deploy.sh" || return 1
+  assert_contains "$section" "manifests.sh" || return 1
+  assert_contains "$section" "HELLO_WORLD_IMAGE" || return 1
+  assert_contains "$section" "https://ocm.software/docs/concepts/kubernetes-deployer/" || return 1
+  assert_contains "$section" "bindings/go/kubernetes/controller" || return 1
+  assert_not_contains "$section" "kind: Localization" || return 1
+  assert_not_contains "$section" "kind: ComponentVersion" || return 1
+}
+
 # ── Run all tests ─────────────────────────────────────────────────────────────
 
 run_test "build produces application tree" test_build_produces_application_tree
@@ -1606,6 +1626,7 @@ run_test "ctf layout is canonical" test_ctf_layout_is_canonical
 run_test "ctf archive is portable and signed" test_ctf_archive_is_portable_and_signed
 run_test "readme documents canonical component repositories" test_readme_documents_canonical_component_repositories
 run_test "readme documents kubernetes controller" test_readme_documents_kubernetes_controller
+run_test "readme documents kubernetes deployer" test_readme_documents_kubernetes_deployer
 
 echo ""
 echo "Results: $PASS passed, $FAIL failed"
