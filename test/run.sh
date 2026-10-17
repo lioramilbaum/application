@@ -1564,6 +1564,48 @@ test_readme_documents_kubernetes_deployer() {
   assert_not_contains "$section" "kind: ComponentVersion" || return 1
 }
 
+test_builtin_plugins_serve_component_types() {
+  local tmp="$1" types expected
+  _build
+  mkdir -p "$tmp/plugins"
+  types="$("$OCM" --plugin-directory "$tmp/plugins" --loglevel debug \
+    get cv "$(cv_ref "$ROOT_COMPONENT")" -o json 2>"$tmp/plugins.log" \
+    | jq -r '[.[0].component.resources[].access.type, .[0].component.sources[].access.type] | unique | join(",")')"
+  expected="$("$OCM" get cv "$(cv_ref "$ROOT_COMPONENT")" -o json \
+    | jq -r '[.[0].component.resources[].access.type, .[0].component.sources[].access.type] | unique | join(",")')"
+  assert_eq "$types" "$expected" "access types with no external plugins" || return 1
+  # "no plugins found" is from bindings/go/plugin/manager/manager.go — update if OCM rewording occurs
+  assert_contains "$(cat "$tmp/plugins.log")" "no plugins found" || return 1
+
+  "$OCM" --plugin-directory "$tmp/plugins" download resource "$(cv_ref "$ROOT_COMPONENT")" \
+    --identity name=hello-world-manifests --output "$tmp/manifests.yaml" >/dev/null || return 1
+  cmp "$tmp/manifests.yaml" "$ROOT/components/hello-world/manifests.yaml" || \
+    { echo "  manifests download differs without plugins" >&2; return 1; }
+}
+
+test_readme_documents_plugin_system() {
+  local tmp="$1" section t
+  section="$(awk '/^## Plugin system/{f=1; next} /^## /{f=0} f' "$ROOT/README.md")"
+  [[ -n "$section" ]] || { echo "  README has no '## Plugin system' section" >&2; return 1; }
+  assert_contains "$section" "https://ocm.software/docs/concepts/plugin-system/" || return 1
+  assert_contains "$section" "bindings/go/plugin" || return 1
+  assert_contains "$section" "--plugin-directory" || return 1
+  assert_contains "$section" ".config/ocm/plugins" || return 1
+  assert_contains "$section" "capabilities" || return 1
+  assert_contains "$section" "built-in plugin" || return 1
+  assert_contains "$section" "CommonTransportFormat/v1" || return 1
+  assert_contains "$section" "Dir/v1" || return 1
+  assert_contains "$section" "RSA/v1alpha1" || return 1
+  assert_contains "$section" "ocm download plugin" || return 1
+  assert_not_contains "$section" "deployer plugin" || return 1
+
+  _build
+  for t in $("$OCM" get cv "$(cv_ref "$ROOT_COMPONENT")" -o json \
+    | jq -r '[.[0].component.resources[].access.type, .[0].component.sources[].access.type] | unique[]'); do
+    assert_contains "$section" "$t" || return 1
+  done
+}
+
 # ── Run all tests ─────────────────────────────────────────────────────────────
 
 run_test "build produces application tree" test_build_produces_application_tree
@@ -1627,6 +1669,8 @@ run_test "ctf archive is portable and signed" test_ctf_archive_is_portable_and_s
 run_test "readme documents canonical component repositories" test_readme_documents_canonical_component_repositories
 run_test "readme documents kubernetes controller" test_readme_documents_kubernetes_controller
 run_test "readme documents kubernetes deployer" test_readme_documents_kubernetes_deployer
+run_test "builtin plugins serve component types" test_builtin_plugins_serve_component_types
+run_test "readme documents plugin system" test_readme_documents_plugin_system
 
 echo ""
 echo "Results: $PASS passed, $FAIL failed"

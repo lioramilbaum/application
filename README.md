@@ -137,7 +137,7 @@ Validation: unknown keys (for example `component:` or `version:`) are silently i
 
 ## Resource repositories
 
-Each resource in a component descriptor has an [`access:`](https://ocm.software/docs/concepts/resource-repositories/) specification that says where the artifact lives and how to retrieve it. OCM uses that type to route downloads and uploads to the right backend — an OCI registry, a Helm repository, cloud storage, or a plugin-backed store.
+Each resource in a component descriptor has an [`access:`](https://ocm.software/docs/concepts/resource-repositories/) specification that says where the artifact lives and how to retrieve it. OCM uses that type to route downloads and uploads to the right backend — an OCI registry, a Helm repository, cloud storage, or a [plugin-backed](#plugin-system) store.
 
 ### Resources in this component
 
@@ -271,6 +271,34 @@ The deployer applies the blob as-is and skips `manifests.sh` localization: `HELL
 reaches the cluster unpatched, and the controller has no `Localization` CR to fill it in
 ([how-to](https://ocm.software/docs/how-to/deploy-manifests-with-deployer/),
 [source](https://github.com/open-component-model/open-component-model/tree/main/bindings/go/kubernetes/controller/internal/controller/deployer)).
+
+## Plugin system
+
+The [OCM plugin system](https://ocm.software/docs/concepts/plugin-system/) adds repository
+types, access types, input types, credential backends, and signing handlers to OCM without
+forking it. A plugin is a standalone binary, usually built with the Go SDK in
+[`bindings/go/plugin`](https://github.com/open-component-model/open-component-model/tree/main/bindings/go/plugin).
+The `ocm` CLI scans one directory, `--plugin-directory` (default `$HOME/.config/ocm/plugins`),
+runs each binary with `capabilities` to learn which types it serves, and starts it only when a
+command needs one of them. Requests are HTTP + JSON over a Unix domain socket (or TCP in scratch containers), and the
+plugin exits after an idle timeout. Plugin settings go in `.ocmconfig` under the plugin's own `type`.
+
+Every type this component uses is served by a built-in plugin compiled into `ocm`, so build,
+sign, verify, and transfer need no plugin installed:
+
+| Type in this component | Built-in plugin |
+|---|---|
+| `CommonTransportFormat/v1` (`ctf::`), `OCIRepository/v1` (`oci::`), `OCIImage/v1`, `LocalBlob/v1` | OCI |
+| `file` and `Dir/v1` inputs | file, dir |
+| `GitHub/v1` source access | GitHub |
+| `RSA/v1alpha1` signatures | RSA |
+
+An external plugin fits when an artifact lives where OCM cannot reach it. If the manifests sat
+in an internal artifact store, a resource repository plugin for that store's access type would
+let `component-constructor.yaml` reference them with `access:` while `make build`,
+`ocm download resource`, and `make publish` stay unchanged. Plugins are shipped as OCM
+component versions, so `ocm download plugin` fetches a plugin binary from one into the plugin
+directory.
 
 ## Prerequisites
 
@@ -429,6 +457,7 @@ Tests include:
 - Canonical component repositories (CTF): `ctf layout is canonical`, `ctf archive is portable and signed`, `readme documents canonical component repositories`
 - Kubernetes controller: `readme documents kubernetes controller`
 - Kubernetes deployer: `readme documents kubernetes deployer`
+- Plugin system: `builtin plugins serve component types`, `readme documents plugin system`
 
 ## CI
 
