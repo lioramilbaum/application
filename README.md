@@ -6,7 +6,8 @@ A minimal HelloWorld application built with the [Open Component Model](https://o
 
 ```text
 github.com/lioramilbaum/application
-├── hello-world-image  (ociImage, docker.io/library/nginx:1.31-alpine)
+├── hello-world-image  (ociImage, architecture=amd64, docker.io/library/nginx:1.31-alpine)
+├── hello-world-image  (ociImage, architecture=arm64, docker.io/library/nginx:1.31-alpine)
 ├── hello-world-manifests  (blob, application/yaml, Kubernetes manifests)
 ├── hello-world-localization  (localizationConfig, application/json, image localization rules)
 └── deploy-bundle  (directoryTree, deployment scripts and descriptor)
@@ -20,9 +21,11 @@ Sources:
 └── application-source  (git, GitHub repository with commit SHA)
 ```
 
+The names in the tree are artifact identities within `github.com/lioramilbaum/application:<version>` — see [Component identity](#component-identity).
+
 ## How it works
 
-A single OCM component with 4 direct resources and 1 source (no component references):
+A single OCM component with 5 direct resources and 1 source (no component references):
 
 - **hello-world-image**: nginx container image (digest-pinned from Docker Hub)
 - **hello-world-manifests**: Kubernetes Namespace, ConfigMap, Deployment, and Service manifests
@@ -44,6 +47,85 @@ make manifests  # render from the registry copy; image references point at the l
 ```
 
 `manifests.sh` accepts transferred image references (`http://` or `https://` prefix, no digest) and pins them to the digest from the signed descriptor. A mismatched or missing digest fails the render.
+
+## Component identity
+
+[Component identity](https://ocm.software/docs/concepts/component-identity/) names every
+component version and every artifact independently of where it is stored. A component version
+is an immutable snapshot addressed by `name:version`.
+
+**Component name** follows a DNS-based scheme: a domain the owner controls followed by at least
+one path segment. The full regex the OCM CLI enforces is:
+
+```
+^[a-z][-a-z0-9]*([.][a-z][-a-z0-9]*)*[.][a-z]{2,}(/[a-z][-a-z0-9_]*([.][a-z][-a-z0-9_]*)*)+$
+```
+
+`ocm add cv` rejects `example.com/Demo` (uppercase letter), `demo` (no domain), and `example.com`
+(no path segment). This component's name `github.com/lioramilbaum/application` is the GitHub
+organization URL where the owner controls the namespace.
+
+**Component version** is relaxed SemVer: the `v` prefix is optional, pre-release and build
+metadata are allowed, and `latest` is rejected. `release.yaml` strips the tag's `v` prefix, so
+Git tag `v0.1.0` becomes component version `0.1.0`.
+
+**Reference syntax** is `[<type>::]<repository>//<name>[:<version>]`. For this component:
+
+```
+ctf::./build/ctf//github.com/lioramilbaum/application:0.1.0
+```
+
+The repository (`ctf::./build/ctf`) locates the component but is not part of its identity. That
+is why `OCM_COMPONENT_REPO=oci::http://localhost:5001` addresses the same component version and
+why transfer preserves signatures. Leaving out `:<version>` lists all versions.
+
+### Artifact identity
+
+Each resource and source has an identity relative to its component version: `name` (required),
+`extraIdentity` (an optional string map for variants such as platform splits), and `version`.
+Duplicate identities are rejected at build time (`duplicate resource identities`). `type`, `labels`, `relation` and `access` are
+not part of identity — two resources that differ only in those still collide.
+
+This component's elements and their identities:
+
+| Element | Identity | Name coordinate |
+|---|---|---|
+| resource `hello-world-image` (amd64) | `name=hello-world-image,version=0.1.0,architecture=amd64` | `github.com/lioramilbaum/application:0.1.0:resource/hello-world-image` |
+| resource `hello-world-image` (arm64) | `name=hello-world-image,version=0.1.0,architecture=arm64` | `github.com/lioramilbaum/application:0.1.0:resource/hello-world-image` |
+| resource `hello-world-manifests` | `name=hello-world-manifests,version=0.1.0` | `github.com/lioramilbaum/application:0.1.0:resource/hello-world-manifests` |
+| resource `hello-world-localization` | `name=hello-world-localization,version=0.1.0` | `github.com/lioramilbaum/application:0.1.0:resource/hello-world-localization` |
+| resource `deploy-bundle` | `name=deploy-bundle,version=0.1.0` | `github.com/lioramilbaum/application:0.1.0:resource/deploy-bundle` |
+| source `application-source` | `name=application-source,version=0.1.0` | `github.com/lioramilbaum/application:0.1.0:source/application-source` |
+
+`hello-world-image` ships as two platform variants: `architecture: amd64` and `architecture: arm64`.
+Each points to its platform-specific manifest digest of `nginx:1.31-alpine`, keeping the identities
+unique while the name stays the same. The name coordinate alone is ambiguous for these variants —
+`ocm download resource` would return `got 2`; pass `--identity architecture=amd64` (or `arm64`) to
+select one (see [Selecting an artifact](#selecting-an-artifact)). `manifests.sh` selects the variant
+matching `TARGET_ARCH` (default: host architecture from `scripts/lib.sh`). The
+`application.lioramilbaum.github.com/tier` label is metadata for tools, not identity — see
+[Signing and verification](#signing-and-verification) for what labels are signed.
+
+### Selecting an artifact
+
+`ocm download resource` takes `--identity key=value,...` pairs. OCM prefers an exact match, falls
+back to a subset match, and requires exactly one candidate:
+
+| `--identity` | Result |
+|---|---|
+| `name=deploy-bundle` | OK (subset match, one candidate) |
+| `name=deploy-bundle,version=0.1.0` | OK (exact match) |
+| `version=0.1.0` | error: `expected exactly one resource candidate to download, got 5` |
+| `name=deploy-bundle,version=9.9.9` | error: `expected exactly one resource candidate to download, got 0` |
+| `name=hello-world-image` | error: `expected exactly one resource candidate to download, got 2` |
+| `name=hello-world-image,architecture=amd64` | OK (subset match, one candidate) |
+
+`scripts/manifests.sh` does not pass `--identity` for the image. It selects the `hello-world-image`
+resource whose `extraIdentity.architecture` matches `TARGET_ARCH` (default: the host architecture
+from `scripts/lib.sh`) and fails unless exactly one candidate matches.
+
+This is distinct from the *consumer identity* in [Credential system](#credential-system), which
+identifies the endpoint a credential belongs to.
 
 ## Credential system
 
@@ -421,6 +503,7 @@ Notes:
 - Downloaded files are mode 0600. Run them with `bash`, not `./`.
 - The deploy-bundle is a tar.gz archive that is automatically extracted by `ocm download resource`.
 - `deploy.sh` creates the application but does not tear it down. To delete: `kubectl delete ns hello-world`
+- `--identity name=deploy-bundle` selects the resource by artifact identity (subset match — only one resource has that name); see [Component identity](#component-identity).
 
 ## E2E testing
 
@@ -522,6 +605,7 @@ Tests include:
 - Kubernetes deployer: `readme documents kubernetes deployer`
 - Plugin system: `builtin plugins serve component types`, `readme documents plugin system`
 - Signing and verification: `signature covers normalized descriptor`, `readme documents signing and verification`
+- Component identity: `component identity selects artifacts`, `component identity rules enforced`, `readme documents component identity`
 
 ## CI
 

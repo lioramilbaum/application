@@ -15,7 +15,15 @@ cv_json="$("$OCM" get cv "$(cv_ref "$ROOT_COMPONENT")" -o json)"
 [[ "$(echo "$cv_json" | jq 'length')" -eq 1 ]] || \
   die "Expected exactly 1 component version, got: $(echo "$cv_json" | jq 'length')"
 
-res() { jq -c --arg n "$1" '.[0].component.resources[] | select(.name==$n)' <<<"$cv_json"; }
+res() {
+  local matches count
+  matches="$(jq -c --arg n "$1" --arg a "$TARGET_ARCH" \
+    '[.[0].component.resources[] | select(.name==$n and ((.extraIdentity.architecture // $a) == $a))]' \
+    <<<"$cv_json")"
+  count="$(jq length <<<"$matches")"
+  [[ "$count" -eq 1 ]] || die "expected exactly one $1 resource for architecture $TARGET_ARCH, got $count"
+  jq -c '.[0]' <<<"$matches"
+}
 
 res_digest() { res "$1" | jq -r '.digest.value'; }
 

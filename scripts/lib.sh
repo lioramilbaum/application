@@ -30,6 +30,9 @@ host_arch() {
   esac
 }
 
+TARGET_ARCH="${TARGET_ARCH:-$(host_arch)}"
+export TARGET_ARCH
+
 sha256() {
   if command -v shasum >/dev/null 2>&1; then
     shasum -a 256 "$1" | awk '{print $1}'

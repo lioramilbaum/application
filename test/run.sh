@@ -309,7 +309,12 @@ test_build_produces_application_tree() {
   local resource_names
   resource_names=$("$OCM" get cv "$(cv_ref "$ROOT_COMPONENT")" \
     -o json 2>/dev/null | jq -r '.[0].component.resources[].name' | sort | paste -sd, -)
-  assert_eq "$resource_names" "deploy-bundle,hello-world-image,hello-world-localization,hello-world-manifests" "resource names"
+  assert_eq "$resource_names" "deploy-bundle,hello-world-image,hello-world-image,hello-world-localization,hello-world-manifests" "resource names"
+
+  local image_archs
+  image_archs=$("$OCM" get cv "$(cv_ref "$ROOT_COMPONENT")" \
+    -o json 2>/dev/null | jq -r '[.[0].component.resources[] | select(.name=="hello-world-image") | .extraIdentity.architecture] | sort | join(",")')
+  assert_eq "$image_archs" "amd64,arm64" "hello-world-image architectures" || return 1
 
   local ref_count
   ref_count=$("$OCM" get cv "$(cv_ref "$ROOT_COMPONENT")" \
@@ -351,20 +356,21 @@ test_image_resource_is_pinned_by_digest() {
   local cv_json
   cv_json=$("$OCM" get cv "ctf::${tmp}/ctf//github.com/lioramilbaum/application:${VERSION:-0.1.0}" -o json 2>/dev/null)
 
-  local rtype relation img
-  rtype=$(echo "$cv_json" | jq -r '.[0].component.resources[] | select(.name=="hello-world-image") | .type')
-  assert_eq "$rtype" "ociImage" "image resource type"
+  local a rtype relation img expected_digest actual_digest
+  for a in amd64 arm64; do
+    rtype=$(echo "$cv_json" | jq -r --arg a "$a" '.[0].component.resources[] | select(.name=="hello-world-image" and .extraIdentity.architecture==$a) | .type')
+    assert_eq "$rtype" "ociImage" "$a image resource type" || return 1
 
-  relation=$(echo "$cv_json" | jq -r '.[0].component.resources[] | select(.name=="hello-world-image") | .relation // "external"')
-  assert_eq "$relation" "external" "image relation"
+    relation=$(echo "$cv_json" | jq -r --arg a "$a" '.[0].component.resources[] | select(.name=="hello-world-image" and .extraIdentity.architecture==$a) | .relation // "external"')
+    assert_eq "$relation" "external" "$a image relation" || return 1
 
-  img=$(echo "$cv_json" | jq -r '.[0].component.resources[] | select(.name=="hello-world-image") | .access.imageReference')
-  [[ "$img" =~ @sha256:[0-9a-f]{64}$ ]] || { echo "  Image not pinned by digest: $img" >&2; return 1; }
+    img=$(echo "$cv_json" | jq -r --arg a "$a" '.[0].component.resources[] | select(.name=="hello-world-image" and .extraIdentity.architecture==$a) | .access.imageReference')
+    [[ "$img" =~ @sha256:[0-9a-f]{64}$ ]] || { echo "  $a image not pinned by digest: $img" >&2; return 1; }
 
-  local expected_digest actual_digest
-  expected_digest=$(echo "$cv_json" | jq -r '.[0].component.resources[] | select(.name=="hello-world-image") | .digest.value')
-  actual_digest="${img##*@sha256:}"
-  assert_eq "$actual_digest" "$expected_digest" "image digest match"
+    expected_digest=$(echo "$cv_json" | jq -r --arg a "$a" '.[0].component.resources[] | select(.name=="hello-world-image" and .extraIdentity.architecture==$a) | .digest.value')
+    actual_digest="${img##*@sha256:}"
+    assert_eq "$actual_digest" "$expected_digest" "$a image digest match" || return 1
+  done
 }
 
 test_manifests_resource_metadata() {
@@ -464,7 +470,7 @@ test_manifests_renders_pinned_image() {
 
   local img
   img=$("$OCM" get cv "$(cv_ref "$ROOT_COMPONENT")" -o json 2>/dev/null \
-    | jq -r '.[0].component.resources[] | select(.name=="hello-world-image") | .access.imageReference')
+    | jq -r --arg a "$TARGET_ARCH" '.[0].component.resources[] | select(.name=="hello-world-image" and .extraIdentity.architecture==$a) | .access.imageReference')
   assert_contains "$rendered" "image: $img" "rendered image matches descriptor"
 }
 
@@ -519,7 +525,7 @@ test_manifests_localizes_transferred_image() {
 
   local digest
   digest="$("$OCM" get cv "$(cv_ref "$ROOT_COMPONENT")" -o json 2>/dev/null \
-    | jq -r '.[0].component.resources[] | select(.name=="hello-world-image") | .digest.value')"
+    | jq -r --arg a "$TARGET_ARCH" '.[0].component.resources[] | select(.name=="hello-world-image" and .extraIdentity.architecture==$a) | .digest.value')"
 
   local rendered
   rendered="$(cat "$tmp/deploy/hello-world.yaml")"
@@ -579,7 +585,7 @@ test_manifests_localizes_by_rule_not_placeholder() {
 
   local img
   img=$("$OCM" get cv "ctf::${ctf}//${ROOT_COMPONENT}:${VERSION:-0.1.0}" -o json 2>/dev/null \
-    | jq -r '.[0].component.resources[] | select(.name=="hello-world-image") | .access.imageReference')
+    | jq -r --arg a "$TARGET_ARCH" '.[0].component.resources[] | select(.name=="hello-world-image" and .extraIdentity.architecture==$a) | .access.imageReference')
 
   CTF="$ctf" SKIP_VERIFY=1 bash "$ROOT/scripts/manifests.sh" >/dev/null
 
@@ -1342,13 +1348,15 @@ test_resource_access_types() {
   local cv_json
   cv_json="$("$OCM" get cv "$(cv_ref "$ROOT_COMPONENT")" -o json 2>/dev/null)"
 
-  local relation access img name
-  relation=$(echo "$cv_json" | jq -r '.[0].component.resources[] | select(.name=="hello-world-image") | .relation')
-  assert_eq "$relation" "external" "image relation" || return 1
-  access=$(echo "$cv_json" | jq -r '.[0].component.resources[] | select(.name=="hello-world-image") | .access.type')
-  assert_eq "$access" "OCIImage/v1" "image access type" || return 1
-  img=$(echo "$cv_json" | jq -r '.[0].component.resources[] | select(.name=="hello-world-image") | .access.imageReference')
-  [[ "$img" == docker.io/* ]] || { echo "  image not referenced on docker.io: $img" >&2; return 1; }
+  local a relation access img name
+  for a in amd64 arm64; do
+    relation=$(echo "$cv_json" | jq -r --arg a "$a" '.[0].component.resources[] | select(.name=="hello-world-image" and .extraIdentity.architecture==$a) | .relation')
+    assert_eq "$relation" "external" "$a image relation" || return 1
+    access=$(echo "$cv_json" | jq -r --arg a "$a" '.[0].component.resources[] | select(.name=="hello-world-image" and .extraIdentity.architecture==$a) | .access.type')
+    assert_eq "$access" "OCIImage/v1" "$a image access type" || return 1
+    img=$(echo "$cv_json" | jq -r --arg a "$a" '.[0].component.resources[] | select(.name=="hello-world-image" and .extraIdentity.architecture==$a) | .access.imageReference')
+    [[ "$img" == docker.io/* ]] || { echo "  $a image not referenced on docker.io: $img" >&2; return 1; }
+  done
 
   for name in hello-world-manifests hello-world-localization deploy-bundle; do
     relation=$(echo "$cv_json" | jq -r --arg n "$name" '.[0].component.resources[] | select(.name==$n) | .relation')
@@ -1396,7 +1404,7 @@ test_transfer_without_copy_resources_keeps_external_reference() {
   n_transforms="$(printf '%s' "$plan" | jq '.transformations | length')"
   [[ "$n_transforms" -gt 0 ]] || { echo "  dry-run plan must contain at least one transformation" >&2; return 1; }
 
-  img_type="$(echo "$plan" | jq -r '.environment[].component.resources[] | select(.name=="hello-world-image") | .access.type')"
+  img_type="$(echo "$plan" | jq -r '[.environment[].component.resources[] | select(.name=="hello-world-image") | .access.type] | unique | join(",")')"
   assert_eq "$img_type" "OCIImage/v1" "image access type after plain transfer" || return 1
 
   fetches="$(echo "$plan" | jq '[.transformations[] | select(.type=="GetOCIArtifact/v1alpha1")] | length')"
@@ -1411,30 +1419,35 @@ test_transfer_copy_resources_inlines_image_as_local_blob() {
   plan="$(_transfer_plan "ctf::$tmp/target" --copy-resources)" || return 1
 
   fetched="$(echo "$plan" | jq -r '[.transformations[] | select(.type=="GetOCIArtifact/v1alpha1") | .spec.resource.name] | join(",")')"
-  assert_eq "$fetched" "hello-world-image" "only the external image is downloaded" || return 1
+  assert_eq "$fetched" "hello-world-image,hello-world-image" "only the external images are downloaded" || return 1
 
   # The CTF add transform's spec holds unresolved templates, so match on its label
   added="$(echo "$plan" | jq '[.transformations[] | select(.type=="CTFAddLocalResource/v1alpha1") | select(.label | test("hello-world-image"))] | length')"
-  assert_eq "$added" "1" "image written as LocalBlob to the CTF" || return 1
+  assert_eq "$added" "2" "one LocalBlob per architecture written to the CTF" || return 1
 }
 
 test_transfer_copy_resources_uploads_oci_artifact() {
-  local tmp="$1" plan ref target_type source_digest target_digest
+  local tmp="$1" plan ref target_type mismatched n_artifacts
   _build
   plan="$(_transfer_plan "oci::http://localhost:5001" --copy-resources --upload-as ociArtifact)" || return 1
 
   # In OCM ≥0.19 imageReference is a CEL template with the target URL embedded as a
   # map-literal key ("baseUrl": "http://localhost:5001"), so we match on the host only.
+  # One TransferOCIArtifact per architecture variant
+  n_artifacts="$(echo "$plan" | jq '[.transformations[] | select(.type=="TransferOCIArtifact/v1alpha1")] | length')"
+  assert_eq "$n_artifacts" "2" "one OCI artifact transfer per architecture" || return 1
+
+  local bad_refs
+  bad_refs="$(echo "$plan" | jq '[.transformations[] | select(.type=="TransferOCIArtifact/v1alpha1") | .spec.targetResource.access.imageReference | select(contains("http://localhost:5001") | not)] | length')"
+  assert_eq "$bad_refs" "0" "all target imageReferences contain http://localhost:5001" || return 1
   ref="$(echo "$plan" | jq -r '.transformations[] | select(.type=="TransferOCIArtifact/v1alpha1") | .spec.targetResource.access.imageReference')"
-  assert_contains "$ref" "http://localhost:5001" || return 1
   assert_not_contains "$ref" "@sha256:" || return 1
 
-  target_type="$(echo "$plan" | jq -r '.transformations[] | select(.type=="TransferOCIArtifact/v1alpha1") | .spec.targetResource.access.type')"
+  target_type="$(echo "$plan" | jq -r '[.transformations[] | select(.type=="TransferOCIArtifact/v1alpha1") | .spec.targetResource.access.type] | unique | join(",")')"
   assert_eq "$target_type" "ociArtifact/v1" "target access type" || return 1
 
-  source_digest="$(echo "$plan" | jq -r '.transformations[] | select(.type=="TransferOCIArtifact/v1alpha1") | .spec.resource.digest.value')"
-  target_digest="$(echo "$plan" | jq -r '.transformations[] | select(.type=="TransferOCIArtifact/v1alpha1") | .spec.targetResource.digest.value')"
-  assert_eq "$target_digest" "$source_digest" "digest preserved across transfer" || return 1
+  mismatched="$(echo "$plan" | jq '[.transformations[] | select(.type=="TransferOCIArtifact/v1alpha1") | select(.spec.targetResource.digest.value != .spec.resource.digest.value)] | length')"
+  assert_eq "$mismatched" "0" "digest preserved across transfer" || return 1
 }
 
 test_ctf_layout_is_canonical() {
@@ -1706,6 +1719,213 @@ test_readme_documents_signing_and_verification() {
     | jq -r '[.[0].component.labels[] | select(.signing != true) | .name] | unique[]')
 }
 
+test_component_identity_selects_artifacts() {
+  local tmp="$1" cv_json out
+  _build
+  cv_json="$("$OCM" get cv "$(cv_ref)" -o json)"
+
+  local re='^[a-z][-a-z0-9]*([.][a-z][-a-z0-9]*)*[.][a-z]{2,}(/[a-z][-a-z0-9_]*([.][a-z][-a-z0-9_]*)*)+$'
+  [[ "$(jq -r '.[0].component.name' <<<"$cv_json")" =~ $re ]] \
+    || { echo "  component name does not match regex" >&2; return 1; }
+
+  local count; count="$(jq '[.[0].component.resources[] | {name,version,extraIdentity}] | unique | length' <<<"$cv_json")"
+  local total; total="$(jq '[.[0].component.resources[]] | length' <<<"$cv_json")"
+  assert_eq "$count" "$total" "all resource identities are unique" || return 1
+
+  "$OCM" download resource "$(cv_ref)" --identity "name=hello-world-manifests" \
+    --output "$tmp/m1.yaml" >/dev/null || return 1
+  cmp "$tmp/m1.yaml" "$ROOT/components/hello-world/manifests.yaml" \
+    || { echo "  subset-match download differs" >&2; return 1; }
+
+  "$OCM" download resource "$(cv_ref)" --identity "name=hello-world-manifests,version=$VERSION" \
+    --output "$tmp/m2.yaml" >/dev/null || return 1
+  cmp "$tmp/m2.yaml" "$ROOT/components/hello-world/manifests.yaml" \
+    || { echo "  exact-match download differs" >&2; return 1; }
+
+  out="$("$OCM" download resource "$(cv_ref)" --identity "version=$VERSION" \
+    --output "$tmp/bad.yaml" 2>&1)" \
+    && { echo "  version-only identity should fail" >&2; return 1; }
+  assert_contains "$out" "got 5" || return 1
+
+  out="$("$OCM" download resource "$(cv_ref)" \
+    --identity "name=hello-world-manifests,version=9.9.9" \
+    --output "$tmp/bad2.yaml" 2>&1)" \
+    && { echo "  wrong-version identity should fail" >&2; return 1; }
+  assert_contains "$out" "got 0" || return 1
+
+  out="$("$OCM" download resource "$(cv_ref)" --identity "name=hello-world-image" \
+    --output "$tmp/bad3.tar" 2>&1)" \
+    && { echo "  name-only image identity should fail" >&2; return 1; }
+  assert_contains "$out" "got 2" || return 1
+
+  out="$("$OCM" download resource "$(cv_ref)" --identity "name=hello-world-image,architecture=s390x" \
+    --output "$tmp/bad4.tar" 2>&1)" \
+    && { echo "  unknown architecture identity should fail" >&2; return 1; }
+  assert_contains "$out" "got 0" || return 1
+
+  "$OCM" download resource "$(cv_ref)" --identity "name=hello-world-image,architecture=amd64" \
+    --output "$tmp/img-amd64.tar" --extraction-policy disable >/dev/null || return 1
+  [[ -s "$tmp/img-amd64.tar" ]] || { echo "  amd64 image download is empty" >&2; return 1; }
+
+  assert_fails "$OCM" get cv "ctf::$CTF//${ROOT_COMPONENT}:9.9.9" -o json || return 1
+
+  local versions; versions="$("$OCM" get cv "ctf::$CTF//${ROOT_COMPONENT}" -o json \
+    | jq -r '.[].component.version')"
+  assert_contains "$versions" "$VERSION" || return 1
+}
+
+test_component_identity_rules_enforced() {
+  local tmp="$1" cfg n=0 out
+  cfg="$(_empty_ocmconfig "$tmp")"
+  printf 'a' > "$tmp/a.txt"
+  printf 'b' > "$tmp/b.txt"
+
+  while IFS='|' read -r cname cver; do
+    n=$((n+1))
+    cat > "$tmp/c$n.yaml" <<YAML
+components:
+  - name: $cname
+    version: $cver
+    provider: {name: test}
+    resources:
+      - name: ap
+        version: $cver
+        type: blob
+        input: {type: file, path: ./a.txt}
+YAML
+    out="$("$OCM" add cv --repository "ctf::$tmp/bad$n" \
+      --constructor "$tmp/c$n.yaml" --config "$cfg" 2>&1)" \
+      && { echo "  expected failure for name=$cname version=$cver" >&2; return 1; }
+    # error wording varies across OCM versions; just confirm the command rejected
+    assert_contains "$out" "Error" || return 1
+  done <<'TABLE'
+example.com/Demo|1.0.0
+demo|1.0.0
+example.com|1.0.0
+example.com/identity-demo|latest
+TABLE
+
+  cat > "$tmp/dup.yaml" <<'YAML'
+components:
+  - name: example.com/identity-demo
+    version: 1.0.0
+    provider: {name: test}
+    resources:
+      - name: ap
+        version: 1.0.0
+        type: blob
+        input: {type: file, path: ./a.txt}
+      - name: ap
+        version: 1.0.0
+        type: ociImage
+        input: {type: file, path: ./b.txt}
+YAML
+  out="$("$OCM" add cv --repository "ctf::$tmp/dup" \
+    --constructor "$tmp/dup.yaml" --config "$cfg" 2>&1)" \
+    && { echo "  expected duplicate identity failure" >&2; return 1; }
+  assert_contains "$out" "duplicate resource identities" || return 1
+
+  cat > "$tmp/variants.yaml" <<'YAML'
+components:
+  - name: example.com/identity-demo
+    version: 1.0.0
+    provider: {name: test}
+    resources:
+      - name: ap
+        version: 1.0.0
+        extraIdentity: {architecture: amd64}
+        type: blob
+        input: {type: file, path: ./a.txt}
+      - name: ap
+        version: 1.0.0
+        extraIdentity: {architecture: arm64}
+        type: blob
+        input: {type: file, path: ./b.txt}
+YAML
+  "$OCM" add cv --repository "ctf::$tmp/variants" \
+    --constructor "$tmp/variants.yaml" --config "$cfg" >/dev/null || return 1
+
+  out="$("$OCM" download resource "ctf::$tmp/variants//example.com/identity-demo:1.0.0" \
+    --identity "name=ap" --output "$tmp/ap-any.txt" 2>&1)" \
+    && { echo "  ambiguous name-only identity should fail" >&2; return 1; }
+  assert_contains "$out" "got 2" || return 1
+
+  "$OCM" download resource "ctf::$tmp/variants//example.com/identity-demo:1.0.0" \
+    --identity "name=ap,architecture=arm64" --output "$tmp/ap-arm64.txt" >/dev/null || return 1
+  assert_eq "$(cat "$tmp/ap-arm64.txt")" "b" "arm64 variant content" || return 1
+
+  out="$("$OCM" download resource "ctf::$tmp/variants//example.com/identity-demo:1.0.0" \
+    --identity "name=ap,architecture=s390x" --output "$tmp/ap-s390x.txt" 2>&1)" \
+    && { echo "  missing architecture should fail" >&2; return 1; }
+  assert_contains "$out" "got 0" || return 1
+}
+
+test_manifests_selects_target_arch_variant() {
+  local tmp="$1" out a digest other_digest
+  _build
+  for a in amd64 arm64; do
+    TARGET_ARCH="$a" SKIP_VERIFY=1 bash "$ROOT/scripts/manifests.sh" >/dev/null || return 1
+    digest="$("$OCM" get cv "$(cv_ref "$ROOT_COMPONENT")" -o json 2>/dev/null \
+      | jq -r --arg a "$a" '.[0].component.resources[] | select(.name=="hello-world-image" and .extraIdentity.architecture==$a) | .digest.value')"
+    other_digest="$("$OCM" get cv "$(cv_ref "$ROOT_COMPONENT")" -o json 2>/dev/null \
+      | jq -r --arg a "$a" '.[0].component.resources[] | select(.name=="hello-world-image" and .extraIdentity.architecture!=$a) | .digest.value')"
+    assert_contains "$(cat "$tmp/deploy/hello-world.yaml")" "@sha256:$digest" \
+      || { echo "  manifest does not contain the $a image digest" >&2; return 1; }
+    assert_not_contains "$(cat "$tmp/deploy/hello-world.yaml")" "@sha256:$other_digest" \
+      || { echo "  manifest contains the other-architecture digest for TARGET_ARCH=$a" >&2; return 1; }
+  done
+
+  out="$(TARGET_ARCH=s390x SKIP_VERIFY=1 bash "$ROOT/scripts/manifests.sh" 2>&1)" \
+    && { echo "  s390x should fail" >&2; return 1; }
+  assert_contains "$out" "s390x" || return 1
+  assert_contains "$out" "got 0" || return 1
+}
+
+test_readme_documents_component_identity() {
+  local tmp="$1" section tree_section consuming_section n v identity
+  section="$(awk '/^## Component identity/{f=1; next} /^## /{f=0} f' "$ROOT/README.md")"
+  [[ -n "$section" ]] || { echo "  README has no '## Component identity' section" >&2; return 1; }
+
+  assert_contains "$section" "https://ocm.software/docs/concepts/component-identity/" || return 1
+  assert_contains "$section" "$ROOT_COMPONENT" || return 1
+  assert_contains "$section" 'a-z][-a-z0-9]*' || return 1
+  assert_contains "$section" "name:version" || return 1
+  assert_contains "$section" "OCM_COMPONENT_REPO" || return 1
+  assert_contains "$section" "extraIdentity" || return 1
+  assert_contains "$section" "--identity" || return 1
+  assert_contains "$section" "duplicate resource identities" || return 1
+  assert_contains "$section" "expected exactly one resource candidate" || return 1
+  assert_contains "$section" "consumer identity" || return 1
+  assert_contains "$section" "(#credential-system)" || return 1
+  assert_contains "$section" "(#signing-and-verification)" || return 1
+  assert_not_contains "$section" "major and minor" || return 1
+  assert_not_contains "$section" "None uses \`extraIdentity\`" || return 1
+  assert_not_contains "$section" "would select" || return 1
+  assert_contains "$section" "TARGET_ARCH" || return 1
+  assert_contains "$section" "name=hello-world-image,architecture=amd64" || return 1
+  assert_contains "$section" "Name coordinate" || return 1
+  assert_contains "$section" "name coordinate" || return 1
+
+  _build
+  while IFS=$'\t' read -r n identity; do
+    assert_contains "$section" "$identity" || return 1
+    assert_contains "$section" "${ROOT_COMPONENT}:${VERSION}:resource/$n" || return 1
+  done < <("$OCM" get cv "$(cv_ref)" -o json \
+    | jq -r '.[0].component.resources[] | [.name, ("name=\(.name),version=\(.version)" + ([.extraIdentity // {} | to_entries[] | ",\(.key)=\(.value)"] | join("")))] | @tsv')
+
+  while IFS= read -r n; do
+    assert_contains "$section" "name=$n,version=$VERSION" || return 1
+    assert_contains "$section" "${ROOT_COMPONENT}:${VERSION}:source/$n" || return 1
+  done < <("$OCM" get cv "$(cv_ref)" -o json \
+    | jq -r '.[0].component.sources[].name')
+
+  tree_section="$(awk '/^## Component tree/{f=1; next} /^## /{f=0} f' "$ROOT/README.md")"
+  assert_contains "$tree_section" "(#component-identity)" || return 1
+
+  consuming_section="$(awk '/^## Consuming the component/{f=1; next} /^## /{f=0} f' "$ROOT/README.md")"
+  assert_contains "$consuming_section" "(#component-identity)" || return 1
+}
+
 # ── Run all tests ─────────────────────────────────────────────────────────────
 
 run_test "build produces application tree" test_build_produces_application_tree
@@ -1773,6 +1993,10 @@ run_test "builtin plugins serve component types" test_builtin_plugins_serve_comp
 run_test "readme documents plugin system" test_readme_documents_plugin_system
 run_test "signature covers normalized descriptor" test_signature_covers_normalized_descriptor
 run_test "readme documents signing and verification" test_readme_documents_signing_and_verification
+run_test "component identity selects artifacts" test_component_identity_selects_artifacts
+run_test "component identity rules enforced" test_component_identity_rules_enforced
+run_test "readme documents component identity" test_readme_documents_component_identity
+run_test "manifests selects target architecture variant" test_manifests_selects_target_arch_variant
 
 echo ""
 echo "Results: $PASS passed, $FAIL failed"

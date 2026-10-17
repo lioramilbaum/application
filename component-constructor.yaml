@@ -16,11 +16,21 @@ components:
           commit: ${SOURCE_COMMIT}
     resources:
       - name: hello-world-image
+        extraIdentity:
+          architecture: amd64
         type: ociImage
         version: ${VERSION}
         access:
           type: OCIImage/v1
           imageReference: docker.io/library/nginx:1.31-alpine@sha256:138af827713b7671ef4ee2deea73bc6f08ae265130ce350307e3e7b52cd4b51b
+      - name: hello-world-image
+        extraIdentity:
+          architecture: arm64
+        type: ociImage
+        version: ${VERSION}
+        access:
+          type: OCIImage/v1
+          imageReference: docker.io/library/nginx:1.31-alpine@sha256:2d829ce6bc998fecd1cd72204c358c0c0614bab5edd9471dfcf8b92a49f4d323
       - name: hello-world-manifests
         type: blob
         version: ${VERSION}
