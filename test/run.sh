@@ -290,6 +290,12 @@ YAML
   echo "$dir/consumer-ctf"
 }
 
+# Dry-run transfer of the application component; prints the JSON plan.
+_transfer_plan() {
+  local target="$1"; shift
+  "$OCM" transfer cv "$(cv_ref)" "$target" "$@" --dry-run -o json
+}
+
 # ── Tests ────────────────────────────────────────────────────────────────────
 
 test_build_produces_application_tree() {
@@ -1330,6 +1336,107 @@ YAML
   assert_eq "$names" "example.com/resolver-demo/consumer,github.com/lioramilbaum/application" "resolved components in good order" || return 1
 }
 
+test_resource_access_types() {
+  local tmp="$1"
+  _build
+  local cv_json
+  cv_json="$("$OCM" get cv "$(cv_ref "$ROOT_COMPONENT")" -o json 2>/dev/null)"
+
+  local relation access img name
+  relation=$(echo "$cv_json" | jq -r '.[0].component.resources[] | select(.name=="hello-world-image") | .relation')
+  assert_eq "$relation" "external" "image relation" || return 1
+  access=$(echo "$cv_json" | jq -r '.[0].component.resources[] | select(.name=="hello-world-image") | .access.type')
+  assert_eq "$access" "OCIImage/v1" "image access type" || return 1
+  img=$(echo "$cv_json" | jq -r '.[0].component.resources[] | select(.name=="hello-world-image") | .access.imageReference')
+  [[ "$img" == docker.io/* ]] || { echo "  image not referenced on docker.io: $img" >&2; return 1; }
+
+  for name in hello-world-manifests hello-world-localization deploy-bundle; do
+    relation=$(echo "$cv_json" | jq -r --arg n "$name" '.[0].component.resources[] | select(.name==$n) | .relation')
+    assert_eq "$relation" "local" "$name relation" || return 1
+    access=$(echo "$cv_json" | jq -r --arg n "$name" '.[0].component.resources[] | select(.name==$n) | .access.type')
+    assert_eq "$access" "LocalBlob/v1" "$name access type" || return 1
+  done
+
+  access=$(echo "$cv_json" | jq -r '.[0].component.sources[] | select(.name=="application-source") | .access.type')
+  assert_eq "$access" "GitHub/v1" "source access type" || return 1
+}
+
+test_readme_documents_resource_access_types() {
+  # awk rather than sed/head: BSD (macOS) sed and head reject the GNU-only forms
+  local section
+  section="$(awk '/^## Resource repositories/{f=1; next} /^## /{f=0} f' "$ROOT/README.md")"
+  [[ -n "$section" ]] || { echo "  README has no '## Resource repositories' section" >&2; return 1; }
+  assert_contains "$section" "OCIImage/v1" || return 1
+  assert_contains "$section" "LocalBlob/v1" || return 1
+  assert_contains "$section" "GitHub/v1" || return 1
+  assert_contains "$section" "--copy-resources" || return 1
+  assert_contains "$section" "--upload-as ociArtifact" || return 1
+}
+
+test_publish_copies_resources_as_oci_artifacts() {
+  local tmp="$1" mode args
+  mkdir -p "$tmp/cred" "$tmp/disc"
+  _run_publish_stubbed "$tmp/cred" OCM_REGISTRY_USERNAME=demo-user OCM_REGISTRY_PASSWORD=demo-secret >/dev/null || return 1
+  _run_publish_stubbed "$tmp/disc" >/dev/null || return 1
+
+  for mode in cred disc; do
+    args="$(cat "$tmp/$mode/ocm-args.log")"
+    assert_contains "$args" "--copy-resources" || { echo "  $mode mode: --copy-resources missing" >&2; return 1; }
+    assert_contains "$args" "--upload-as ociArtifact" || { echo "  $mode mode: --upload-as ociArtifact missing" >&2; return 1; }
+  done
+}
+
+test_transfer_without_copy_resources_keeps_external_reference() {
+  local tmp="$1" plan img_type fetches
+  _build
+  plan="$(_transfer_plan "ctf::$tmp/target")" || return 1
+
+  # A zero fetch count is only meaningful if the plan actually has transformations
+  local n_transforms
+  n_transforms="$(printf '%s' "$plan" | jq '.transformations | length')"
+  [[ "$n_transforms" -gt 0 ]] || { echo "  dry-run plan must contain at least one transformation" >&2; return 1; }
+
+  img_type="$(echo "$plan" | jq -r '.environment[].component.resources[] | select(.name=="hello-world-image") | .access.type')"
+  assert_eq "$img_type" "OCIImage/v1" "image access type after plain transfer" || return 1
+
+  fetches="$(echo "$plan" | jq '[.transformations[] | select(.type=="GetOCIArtifact/v1alpha1")] | length')"
+  assert_eq "$fetches" "0" "external image not downloaded" || return 1
+
+  [[ ! -e "$tmp/target" ]] || { echo "  dry run must not create the target" >&2; return 1; }
+}
+
+test_transfer_copy_resources_inlines_image_as_local_blob() {
+  local tmp="$1" plan fetched added
+  _build
+  plan="$(_transfer_plan "ctf::$tmp/target" --copy-resources)" || return 1
+
+  fetched="$(echo "$plan" | jq -r '[.transformations[] | select(.type=="GetOCIArtifact/v1alpha1") | .spec.resource.name] | join(",")')"
+  assert_eq "$fetched" "hello-world-image" "only the external image is downloaded" || return 1
+
+  # The CTF add transform's spec holds unresolved templates, so match on its label
+  added="$(echo "$plan" | jq '[.transformations[] | select(.type=="CTFAddLocalResource/v1alpha1") | select(.label | test("hello-world-image"))] | length')"
+  assert_eq "$added" "1" "image written as LocalBlob to the CTF" || return 1
+}
+
+test_transfer_copy_resources_uploads_oci_artifact() {
+  local tmp="$1" plan ref target_type source_digest target_digest
+  _build
+  plan="$(_transfer_plan "oci::http://localhost:5001" --copy-resources --upload-as ociArtifact)" || return 1
+
+  # In OCM ≥0.19 imageReference is a CEL template with the target URL embedded as a
+  # map-literal key ("baseUrl": "http://localhost:5001"), so we match on the host only.
+  ref="$(echo "$plan" | jq -r '.transformations[] | select(.type=="TransferOCIArtifact/v1alpha1") | .spec.targetResource.access.imageReference')"
+  assert_contains "$ref" "http://localhost:5001" || return 1
+  assert_not_contains "$ref" "@sha256:" || return 1
+
+  target_type="$(echo "$plan" | jq -r '.transformations[] | select(.type=="TransferOCIArtifact/v1alpha1") | .spec.targetResource.access.type')"
+  assert_eq "$target_type" "ociArtifact/v1" "target access type" || return 1
+
+  source_digest="$(echo "$plan" | jq -r '.transformations[] | select(.type=="TransferOCIArtifact/v1alpha1") | .spec.resource.digest.value')"
+  target_digest="$(echo "$plan" | jq -r '.transformations[] | select(.type=="TransferOCIArtifact/v1alpha1") | .spec.targetResource.digest.value')"
+  assert_eq "$target_digest" "$source_digest" "digest preserved across transfer" || return 1
+}
+
 # ── Run all tests ─────────────────────────────────────────────────────────────
 
 run_test "build produces application tree" test_build_produces_application_tree
@@ -1382,6 +1489,12 @@ run_test "release publishes with OCM credentials" test_release_publishes_with_oc
 run_test "resolvers config is valid for ocm" test_resolvers_config_is_valid_for_ocm
 run_test "resolvers resolve component reference" test_resolvers_resolve_component_reference
 run_test "resolvers honour version constraint and order" test_resolvers_honour_version_constraint_and_order
+run_test "resource access types" test_resource_access_types
+run_test "readme documents resource access types" test_readme_documents_resource_access_types
+run_test "publish copies resources as OCI artifacts" test_publish_copies_resources_as_oci_artifacts
+run_test "transfer without copy-resources keeps external reference" test_transfer_without_copy_resources_keeps_external_reference
+run_test "transfer copy-resources inlines image as local blob" test_transfer_copy_resources_inlines_image_as_local_blob
+run_test "transfer copy-resources uploads OCI artifact" test_transfer_copy_resources_uploads_oci_artifact
 
 echo ""
 echo "Results: $PASS passed, $FAIL failed"
