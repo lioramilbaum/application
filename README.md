@@ -254,6 +254,8 @@ Helm charts (`helm/v1` input, `Helm/v1` access): see [Helm charts](#helm-charts)
 
 HTTP downloads (`Wget/v1` input and access): see [HTTP resources](#http-resources).
 
+Git repositories (`Git/v1` input, access and sources): see [Git repositories](#git-repositories).
+
 **`input:` vs `access:`** in `component-constructor.yaml`: an `input:` block is read at build time and stored as a `LocalBlob/v1` in the component repository. An `access:` block points at an artifact already in an external resource repository; OCM records only the reference and its digest. The nginx image digest is already pinned in `component-constructor.yaml`; OCM records it as-is without re-resolving it from Docker Hub.
 
 Inspect the built descriptor:
@@ -1259,15 +1261,121 @@ The signature, including the chain, lives in the descriptor, so `ocm transfer cv
 - PEM encoding is early access. OCM logs `signing with PEM encoding is experimental` and `verifying signatures with PEM encoding is experimental` as warnings.
 - When the verifier's file holds no root, OCM uses the system verifier and its message differs by platform: `certificate signed by unknown authority` on Linux, `certificate is not trusted` on macOS. Both are reported as `unknown-authority`.
 
+## Git repositories
+
+OCM records a Git repository in a component in three ways. A [`Git/v1` input](https://ocm.software/docs/reference/input-and-access-types/#gitv1-input) copies the files of one commit into the component. A [`Git/v1` access](https://ocm.software/docs/reference/input-and-access-types/#gitv1-access) records the repository and a commit, and fetches the files when the resource is downloaded. A source is a `Git/v1` access without a digest.
+
+### Demo component
+
+`components/git/component-constructor.yaml`:
+
+```yaml
+name: github.com/lioramilbaum/git-demo
+version: ${VERSION}
+provider:
+  name: github.com/lioramilbaum
+sources:
+  - name: hello-world-source
+    type: git
+    version: ${VERSION}
+    access:
+      type: Git/v1
+      repository: ${GIT_DEMO_REPO}
+      commit: "${GIT_DEMO_COMMIT}"
+resources:
+  - name: hello-world-source-snapshot
+    type: directoryTree
+    version: ${VERSION}
+    labels:
+      - name: git.lioramilbaum.github.com/commit
+        signing: true
+        value: "${GIT_DEMO_COMMIT}"
+    input:
+      type: Git/v1
+      repository: ${GIT_DEMO_REPO}
+      commit: "${GIT_DEMO_COMMIT}"
+  - name: hello-world-source-tracked
+    type: directoryTree
+    version: ${VERSION}
+    access:
+      type: Git/v1
+      repository: ${GIT_DEMO_REPO}
+      ref: ${GIT_DEMO_REF}
+```
+
+```sh
+make git   # build, sign, verify and audit the Git source demo; offline
+```
+
+`make git` creates `build/git/upstream.git` from `components/git/upstream/`: one commit with the tag `v0.1.0`. The repository is created with `--object-format=sha1`, and a fixed identity and date make every run produce the same commit. It writes the component archive to `build/git-ctf`, signs and verifies it, then audits the snapshot against the commit named by its label.
+
+| Record | Constructor form | Stored as | Signed |
+|---|---|---|---|
+| `hello-world-source` (source) | `access: Git/v1` with `repository` and `commit` | the access only | name, version and type; the access is not |
+| `hello-world-source-tracked` (resource) | `access: Git/v1` with `repository` and `ref` | `Git/v1` access, with the ref pinned to a commit at build time | digest; the access is not |
+| `hello-world-source-snapshot` (resource) | `input: Git/v1` with `repository` and `commit` | `LocalBlob/v1`, an archive of the tree with media type `application/x-tgz` | digest, and the `git.lioramilbaum.github.com/commit` label, which has `signing: true` |
+
+The source content is recorded without a digest and is not verifiable: OCM never downloads it, so `ocm verify cv` cannot check it, and a changed commit in the source's access goes unnoticed. Declare the artifact as a resource if its content must be checked. The tracked resource is a `Git/v1` access and downloads from the repository at consume time, so it needs the repository and the pinned commit. The snapshot is self-contained: it stores the files, and the signed label names the commit they came from.
+
+### Pinned commits and digests
+
+The `ref` in the tracked resource is resolved to a commit when the component is built. A branch that moves later does not change what the resource downloads (`branch-moved` below). The downloaded archive must match the digest recorded in the descriptor; otherwise the download fails with `git archive digest mismatch`.
+
+The digest covers the tree, not the commit. Two commits with the same tree have the same digest, so the commit named in an access can be replaced with another commit of the same tree without failing a download. A different tree fails with `git archive digest mismatch`.
+
+`bash scripts/git.sh audit` closes the gap for the snapshot. It fetches the commit named by the signed label from the source's repository and compares it with the snapshot files with `diff -r`. It prints `audit <commit> <digest> match`. Without a signature, `audit` stops before it fetches anything.
+
+### Transfer and credentials
+
+`bash scripts/git.sh transfer` runs `ocm transfer cv --copy-resources` and prints the access type of each record in the target. The snapshot becomes a `LocalBlob/v1`, so the copy no longer needs the repository. The tracked resource and the source keep their `Git/v1` access and still need the repository. The signature travels with the copy and still verifies.
+
+A `localblob.uploader.transfer.config.ocm.software/v1alpha1` rule with `match: resource.access.isType("Git")` would copy the tracked resource as well. In OCM 0.19.1 that rule fails with `cannot copy access type Git/v1`; copying `Git/v1` access arrives in v0.20.0-rc.1 (#3709). See [Transfer and transport](#transfer-and-transport).
+
+Private repositories are reached with `GitCredentials/v1`, resolved by consumer identity like every other OCM credential. See [Credential system](#credential-system).
+
+### Own repository
+
+Set `GIT_DEMO_REPO` and `GIT_DEMO_COMMIT` together to build from a repository you supply instead of the generated one:
+
+```sh
+GIT_DEMO_REPO=/path/to/repo GIT_DEMO_COMMIT=<40-char commit SHA> make git
+```
+
+Setting only one of them fails. `GIT_DEMO_COMMIT` must be a 40-character SHA-1 commit. A 64-character SHA-256 object name is rejected before the build. OCM 0.19.1 reads SHA-1 repositories only, so a SHA-256 repository fails with `mismatched algorithms` (#3794). `GIT_DEMO_REF` (default `refs/heads/main`) sets the ref that the tracked resource follows at build time. `make git` with your own repository does not create `build/git/upstream.git`. The `scenarios` and `upstream` commands need the generated repository.
+
+### Scenarios
+
+`bash scripts/git.sh scenarios` builds and signs the component once, then changes the generated upstream for each row and prints `<scenario> <verify> <snapshot> <tracked> <reason>`:
+
+| Scenario | Upstream after signing | Verify | Snapshot | Tracked | Reason |
+|---|---|---|---|---|---|
+| `baseline` | unchanged | ok | ok | ok | - |
+| `branch-moved` | `main` has a new commit; the pinned commit is still in the repository | ok | ok | ok | - |
+| `history-rewritten` | `main` is force-pushed and the pinned commit is removed | ok | ok | fail | `missing-commit` |
+| `upstream-deleted` | the repository is deleted | ok | ok | fail | `repository-not-found` |
+
+The snapshot is a `LocalBlob/v1` in the component, so it downloads in every row. The tracked resource needs the pinned commit, so it fails once the commit is removed or the repository is gone. Verification passes in every row because the component is not changed.
+
+### Limitations
+
+- `make git` needs OCM CLI ≥ 0.19.0 (`Git/v1` input and access) and `git` 2.32 or newer. The script refuses to run with an older OCM CLI.
+- The demo uses `file://` repositories only. Remote repositories need `GitCredentials/v1` for private ones.
+- The source is not verifiable, and its commit is not signed. The snapshot's label is the only signed link to a commit.
+- `srcRefs` is not signed and this component does not use it.
+- Copying `Git/v1` access in a transfer arrives in v0.20.0-rc.1 (#3709).
+
+Related: [Source provenance](#source-provenance) · [Signing and verification](#signing-and-verification) · [Transfer and transport](#transfer-and-transport) · [Credential system](#credential-system)
+
 ## Prerequisites
 
-- OCM CLI v2 ≥ 0.17.0 (publishing with `OCM_REGISTRY_USERNAME`/`OCM_REGISTRY_PASSWORD` requires ≥ 0.19.1); `make versions` and `make wget` require ≥ 0.19.0
+- OCM CLI v2 ≥ 0.17.0 (publishing with `OCM_REGISTRY_USERNAME`/`OCM_REGISTRY_PASSWORD` requires ≥ 0.19.1); `make versions`, `make wget` and `make git` require ≥ 0.19.0
 - kind
 - `make`
 - `shellcheck` (for linting)
 - `jq`
 - `openssl` (`make pki` uses `openssl ca` to issue demo certificates; tested with OpenSSL 3.0 and 4.0 and LibreSSL 3.3)
 - `python3` and `curl` (for `make wget`: the local upstream server and its readiness check)
+- `git` 2.32 or newer (for `make git`: creates the demo repository and reads it back)
 - `kubectl` (for deploying and for `make manifests`, which uses `kubectl kustomize`)
 - `helm` is optional, only for rendering the downloaded chart with `helm template`
 - `docker` (for `make e2e` or `make e2e-run` only)
@@ -1299,6 +1407,7 @@ make versions  # build the versions demo and show constraint/--latest/scheme sel
 make helm      # build, sign, verify and download the Helm chart demo (helm/v1 input, --transformer helm); offline
 make wget      # build, sign, verify and download the HTTP resources demo (Wget/v1 input and access); offline, requires OCM >= 0.19.0
 make pki        # create a demo CA, build, sign with a PEM certificate-chain signature and verify against the root CA; offline
+make git        # build, sign, verify and audit the Git source demo (Git/v1 source, access and input); offline, requires OCM >= 0.19.0
 ```
 
 ## Consuming the component
@@ -1384,6 +1493,8 @@ The commit SHA is determined by:
 
 Note: SOURCE_COMMIT must be a 40-character hex string (a full git commit SHA). A dirty working tree is not reflected in the source reference — only the commit SHA matters.
 
+The commit identifies the source but does not carry it: if the repository is rewritten or deleted, the reference is dead, and the signed descriptor does not bind the commit. [Git repositories](#git-repositories) escrows the source tree in the component with a `Git/v1` input and binds its commit with a signed label.
+
 ## Keyless signing (Sigstore)
 
 To sign with Sigstore/Cosign keyless signing (requires OIDC token):
@@ -1440,6 +1551,7 @@ Tests include:
 - Helm charts: `helm chart resource metadata`, `helm chart is oci artifact`, `helm transformer extracts chart`, `helm download verifies chart`, `helm download requires signature`, `helm build from any directory`, `helm chart version independent of component`, `helm chart layer is reproducible`, `helm input rejects invalid chart`, `helm access resolved at build time`, `helm transfer keeps chart local`, `helm values from component`, `helm values requires application ctf`, `helm show reports chart`, `make helm target`, `readme documents helm charts`
 - HTTP resources: `wget resource metadata`, `wget pinned digest matches upstream file`, `wget pinned digest rejects mismatch`, `wget input embeds bytes at build time`, `wget access needs server at consume time`, `wget download rejects changed upstream`, `wget download requires signature`, `wget checksum require rejects unadvertised`, `wget checksum matrix`, `wget rejects invalid checksum mode`, `wget credentials resolved by url identity`, `wget transfer reference vs copy`, `wget transfer copy enforces digest`, `wget requires ocm 0.19`, `wget server port in use`, `wget show reports resources`, `make wget target`, `readme documents http resources`
 - Certificate-chain signing: `pki signature is pem encoded`, `pki verifier pins only root`, `pki scenarios`, `pki rotation keeps verifier config`, `pki certs are reused`, `pki reissues expiring leaf`, `pki signature covers descriptor`, `pki signature survives transfer`, `pki verify requires signature`, `pki own pki requires all vars`, `pki own pki uses supplied files`, `pki show reports chain`, `make pki target`, `readme documents certificate-chain signing`
+- Git repositories: `git resource metadata`, `git ref pinned at build time`, `git upstream is deterministic`, `git snapshot matches commit tree`, `git digest covers tree not commit`, `git signature binds commit label`, `git audit matches snapshot`, `git audit rejects wrong commit label`, `git audit requires signature`, `git scenarios`, `git transfer carries snapshot only`, `git uploader cannot copy git access`, `git own repo requires both vars`, `git own repo uses supplied repository`, `git rejects sha256 repository`, `git requires ocm 0.19`, `git show reports provenance`, `make git target`, `readme documents git repositories`
 - Version selection: `versions lists newest first`, `versions constraint filters`, `versions latest includes prereleases by default`, `versions scheme orders build numbers`, `versions without scheme misorders`, `versions reference requires semver`, `versions requires ocm 0.19`, `versions show reports selection`, `make versions target`, `readme documents version selection`
 
 ## CI

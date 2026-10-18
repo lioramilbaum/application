@@ -1,0 +1,35 @@
+# Three ways to record a Git repository (see README "Git repositories"):
+#   hello-world-source           source, Git/v1 access: URL and commit, no digest
+#   hello-world-source-tracked   resource, Git/v1 access: ref pinned to a commit at build time, digest
+#   hello-world-source-snapshot  resource, Git/v1 input: files stored in the component, commit in a signed label
+name: github.com/lioramilbaum/git-demo
+version: ${VERSION}
+provider:
+  name: github.com/lioramilbaum
+sources:
+  - name: hello-world-source
+    type: git
+    version: ${VERSION}
+    access:
+      type: Git/v1
+      repository: ${GIT_DEMO_REPO}
+      commit: "${GIT_DEMO_COMMIT}"
+resources:
+  - name: hello-world-source-snapshot
+    type: directoryTree
+    version: ${VERSION}
+    labels:
+      - name: git.lioramilbaum.github.com/commit
+        signing: true
+        value: "${GIT_DEMO_COMMIT}"
+    input:
+      type: Git/v1
+      repository: ${GIT_DEMO_REPO}
+      commit: "${GIT_DEMO_COMMIT}"
+  - name: hello-world-source-tracked
+    type: directoryTree
+    version: ${VERSION}
+    access:
+      type: Git/v1
+      repository: ${GIT_DEMO_REPO}
+      ref: ${GIT_DEMO_REF}

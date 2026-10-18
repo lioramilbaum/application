@@ -3,7 +3,7 @@ OCM            ?= ocm
 
 export VERSION OCM
 
-.PHONY: help build sign verify resolvers manifests deploy publish transfer-plan ownership sbom product versions helm wget pki lint test e2e cluster-up cluster-down e2e-run clean
+.PHONY: help build sign verify resolvers manifests deploy publish transfer-plan ownership sbom product versions helm wget pki git lint test e2e cluster-up cluster-down e2e-run clean
 
 help: ## Show this help
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | \
@@ -53,6 +53,9 @@ wget: ## Build, sign, verify and download the HTTP resources demo (Wget/v1 input
 
 pki: ## Create a demo CA, build, sign (PEM certificate chain) and verify the PKI demo against the root CA; offline
 	@bash scripts/pki.sh
+
+git: ## Create a demo Git repository, build, sign, verify and audit the Git source demo (Git/v1 source, access and input); offline (requires OCM CLI >= 0.19.0, git)
+	@bash scripts/git.sh
 
 lint: ## Lint shell scripts (if shellcheck is available)
 	@if command -v shellcheck >/dev/null 2>&1; then \
