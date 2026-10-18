@@ -1,0 +1,13 @@
+# Demo component for certificate-chain (PEM) signing.
+# Uses utf8 input so the build is fully offline.
+name: github.com/lioramilbaum/pki-demo
+version: ${VERSION}
+provider:
+  name: github.com/lioramilbaum
+resources:
+  - name: release-notes
+    type: blob
+    version: ${VERSION}
+    input:
+      type: utf8
+      text: "github.com/lioramilbaum/pki-demo ${VERSION}"
