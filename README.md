@@ -427,6 +427,69 @@ reaches the cluster unpatched, and the controller has no `Localization` CR to fi
 ([how-to](https://ocm.software/docs/how-to/deploy-manifests-with-deployer/),
 [source](https://github.com/open-component-model/open-component-model/tree/main/bindings/go/kubernetes/controller/internal/controller/deployer)).
 
+## Kubernetes component discovery
+
+The [component discovery](https://ocm.software/docs/concepts/kubernetes-component-discovery/)
+controller is implemented in
+[`bindings/go/kubernetes/controller`](https://github.com/open-component-model/open-component-model/tree/main/bindings/go/kubernetes/controller/internal/controller/discovery).
+A `Discovery` references a same-namespace `Component` through `spec.componentRef.name`. Once that
+`Component` is `Ready`, the controller resolves its entire transitive reference graph and filters
+it with `resourceSelector`, `componentSelector` and `referenceSelector`. Each selector takes
+`matchIdentity`, `matchLabels` or `expression` clauses. The matches are then either projected into
+`status.extracted` through `extract.byResources`, or left as raw descriptors in `status.components`.
+
+`Component` polls for new versions (semver constraints plus `interval`). `Discovery` has no interval
+of its own; it re-runs when the resolved version changes. It is the in-cluster equivalent of the
+`jq` resource selection in [`manifests.sh`](#kubernetes-deployer).
+
+Discovery is read-only. It downloads nothing and gives no signature guarantee. Selecting by the
+unsigned `tier` label is fine for queries but not for trust decisions; see
+[Signing and verification](#signing-and-verification).
+
+This component has no `componentReferences`, so its graph is just the root and `referenceSelector`
+has nothing to match here. It matters for consumers that reference `application`; see
+[Resolvers](#resolvers).
+
+```yaml
+# Requires OCM controller >= v0.15.0 and the Component "application"
+# from README "Kubernetes controller" in the same namespace.
+apiVersion: delivery.ocm.software/v1alpha1
+kind: Discovery
+metadata:
+  name: hello-world-images
+spec:
+  componentRef:
+    name: application
+  componentSelector:
+    matchLabels:
+      application.lioramilbaum.github.com/tier: application
+  resourceSelector:
+    matchIdentity:
+      name: hello-world-image
+  extract:
+    byResources:
+      architecture: resource.extraIdentity.architecture
+      image: resource.access.imageReference
+      digest: resource.digest.value
+```
+
+The expected result is two records, one per `architecture: amd64` and `architecture: arm64`. After
+`make publish`, `image` is the ghcr.io copy without `@sha256`. `digest` is `resource.digest.value`;
+it survives transfer unchanged, so pin by it.
+
+A typo in a `byResources` path silently drops that field, and the controller reports no error.
+`make test` guards against this by checking every path against the built descriptor.
+
+`Discovery` requires OCM controller v0.15.0 or later.
+
+Only consume the result when `Ready` is `True` and `status.observedGeneration` equals
+`metadata.generation`:
+
+```
+kubectl get discovery hello-world-images -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}'
+kubectl get discovery hello-world-images -o jsonpath='{.status.extracted}'
+```
+
 ## Plugin system
 
 The [OCM plugin system](https://ocm.software/docs/concepts/plugin-system/) adds repository
@@ -682,6 +745,7 @@ Tests include:
 - Plugin system: `builtin plugins serve component types`, `readme documents plugin system`
 - Signing and verification: `signature covers normalized descriptor`, `readme documents signing and verification`
 - Component identity: `component identity selects artifacts`, `component identity rules enforced`, `readme documents component identity`
+- Kubernetes component discovery: `discovery selects image variants`, `readme documents kubernetes component discovery`
 
 ## CI
 
