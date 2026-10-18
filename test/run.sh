@@ -14,6 +14,7 @@ VERSIONS_OCM="${VERSIONS_OCM:-$OCM}"
 WGET_OCM="${WGET_OCM:-$OCM}"
 # OCM >= 0.19.0 is needed for Git/v1 input and access.
 GIT_OCM="${GIT_OCM:-$OCM}"
+GPG_OCM="${GPG_OCM:-$OCM}"
 
 PASS=0
 FAIL=0
@@ -4468,6 +4469,337 @@ test_readme_documents_git_repositories() {
   done < <(bash "$ROOT/scripts/git.sh" scenarios 2>/dev/null)
 }
 
+_gpg_env() {
+  local tmp="$1"
+  unset GPG_PRIVATE_KEY GPG_PUBLIC_KEY GPG_KEY_FINGERPRINT 2>/dev/null || true
+  export GPG_DEMO_CTF="$tmp/gpg-ctf" GPG_DEMO_OUT="$tmp/gpg" OCM="$GPG_OCM"
+}
+_build_gpg() { _gpg_env "$1"; bash "$ROOT/scripts/gpg.sh" build; }
+_gpg_ref() { echo "ctf::${1}//github.com/lioramilbaum/gpg-demo:${VERSION}"; }
+
+test_gpg_signature_is_openpgp() {
+  local tmp="$1" sig value
+  _gpg_env "$tmp"
+  bash "$ROOT/scripts/gpg.sh" >/dev/null 2>&1 || return 1
+  sig="$("$OCM" get cv "$(_gpg_ref "$tmp/gpg-ctf")" -o json </dev/null | jq -c '.[0].signatures[] | select(.name=="gpg")')"
+  [[ -n "$sig" ]] || { echo "  no 'gpg' signature on the component" >&2; return 1; }
+  assert_eq "$(jq -r '.signature.mediaType' <<<"$sig")" "application/vnd.ocm.signature.gpg" "signature mediaType" || return 1
+  assert_eq "$(jq -r '.signature.algorithm' <<<"$sig")" "GPG" "signature algorithm" || return 1
+  assert_eq "$(jq -r '.digest.normalisationAlgorithm' <<<"$sig")" "jsonNormalisation/v4alpha1" "normalisation" || return 1
+  assert_eq "$(jq -r '.digest.hashAlgorithm' <<<"$sig")" "SHA-256" "digest algorithm" || return 1
+
+  value="$(jq -r '.signature.value' <<<"$sig")"
+  assert_eq "$(head -n1 <<<"$value")" "-----BEGIN PGP SIGNATURE-----" "first armor line"
+}
+
+test_gpg_configs_pin_signer_key() {
+  local tmp="$1" fpr sign_cfg verify_cfg mode
+  _gpg_env "$tmp"
+  bash "$ROOT/scripts/gpg.sh" >/dev/null 2>&1 || return 1
+  fpr="$(cat "$tmp/gpg/keys/signer.fpr")"
+  sign_cfg="$(cat "$tmp/gpg/sign.ocmconfig")"
+  verify_cfg="$(cat "$tmp/gpg/verify.ocmconfig")"
+
+  assert_contains "$sign_cfg" "GPG/v1alpha1" || return 1
+  assert_contains "$sign_cfg" "signature: gpg" || return 1
+  assert_contains "$sign_cfg" "keyFingerprint: $fpr" || return 1
+  assert_not_contains "$verify_cfg" "privateKeyPGPFile" || return 1
+  assert_contains "$verify_cfg" "verifier:" || return 1
+  assert_contains "$verify_cfg" "signature: gpg" || return 1
+
+  mode="$(stat -c %a "$tmp/gpg/keys/signer.sec.asc" 2>/dev/null || stat -f %Lp "$tmp/gpg/keys/signer.sec.asc")"
+  assert_eq "$mode" "600" "secret key file mode"
+}
+
+test_gpg_signs_with_subkey() {
+  local tmp="$1" out primary signed
+  _gpg_env "$tmp"
+  bash "$ROOT/scripts/gpg.sh" >/dev/null 2>&1 || return 1
+  out="$(bash "$ROOT/scripts/gpg.sh" show 2>/dev/null)" || return 1
+  primary="$(awk -F'\t' '$1=="key"{print $2}' <<<"$out")"
+  signed="$(awk -F'\t' '$1=="signed-by"{print $2}' <<<"$out")"
+  [[ -n "$primary" && -n "$signed" ]] || { echo "  show did not report both fingerprints" >&2; return 1; }
+  assert_eq "$primary" "$(cat "$tmp/gpg/keys/signer.fpr")" "primary fingerprint" || return 1
+  [[ "$signed" != "$primary" ]] || { echo "  signature was made by the primary key, not the signing subkey" >&2; return 1; }
+}
+
+test_gpg_keys_are_reused() {
+  local tmp="$1"
+  _gpg_env "$tmp"
+  bash "$ROOT/scripts/gpg.sh" keys >/dev/null 2>&1 || return 1
+  cp -R "$tmp/gpg/keys" "$tmp/keys-before"
+  bash "$ROOT/scripts/gpg.sh" keys >/dev/null 2>&1 || return 1
+  diff -r "$tmp/keys-before" "$tmp/gpg/keys" >/dev/null || { echo "  keys changed across runs" >&2; return 1; }
+}
+
+test_gpg_reissues_expiring_key() {
+  local tmp="$1" seed seeded_fpr exp
+  _gpg_env "$tmp"
+  bash "$ROOT/scripts/gpg.sh" keys >/dev/null 2>&1 || return 1
+
+  # Seed a signing subkey that expires in 12 hours, inside the one-day reissue window.
+  seed="$(mktemp -d /tmp/ocm-gpg.XXXXXX)"
+  chmod 0700 "$seed"
+  exp="$(python3 -I -c 'import time; print(time.strftime("%Y%m%dT%H%M%S", time.localtime(time.time() + 43200)))')"
+  gpg --batch --quiet --pinentry-mode loopback --passphrase '' --homedir "$seed" \
+    --quick-gen-key "OCM Demo Signer <signer@gpg-demo.lioramilbaum.github.com>" rsa3072 cert 2y 2>/dev/null
+  seeded_fpr="$(gpg --batch --quiet --homedir "$seed" --with-colons --list-keys "OCM Demo Signer" 2>/dev/null | awk -F: '/^fpr/{print $10; exit}')"
+  gpg --batch --quiet --pinentry-mode loopback --passphrase '' --homedir "$seed" \
+    --quick-add-key "$seeded_fpr" rsa3072 sign "$exp" 2>/dev/null
+  gpg --batch --quiet --pinentry-mode loopback --passphrase '' --homedir "$seed" \
+    --armor --export-secret-keys "$seeded_fpr" > "$tmp/gpg/keys/signer.sec.asc"
+  gpg --batch --quiet --homedir "$seed" --armor --export "$seeded_fpr" > "$tmp/gpg/keys/signer.pub.asc"
+  echo "$seeded_fpr" > "$tmp/gpg/keys/signer.fpr"
+  gpgconf --homedir "$seed" --kill all 2>/dev/null; rm -rf "$seed"
+
+  bash "$ROOT/scripts/gpg.sh" keys >/dev/null 2>&1 || return 1
+  [[ "$(cat "$tmp/gpg/keys/signer.fpr")" != "$seeded_fpr" ]] || { echo "  expiring key was not reissued" >&2; return 1; }
+}
+
+test_gpg_leaves_user_keyring_untouched() {
+  local tmp="$1"
+  _gpg_env "$tmp"
+  mkdir -p "$tmp/home"
+  HOME="$tmp/home" bash "$ROOT/scripts/gpg.sh" >/dev/null 2>&1 || return 1
+  [[ ! -e "$tmp/home/.gnupg" ]] || { echo "  gpg.sh created $tmp/home/.gnupg" >&2; return 1; }
+}
+
+test_gpg_scenarios() {
+  local tmp="$1" out expected
+  _gpg_env "$tmp"
+  out="$(bash "$ROOT/scripts/gpg.sh" scenarios 2>/dev/null)" || return 1
+  expected="$(printf '%s\n' \
+    $'valid\tok\tok\t-' \
+    $'rotated-key\tok\tok\t-' \
+    $'concatenated-keyring\tok\tfail\tunknown-key' \
+    $'wrong-key\tok\tfail\tunknown-key' \
+    $'verifier-pins-other-key\tok\tfail\tunknown-key' \
+    $'pinned-subkey\tfail\t-\tno-matching-key' \
+    $'expired-key\tfail\t-\tno-signing-key' \
+    $'expired-after-signing\tok\tfail\tkey-expired' \
+    $'revoked-key\tok\tfail\trevoked' \
+    $'protected-key\tok\tok\t-' \
+    $'protected-key-no-passphrase\tfail\t-\tpassphrase-required' \
+    $'sha512-signature\tok\tok\t-' \
+    $'default-verifier\tok\tfail\tmedia-type')"
+  assert_eq "$out" "$expected" "scenario matrix"
+}
+
+test_gpg_crosscheck_with_stock_gpg() {
+  local tmp="$1" out
+  _gpg_env "$tmp"
+  bash "$ROOT/scripts/gpg.sh" >/dev/null 2>&1 || return 1
+  out="$(bash "$ROOT/scripts/gpg.sh" crosscheck 2>&1)" || return 1
+  assert_contains "$out" $'crosscheck\tgood'
+}
+
+test_gpg_crosscheck_does_not_cover_descriptor() {
+  local tmp="$1" out
+  _gpg_env "$tmp"
+  bash "$ROOT/scripts/gpg.sh" >/dev/null 2>&1 || return 1
+  _tamper_descriptor "$tmp/gpg-ctf" "$VERSION" '(.component.provider) = "github.com/someoneelse"' "$tmp/tampered" || return 1
+
+  out="$(GPG_DEMO_CTF="$tmp/tampered" bash "$ROOT/scripts/gpg.sh" crosscheck 2>&1)" || {
+    echo "  crosscheck should pass on a tampered descriptor" >&2
+    return 1
+  }
+  assert_contains "$out" $'crosscheck\tgood' || return 1
+
+  if out="$(GPG_DEMO_CTF="$tmp/tampered" bash "$ROOT/scripts/gpg.sh" verify 2>&1)"; then
+    echo "  verify accepted a tampered descriptor" >&2
+    return 1
+  fi
+  assert_contains "$out" "digest mismatch"
+}
+
+test_gpg_signature_covers_descriptor() {
+  local tmp="$1" out
+  _gpg_env "$tmp"
+  bash "$ROOT/scripts/gpg.sh" >/dev/null 2>&1 || return 1
+  _tamper_descriptor "$tmp/gpg-ctf" "$VERSION" '(.component.resources[] | select(.name=="release-notes") | .name) = "release-renamed"' "$tmp/renamed" || return 1
+  if out="$(GPG_DEMO_CTF="$tmp/renamed" bash "$ROOT/scripts/gpg.sh" verify 2>&1)"; then
+    echo "  verify accepted a renamed resource" >&2
+    return 1
+  fi
+  assert_contains "$out" "digest mismatch"
+}
+
+test_gpg_hash_algorithm_leaves_descriptor_digest() {
+  local tmp="$1" sha256_out sha512_out
+  _gpg_env "$tmp"
+  bash "$ROOT/scripts/gpg.sh" scenarios >/dev/null 2>&1 || return 1
+  sha256_out="$(GPG_DEMO_CTF="$tmp/gpg/scenarios/valid-ctf" bash "$ROOT/scripts/gpg.sh" show 2>/dev/null)" || return 1
+  sha512_out="$(GPG_DEMO_CTF="$tmp/gpg/scenarios/sha512-signature-ctf" bash "$ROOT/scripts/gpg.sh" show 2>/dev/null)" || return 1
+  assert_eq "$(awk -F'\t' '$1=="digest"{print $4}' <<<"$sha512_out")" \
+    "$(awk -F'\t' '$1=="digest"{print $4}' <<<"$sha256_out")" "descriptor digest" || return 1
+  assert_eq "$(awk -F'\t' '$1=="signed-by"{print $3}' <<<"$sha256_out")" "SHA-256" "default hash" || return 1
+  assert_eq "$(awk -F'\t' '$1=="signed-by"{print $3}' <<<"$sha512_out")" "SHA-512" "sha512 hash"
+}
+
+test_gpg_multiple_signatures() {
+  local tmp="$1" out sigs digests
+  _build_gpg "$tmp" >/dev/null 2>&1 || return 1
+  out="$(bash "$ROOT/scripts/gpg.sh" multi 2>/dev/null)" || return 1
+  sigs="$(awk -F'\t' '$1=="signature"' <<<"$out" | wc -l | tr -d ' ')"
+  assert_eq "$sigs" "2" "signature rows" || return 1
+  digests="$(awk -F'\t' '$1=="signature"{print $5}' <<<"$out" | sort -u | wc -l | tr -d ' ')"
+  assert_eq "$digests" "1" "signatures cover one digest" || return 1
+  assert_contains "$out" $'verify\tscoped\tok\t-' || return 1
+  assert_contains "$out" $'verify\tunscoped\tfail\tmedia-type'
+}
+
+test_gpg_signature_survives_transfer() {
+  local tmp="$1"
+  _gpg_env "$tmp"
+  bash "$ROOT/scripts/gpg.sh" >/dev/null 2>&1 || return 1
+  "$OCM" transfer cv --config "$tmp/gpg/verify.ocmconfig" \
+    "$(_gpg_ref "$tmp/gpg-ctf")" "ctf::$tmp/gpg-transferred" </dev/null >/dev/null 2>&1 || return 1
+  GPG_DEMO_CTF="$tmp/gpg-transferred" bash "$ROOT/scripts/gpg.sh" verify >/dev/null 2>&1 || {
+    echo "  transferred copy does not verify" >&2
+    return 1
+  }
+}
+
+test_gpg_verify_requires_signature() {
+  local tmp="$1" out
+  _build_gpg "$tmp" >/dev/null 2>&1 || return 1
+  if bash "$ROOT/scripts/gpg.sh" verify >/dev/null 2>&1; then
+    echo "  verify of an unsigned component should fail" >&2
+    return 1
+  fi
+  if out="$(bash "$ROOT/scripts/gpg.sh" show 2>&1)"; then
+    echo "  show of an unsigned component should fail" >&2
+    return 1
+  fi
+  assert_contains "$out" "no 'gpg' signature"
+}
+
+test_gpg_download_requires_signature() {
+  local tmp="$1"
+  _build_gpg "$tmp" >/dev/null 2>&1 || return 1
+  if bash "$ROOT/scripts/gpg.sh" download >/dev/null 2>&1; then
+    echo "  download of an unsigned component should fail" >&2
+    return 1
+  fi
+  [[ ! -e "$tmp/gpg/download/release-notes" ]] || { echo "  unsigned component was downloaded" >&2; return 1; }
+}
+
+test_gpg_download_checks_digest() {
+  local tmp="$1" content
+  _gpg_env "$tmp"
+  bash "$ROOT/scripts/gpg.sh" >/dev/null 2>&1 || return 1
+  bash "$ROOT/scripts/gpg.sh" download >/dev/null 2>&1 || return 1
+  content="$(cat "$tmp/gpg/download/release-notes")"
+  assert_eq "$content" "github.com/lioramilbaum/gpg-demo $VERSION" "downloaded content"
+}
+
+test_gpg_own_keys_require_both_vars() {
+  local tmp="$1" out
+  _gpg_env "$tmp"
+  if out="$(GPG_PRIVATE_KEY="$tmp/signer.sec.asc" bash "$ROOT/scripts/gpg.sh" build 2>&1)"; then
+    echo "  a private key without a public key should fail" >&2
+    return 1
+  fi
+  assert_contains "$out" "set both GPG_PRIVATE_KEY and GPG_PUBLIC_KEY, or neither" || return 1
+  if out="$(GPG_PUBLIC_KEY="$tmp/signer.pub.asc" bash "$ROOT/scripts/gpg.sh" build 2>&1)"; then
+    echo "  a public key without a private key should fail" >&2
+    return 1
+  fi
+  assert_contains "$out" "set both GPG_PRIVATE_KEY and GPG_PUBLIC_KEY, or neither"
+}
+
+test_gpg_own_keys_use_supplied_files() {
+  local tmp="$1" own
+  own="$tmp/own"
+  GPG_DEMO_OUT="$own" bash "$ROOT/scripts/gpg.sh" keys >/dev/null 2>&1 || return 1
+  _gpg_env "$tmp"
+  GPG_PRIVATE_KEY="$own/keys/signer.sec.asc" GPG_PUBLIC_KEY="$own/keys/signer.pub.asc" \
+    bash "$ROOT/scripts/gpg.sh" >/dev/null 2>&1 || return 1
+
+  [[ ! -e "$tmp/gpg/keys/signer.sec.asc" ]] || { echo "  demo keys generated despite GPG_PRIVATE_KEY" >&2; return 1; }
+  assert_contains "$(cat "$tmp/gpg/sign.ocmconfig")" "privateKeyPGPFile: $own/keys/signer.sec.asc" || return 1
+  assert_contains "$(cat "$tmp/gpg/verify.ocmconfig")" "publicKeyPGPFile: $own/keys/signer.pub.asc"
+}
+
+test_gpg_show_reports_key() {
+  local tmp="$1" out
+  _gpg_env "$tmp"
+  bash "$ROOT/scripts/gpg.sh" >/dev/null 2>&1 || return 1
+  out="$(bash "$ROOT/scripts/gpg.sh" show 2>/dev/null)" || return 1
+  assert_eq "$(wc -l <<<"$out" | tr -d ' ')" "4" "show prints 4 lines" || return 1
+  assert_contains "$out" $'signature\tgpg\tGPG\tapplication/vnd.ocm.signature.gpg' || return 1
+  assert_contains "$out" $'digest\tjsonNormalisation/v4alpha1\tSHA-256\t' || return 1
+  assert_contains "$out" $'key\t' || return 1
+  assert_contains "$out" $'signed-by\t'
+}
+
+test_make_gpg_target() {
+  local dry_run help_out
+  dry_run="$(make -s --dry-run -C "$ROOT" gpg 2>/dev/null)"
+  assert_contains "$dry_run" "scripts/gpg.sh" "dry-run includes gpg.sh" || return 1
+  help_out="$(make -s -C "$ROOT" help 2>/dev/null)"
+  assert_contains "$help_out" "gpg" "make help lists gpg"
+}
+
+test_readme_documents_gpg_signing() {
+  local tmp="$1" readme="$ROOT/README.md" section check name
+  section="$(awk '/^## GPG signing/{f=1;next} /^## /{f=0} f' "$readme")"
+  [[ -n "$section" ]] || { echo "  README missing '## GPG signing' section" >&2; return 1; }
+
+  # The README spells the path literally as prose, so the tilde must not expand here.
+  # shellcheck disable=SC2088
+  local checks=(
+    "https://ocm.software/docs/tutorials/signing/gpg/"
+    "GPG/v1alpha1"
+    "GPGCredentials/v1alpha1"
+    "GPGSigningConfiguration/v1alpha1"
+    "[C]"
+    "[S]"
+    "/tmp"
+    "~/.gnupg"
+    "make gpg"
+    "build/gpg-ctf"
+    "signer.sec.asc"
+    "application/vnd.ocm.signature.gpg"
+    "digest mismatch"
+    "crosscheck"
+    "--signature gpg"
+    "unsupported media type"
+    "GPG_PRIVATE_KEY"
+    "GPG_PUBLIC_KEY"
+    "passphrase"
+    "#3858"
+    "#3691"
+    "(#transfer-and-transport)"
+    "(#signing-and-verification)"
+    "(#credential-system)"
+    "(#certificate-chain-signing)"
+  )
+  for check in "${checks[@]}"; do
+    assert_contains "$section" "$check" "README section contains: $check" || return 1
+  done
+
+  # Drift guard: first yaml block (minus # lines) must match the constructor.
+  local readme_yaml constructor_yaml
+  readme_yaml="$(awk '/^```yaml/{n++; f=(n==1); next} /^```/{f=0} f' <<<"$section" | grep -v '^#')"
+  constructor_yaml="$(grep -v '^#' "$ROOT/components/gpg/component-constructor.yaml")"
+  [[ "$readme_yaml" == "$constructor_yaml" ]] || {
+    echo "  README yaml block differs from components/gpg/component-constructor.yaml" >&2
+    return 1
+  }
+
+  # Drift guard: every scenario row printed by the script is in the README table.
+  _gpg_env "$tmp"
+  while IFS=$'\t' read -r name _ _ reason; do
+    assert_contains "$section" "| \`$name\` |" "scenario $name documented" || return 1
+    [[ "$reason" == "-" ]] || assert_contains "$section" "\`$reason\`" "reason $reason documented" || return 1
+  done < <(bash "$ROOT/scripts/gpg.sh" scenarios 2>/dev/null)
+
+  local sv
+  sv="$(awk '/^## Signing and verification/{f=1;next} /^## /{f=0} f' "$readme")"
+  assert_contains "$sv" "(#gpg-signing)" "Trust models link to GPG signing"
+}
+
 # ── Run all tests ─────────────────────────────────────────────────────────────
 
 run_test "build produces application tree" test_build_produces_application_tree
@@ -4646,6 +4978,27 @@ run_test "git requires ocm 0.19" test_git_requires_ocm_019
 run_test "git show reports provenance" test_git_show_reports_provenance
 run_test "make git target" test_make_git_target
 run_test "readme documents git repositories" test_readme_documents_git_repositories
+run_test "gpg signature is openpgp" test_gpg_signature_is_openpgp
+run_test "gpg configs pin signer key" test_gpg_configs_pin_signer_key
+run_test "gpg signs with subkey" test_gpg_signs_with_subkey
+run_test "gpg keys are reused" test_gpg_keys_are_reused
+run_test "gpg reissues expiring key" test_gpg_reissues_expiring_key
+run_test "gpg leaves user keyring untouched" test_gpg_leaves_user_keyring_untouched
+run_test "gpg scenarios" test_gpg_scenarios
+run_test "gpg crosscheck with stock gpg" test_gpg_crosscheck_with_stock_gpg
+run_test "gpg crosscheck does not cover descriptor" test_gpg_crosscheck_does_not_cover_descriptor
+run_test "gpg signature covers descriptor" test_gpg_signature_covers_descriptor
+run_test "gpg hash algorithm leaves descriptor digest" test_gpg_hash_algorithm_leaves_descriptor_digest
+run_test "gpg multiple signatures" test_gpg_multiple_signatures
+run_test "gpg signature survives transfer" test_gpg_signature_survives_transfer
+run_test "gpg verify requires signature" test_gpg_verify_requires_signature
+run_test "gpg download requires signature" test_gpg_download_requires_signature
+run_test "gpg download checks digest" test_gpg_download_checks_digest
+run_test "gpg own keys require both vars" test_gpg_own_keys_require_both_vars
+run_test "gpg own keys use supplied files" test_gpg_own_keys_use_supplied_files
+run_test "gpg show reports key" test_gpg_show_reports_key
+run_test "make gpg target" test_make_gpg_target
+run_test "readme documents gpg signing" test_readme_documents_gpg_signing
 
 echo ""
 echo "Results: $PASS passed, $FAIL failed"

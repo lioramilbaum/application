@@ -1,0 +1,12 @@
+# Demo component for GPG (OpenPGP) signing.
+name: github.com/lioramilbaum/gpg-demo
+version: ${VERSION}
+provider:
+  name: github.com/lioramilbaum
+resources:
+  - name: release-notes
+    type: blob
+    version: ${VERSION}
+    input:
+      type: utf8
+      text: "github.com/lioramilbaum/gpg-demo ${VERSION}"
