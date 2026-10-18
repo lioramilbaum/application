@@ -3,6 +3,11 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
+export SBOM_RESOURCE="hello-world-sbom"
+# File/v1 inputs are confined to the constructor directory (os.OpenInRoot),
+# so the SBOM must live under $ROOT, not $BUILD_DIR.
+export SBOM_FILE="$ROOT/build/sbom/hello-world.cdx.json"
+
 export OCM="${OCM:-ocm}"
 export VERSION="${VERSION:-0.1.0}"
 export BUILD_DIR="${BUILD_DIR:-$ROOT/build}"

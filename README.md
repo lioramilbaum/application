@@ -11,6 +11,7 @@ github.com/lioramilbaum/application
 ├── hello-world-manifests  (blob, application/yaml, Kubernetes manifests)
 ├── hello-world-localization  (localizationConfig, application/json, image localization rules)
 ├── hello-world-config  (configData, application/json, deploy-time configuration values)
+├── hello-world-sbom  (sbom, application/vnd.cyclonedx+json)
 └── deploy-bundle  (directoryTree, deployment scripts and descriptor)
     ├── component-constructor.yaml  (OCM component descriptor)
     ├── scripts/lib.sh  (shared script functions)
@@ -26,12 +27,13 @@ The names in the tree are artifact identities within `github.com/lioramilbaum/ap
 
 ## How it works
 
-A single OCM component with 6 direct resources and 1 source (no component references):
+A single OCM component with 7 direct resources and 1 source (no component references):
 
 - **hello-world-image**: nginx container image (digest-pinned from Docker Hub)
 - **hello-world-manifests**: Kubernetes Namespace, ConfigMap, Deployment, and Service manifests
 - **hello-world-localization**: signed localization rules (`components/hello-world/localization.json`) mapping each image resource to a container field in the manifests
 - **hello-world-config**: signed deploy-time configuration values (`components/hello-world/config.json`) for the replica count and the served `index.html`
+- **hello-world-sbom**: CycloneDX 1.6 software bill of materials generated from the constructor (see [Software Bills of Materials](#software-bills-of-materials))
 - **deploy-bundle**: directoryTree containing the deployment scripts and OCM component descriptor
 - **application-source**: git source reference with the repository URL and commit SHA
 
@@ -109,6 +111,7 @@ This component's elements and their identities:
 | resource `hello-world-manifests` | `name=hello-world-manifests,version=0.1.0` | `github.com/lioramilbaum/application:0.1.0:resource/hello-world-manifests` |
 | resource `hello-world-localization` | `name=hello-world-localization,version=0.1.0` | `github.com/lioramilbaum/application:0.1.0:resource/hello-world-localization` |
 | resource `hello-world-config` | `name=hello-world-config,version=0.1.0` | `github.com/lioramilbaum/application:0.1.0:resource/hello-world-config` |
+| resource `hello-world-sbom` | `name=hello-world-sbom,version=0.1.0` | `github.com/lioramilbaum/application:0.1.0:resource/hello-world-sbom` |
 | resource `deploy-bundle` | `name=deploy-bundle,version=0.1.0` | `github.com/lioramilbaum/application:0.1.0:resource/deploy-bundle` |
 | source `application-source` | `name=application-source,version=0.1.0` | `github.com/lioramilbaum/application:0.1.0:source/application-source` |
 
@@ -130,7 +133,7 @@ back to a subset match, and requires exactly one candidate:
 |---|---|
 | `name=deploy-bundle` | OK (subset match, one candidate) |
 | `name=deploy-bundle,version=0.1.0` | OK (exact match) |
-| `version=0.1.0` | error: `expected exactly one resource candidate to download, got 6` |
+| `version=0.1.0` | error: `expected exactly one resource candidate to download, got 7` |
 | `name=deploy-bundle,version=9.9.9` | error: `expected exactly one resource candidate to download, got 0` |
 | `name=hello-world-image` | error: `expected exactly one resource candidate to download, got 2` |
 | `name=hello-world-image,architecture=amd64` | OK (subset match, one candidate) |
@@ -244,6 +247,7 @@ Each resource in a component descriptor has an [`access:`](https://ocm.software/
 | `hello-world-manifests` | local | `LocalBlob/v1` | inside the component repository (CTF or OCI layer) |
 | `hello-world-localization` | local | `LocalBlob/v1` | inside the component repository |
 | `deploy-bundle` | local | `LocalBlob/v1` | inside the component repository |
+| `hello-world-sbom` | local | `LocalBlob/v1` | inside the component repository |
 | `application-source` (source) | — | `GitHub/v1` | GitHub — referenced only, never copied |
 
 **`input:` vs `access:`** in `component-constructor.yaml`: an `input:` block is read at build time and stored as a `LocalBlob/v1` in the component repository. An `access:` block points at an artifact already in an external resource repository; OCM records only the reference and its digest. The nginx image digest is already pinned in `component-constructor.yaml`; OCM records it as-is without re-resolving it from Docker Hub.
@@ -631,7 +635,7 @@ The record is idempotent. Re-running construction converges to one record per re
 | Resource | Policy | Record | Reason |
 |---|---|---|---|
 | `hello-world-image` | not set | none | Pushing a referrer to `docker.io/library/nginx` requires write access. Opting in without it fails with `401`. |
-| `hello-world-manifests`, `hello-world-localization`, `hello-world-config`, `deploy-bundle` | not set | none | Raw blobs (non-manifest media types) are silently skipped, even with `Always`. |
+| `hello-world-manifests`, `hello-world-localization`, `hello-world-config`, `hello-world-sbom`, `deploy-bundle` | not set | none | Raw blobs (non-manifest media types) are silently skipped, even with `Always`. |
 | `hello-world-site` (ownership-demo) | `Always` | yes | OCI manifest, stored locally. |
 | `hello-world-site-untracked` (ownership-demo) | `Never` (default) | none | Not opted in. |
 | `hello-world-manifests` (ownership-demo) | `Always` | none | Raw blob, silently skipped. |
@@ -708,6 +712,77 @@ the resource in a component version you have verified. See [Signing and verifica
 A by-value record travels with its subject, so a transfer that copies the resource also copies its
 ownership record. See [Transfer and transport](#transfer-and-transport).
 
+## Software Bills of Materials
+
+A **Software Bill of Materials (SBOM)** is an inventory of software components and their relationships. OCM treats an SBOM as a first-class resource of `type: sbom`. When the SBOM resource carries an `ocm.software/artifact-references` label with `signing: true`, it is:
+
+- **Identified** — bound to the resources it describes by name (and extra identity where needed)
+- **Signed** — any tampering with the label fails `ocm verify`
+- **Travels with the component** — the SBOM is a local blob and moves on every `ocm transfer`
+
+See: [OCM SBOM concept](https://ocm.software/docs/concepts/sboms/) · [Working with SBOMs tutorial](https://ocm.software/docs/tutorials/working-with-sboms/)
+
+> **Note:** `ocm get resource` is an OCM v1 command. OCM v2 uses `ocm get cv -o json | jq` to inspect resources and `ocm download resource [--sbom]` to retrieve them.
+
+### SBOM resource definition
+
+This application ships a CycloneDX 1.6 SBOM covering both nginx image variants and the three delivery files:
+
+```yaml
+- name: hello-world-sbom
+  type: sbom
+  labels:
+    - name: ocm.software/artifact-references
+      signing: true
+      value:
+        - identity: {name: hello-world-image, architecture: amd64}
+        - identity: {name: hello-world-image, architecture: arm64}
+        - identity: {name: hello-world-manifests}
+        - identity: {name: hello-world-localization}
+        - identity: {name: hello-world-config}
+  input:
+    type: file
+    path: ./build/sbom/hello-world.cdx.json
+    mediaType: application/vnd.cyclonedx+json
+```
+
+### Generation
+
+`scripts/sbom.sh` generates a deterministic CycloneDX 1.6 document using only `bash`, `jq`, and `awk`. It parses `component-constructor.yaml` as the single source of truth — image digests and file paths — so the SBOM stays current whenever Renovate bumps a digest or a file changes.
+
+The output is written to `build/sbom/hello-world.cdx.json` (under the repo root, not `$BUILD_DIR`, because `File/v1` inputs are confined to the constructor directory). It contains no `timestamp` or `serialNumber`, so the same inputs always produce the same digest.
+
+```sh
+make build    # SBOM is regenerated automatically
+make sbom     # regenerate only the SBOM
+```
+
+### Accessing the SBOM
+
+```sh
+# Inspect the SBOM resource in the CTF
+ocm get cv ctf::./build/ctf//github.com/lioramilbaum/application:0.1.0 -o json \
+  | jq '.[0].component.resources[] | select(.type=="sbom")'
+
+# Download the SBOM directly
+ocm download resource ctf::./build/ctf//github.com/lioramilbaum/application:0.1.0 \
+  --identity name=hello-world-sbom --output hello-world.cdx.json
+
+# Download the SBOM for a specific resource via --sbom discovery
+ocm download resource ctf::./build/ctf//github.com/lioramilbaum/application:0.1.0 \
+  --identity name=hello-world-manifests --sbom --output sboms/manifests
+ocm download resource ctf::./build/ctf//github.com/lioramilbaum/application:0.1.0 \
+  --identity name=hello-world-image,architecture=amd64 --sbom --output sboms/image-amd64
+```
+
+### Limitations
+
+- The SBOM is **inventory-level**: it lists deliverables (nginx images by digest and purl, config/manifest files by SHA-256). It does not enumerate Alpine packages inside nginx — that requires `syft`, which is not in the devcontainer.
+- `--sbom` discovery is experimental in OCM.
+- The pinned per-platform image references are single-architecture manifests, not image indexes; BuildKit attestation discovery does not apply.
+
+Related: [Signing and verification](#signing-and-verification) · [Transfer and transport](#transfer-and-transport)
+
 ## Prerequisites
 
 - OCM CLI v2 ≥ 0.17.0 (publishing with `OCM_REGISTRY_USERNAME`/`OCM_REGISTRY_PASSWORD` requires ≥ 0.19.1)
@@ -740,6 +815,7 @@ make cluster-down    # delete the kind cluster
 make e2e             # spin up kind cluster, deploy, verify pod ready, tear down (requires docker)
 make publish OCM_REPO=ghcr.io/<you>/ocm  # transfer to an OCI registry, copying external resources (e.g. the nginx image) as OCI artifacts; optional OCM_REGISTRY_USERNAME/OCM_REGISTRY_PASSWORD
 make ownership       # build the ownership demo component and trace the owner of each resource
+make sbom            # regenerate the CycloneDX SBOM (build/sbom/hello-world.cdx.json); also run by make build
 ```
 
 ## Consuming the component
