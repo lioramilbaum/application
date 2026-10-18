@@ -64,6 +64,28 @@ loc_count="$(jq '.localizations | length' "$loc")"
    "$loc_count" -ge 1 ]] || \
   die "unsupported localization config (apiVersion=$loc_api kind=$loc_kind count=$loc_count)"
 
+# Download and verify config data
+cfg="$DEPLOY_DIR/hello-world.config.json"
+rm -f "$cfg"
+"$OCM" download resource \
+  "$(cv_ref "$ROOT_COMPONENT")" \
+  --identity name="$CONFIG_RESOURCE" \
+  --output "$cfg"
+
+cfg_digest="$(res_digest "$CONFIG_RESOURCE")"
+actual_cfg="$(sha256 "$cfg")"
+[[ "$actual_cfg" == "$cfg_digest" ]] || \
+  die "config blob digest mismatch (expected $cfg_digest, got $actual_cfg)"
+
+# Validate config data
+cfg_api="$(jq -r '.apiVersion' "$cfg")"
+cfg_kind="$(jq -r '.kind' "$cfg")"
+cfg_count="$(jq '.configurations | length' "$cfg")"
+[[ "$cfg_api" == "config.application.lioramilbaum.github.com/v1alpha1" && \
+   "$cfg_kind" == "ConfigData" && \
+   "$cfg_count" -ge 1 ]] || \
+  die "unsupported config data (apiVersion=$cfg_api kind=$cfg_kind count=$cfg_count)"
+
 # Build kustomize patches from localization rules
 patches="[]"
 expected_images=()
@@ -114,6 +136,32 @@ while IFS= read -r rule; do
   expected_images+=("$img")
 done < <(jq -c '.localizations[]' "$loc")
 
+# Build kustomize patches from config data
+while IFS= read -r entry; do
+  tgt_kind="$(echo "$entry" | jq -r '.target.kind')"
+  tgt_name="$(echo "$entry" | jq -r '.target.name')"
+  cfg_path="$(echo "$entry" | jq -r '.path')"
+  placeholder="$(echo "$entry" | jq -r '.placeholder')"
+  cfg_value="$(echo "$entry" | jq -c '.value')"
+
+  patch="$(jq -cn \
+    --arg kind "$tgt_kind" \
+    --arg name "$tgt_name" \
+    --arg path_test "$cfg_path" \
+    --arg val_test "$placeholder" \
+    --argjson val_replace "$cfg_value" \
+    --arg path_replace "$cfg_path" \
+    '{
+      target: {kind: $kind, name: $name},
+      patch: ([
+        {op:"test",    path: $path_test,    value: $val_test},
+        {op:"replace", path: $path_replace, value: $val_replace}
+      ] | tojson)
+    }')"
+
+  patches="$(echo "$patches" | jq --argjson p "$patch" '. + [$p]')"
+done < <(jq -c '.configurations[]' "$cfg")
+
 # Write kustomization.yaml
 kust="$DEPLOY_DIR/kustomization.yaml"
 jq -n \
@@ -130,9 +178,10 @@ rm -f "$out"
 "$KUBECTL" kustomize "$DEPLOY_DIR" > "$out.tmp" || { rm -f "$out.tmp"; die "kustomize localization failed"; }
 mv "$out.tmp" "$out"
 
-# Guard: placeholder must not survive rendering
-grep -qF "$IMAGE_PLACEHOLDER" "$out" && \
-  { rm -f "$out"; die "IMAGE_PLACEHOLDER still present in rendered manifest (localization did not apply)"; }
+# Guard: no HELLO_WORLD_* placeholders must survive rendering
+leftover="$(grep -oE "$PLACEHOLDER_PATTERN" "$out" | sort -u | paste -sd, - || true)"
+[[ -z "$leftover" ]] || \
+  { rm -f "$out"; die "unresolved placeholder(s) in rendered manifest: $leftover"; }
 
 # Guard: every expected image must appear in the rendered output
 for img in "${expected_images[@]}"; do
