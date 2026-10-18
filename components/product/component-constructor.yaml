@@ -1,0 +1,11 @@
+# Product component: aggregates github.com/lioramilbaum/application by componentReference.
+# ocm add cv resolves the reference and writes references[0].digest (jsonNormalisation/v4alpha1,
+# SHA-256). The product signature then covers that digest.
+name: github.com/lioramilbaum/product
+version: ${VERSION}
+provider:
+  name: github.com/lioramilbaum
+componentReferences:
+  - name: application
+    componentName: github.com/lioramilbaum/application
+    version: ${VERSION}

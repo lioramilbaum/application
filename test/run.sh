@@ -348,6 +348,23 @@ _transfer_plan() {
   "$OCM" transfer cv "$(cv_ref)" "$target" "$@" --dry-run -o json
 }
 
+# _build_product <tmp>
+# Builds the golden app CTF (copied to $CTF), then builds the product CTF from it.
+# The app is unsigned here; signing is only needed by tests that check signatures.
+# Prints the product CTF path.
+_build_product() {
+  local tmp="$1"
+  _build
+  PRODUCT_CTF="$tmp/product-ctf" bash "$ROOT/scripts/product.sh" build >/dev/null
+  echo "$tmp/product-ctf"
+}
+
+# _product_ref <ctf>
+# Prints the OCM reference for the product component in the given CTF.
+_product_ref() {
+  echo "ctf::${1}//github.com/lioramilbaum/product:${VERSION}"
+}
+
 # ── Tests ────────────────────────────────────────────────────────────────────
 
 test_build_produces_application_tree() {
@@ -2614,6 +2631,173 @@ test_readme_documents_sboms() {
   assert_not_contains "$section" "ocm get resource " || return 1
 }
 
+test_product_references_application() {
+  local tmp="$1" product_ctf cv_json ref_json
+  product_ctf="$(_build_product "$tmp")"
+  cv_json="$("$OCM" get cv "$(_product_ref "$product_ctf")" -o json)"
+
+  # Must have exactly one componentReference
+  assert_eq "$(echo "$cv_json" | jq '.[0].component.componentReferences | length')" \
+    "1" "componentReferences count" || return 1
+
+  ref_json="$(echo "$cv_json" | jq '.[0].component.componentReferences[0]')"
+  assert_eq "$(echo "$ref_json" | jq -r '.name')" "application" "reference name" || return 1
+  assert_eq "$(echo "$ref_json" | jq -r '.componentName')" "$ROOT_COMPONENT" "reference componentName" || return 1
+  assert_eq "$(echo "$ref_json" | jq -r '.version')" "$VERSION" "reference version" || return 1
+
+  # Digest must be set by ocm add cv
+  local digest_norm digest_hash digest_value
+  digest_norm="$(echo "$ref_json" | jq -r '.digest.normalisationAlgorithm')"
+  digest_hash="$(echo "$ref_json" | jq -r '.digest.hashAlgorithm')"
+  digest_value="$(echo "$ref_json" | jq -r '.digest.value')"
+  assert_eq "$digest_norm" "jsonNormalisation/v4alpha1" "digest normalisationAlgorithm" || return 1
+  assert_eq "$digest_hash" "SHA-256" "digest hashAlgorithm" || return 1
+  [[ -n "$digest_value" && "$digest_value" != "null" ]] || \
+    { echo "  reference digest.value is empty" >&2; return 1; }
+
+  # Product CTF holds only the product component
+  local repos
+  repos="$(jq -r '[.artifacts[].repository] | sort | join(",")' "$product_ctf/artifact-index.json")"
+  assert_eq "$repos" "component-descriptors/github.com/lioramilbaum/product" \
+    "product CTF holds only the product" || return 1
+
+  # App CTF is unchanged (still holds only the app component)
+  local app_repos
+  app_repos="$(jq -r '[.artifacts[].repository] | map(select(. == "component-descriptors/github.com/lioramilbaum/application")) | length' "$CTF/artifact-index.json")"
+  [[ "$app_repos" -ge 1 ]] || { echo "  app CTF no longer holds application component" >&2; return 1; }
+}
+
+test_product_signature_covers_reference() {
+  local tmp="$1" product_ctf work out
+  product_ctf="$(_build_product "$tmp")"
+  PRODUCT_CTF="$product_ctf" bash "$ROOT/scripts/product.sh" sign >/dev/null
+
+  # Verify succeeds on clean product
+  PRODUCT_CTF="$product_ctf" bash "$ROOT/scripts/product.sh" verify >/dev/null || \
+    { echo "  verify failed on clean product" >&2; return 1; }
+
+  # Tamper: change reference digest.value → verify must fail
+  local filter1='(.component.componentReferences[0].digest.value) = "0000000000000000000000000000000000000000000000000000000000000000"'
+  work="$tmp/tampered-digest"
+  _tamper_descriptor "$product_ctf" "$VERSION" "$filter1" "$work" || return 1
+  out="$(PRODUCT_CTF="$work" bash "$ROOT/scripts/product.sh" verify 2>&1)" \
+    && { echo "  verify accepted tampered reference digest" >&2; return 1; }
+  assert_contains "$out" "digest mismatch" || return 1
+
+  # Tamper: change reference version → verify must fail
+  local filter2='(.component.componentReferences[0].version) = "9.9.9"'
+  work="$tmp/tampered-version"
+  _tamper_descriptor "$product_ctf" "$VERSION" "$filter2" "$work" || return 1
+  out="$(PRODUCT_CTF="$work" bash "$ROOT/scripts/product.sh" verify 2>&1)" \
+    && { echo "  verify accepted tampered reference version" >&2; return 1; }
+  assert_contains "$out" "digest mismatch" || return 1
+}
+
+test_recursive_transfer_enforces_reference_digest() {
+  local tmp="$1" product_ctf out
+  product_ctf="$(_build_product "$tmp")"
+  bash "$ROOT/scripts/sign.sh" >/dev/null
+  PRODUCT_CTF="$product_ctf" bash "$ROOT/scripts/product.sh" sign >/dev/null
+
+  # Good path: recursive transfer succeeds
+  "$OCM" transfer cv "$(_product_ref "$product_ctf")" "ctf::$tmp/target" \
+    --recursive --config "$BUILD_DIR/resolvers.ocmconfig" >/dev/null || \
+    { echo "  recursive transfer of clean product failed" >&2; return 1; }
+
+  # Target must contain both components
+  local target_repos
+  target_repos="$(jq -r '[.artifacts[].repository] | sort | join(",")' "$tmp/target/artifact-index.json")"
+  assert_contains "$target_repos" "github.com/lioramilbaum/application" "target has application" || return 1
+  assert_contains "$target_repos" "github.com/lioramilbaum/product" "target has product" || return 1
+
+  # Trust limitation: product verify still passes against tampered app
+  local filter='(.component.provider) = "github.com/someoneelse"'
+  _tamper_descriptor "$CTF" "$VERSION" "$filter" "$tmp/app-tampered" || return 1
+  CTF="$tmp/app-tampered" BUILD_DIR="$tmp/resolvers-tampered" \
+    bash "$ROOT/scripts/resolvers.sh" >/dev/null
+  # product verify checks only product's own signature — passes even with tampered app
+  PRODUCT_CTF="$product_ctf" VERIFY_CONFIG="$BUILD_DIR/verify.ocmconfig" \
+    bash "$ROOT/scripts/product.sh" verify >/dev/null || \
+    { echo "  verify correctly rejected tampered app (trust limitation may be fixed — update README)" >&2; return 1; }
+
+  # Recursive transfer fails with digest mismatch when app is tampered
+  out="$(PRODUCT_CTF="$product_ctf" \
+    "$OCM" transfer cv "$(_product_ref "$product_ctf")" "ctf::$tmp/target2" \
+    --recursive --config "$tmp/resolvers-tampered/resolvers.ocmconfig" 2>&1)" \
+    && { echo "  recursive transfer accepted tampered app" >&2; return 1; }
+  assert_contains "$out" "digest mismatch" || return 1
+}
+
+test_product_requires_resolvable_reference() {
+  local tmp="$1" out
+
+  # Missing app CTF → die with helpful message
+  out="$(CTF="$tmp/missing-ctf" PRODUCT_CTF="$tmp/p1" bash "$ROOT/scripts/product.sh" build 2>&1)" \
+    && { echo "  build succeeded with missing CTF" >&2; return 1; }
+  assert_contains "$out" "Application CTF not found" || return 1
+
+  # Wrong VERSION → ocm add cv fails (referenced app:9.9.9 does not exist)
+  _build
+  out="$(VERSION=9.9.9 PRODUCT_CTF="$tmp/p2" bash "$ROOT/scripts/product.sh" build 2>&1)" \
+    && { echo "  build succeeded with unresolvable reference version" >&2; return 1; }
+  # Should report some resolution error
+  [[ -n "$out" ]] || { echo "  no error output for unresolvable reference" >&2; return 1; }
+}
+
+test_make_product_target() {
+  local tmp="$1" dry_run help_out
+
+  # Dry-run must invoke the three scripts
+  dry_run="$(make -s --dry-run -C "$ROOT" product 2>/dev/null)"
+  assert_contains "$dry_run" "scripts/build.sh" "dry-run includes build.sh" || return 1
+  assert_contains "$dry_run" "scripts/sign.sh" "dry-run includes sign.sh" || return 1
+  assert_contains "$dry_run" "scripts/product.sh" "dry-run includes product.sh" || return 1
+
+  # make help must list product
+  help_out="$(make -s -C "$ROOT" help 2>/dev/null)"
+  assert_contains "$help_out" "product" "make help lists product" || return 1
+}
+
+test_readme_documents_component_references() {
+  local readme="$ROOT/README.md"
+  local section
+  section="$(awk '/^## Component References/{f=1;next} /^## /{f=0} f' "$readme")"
+  [[ -n "$section" ]] || \
+    { echo "  README missing '## Component References' section" >&2; return 1; }
+
+  local checks=(
+    "https://ocm.software/docs/how-to/model-products/"
+    "componentReferences"
+    "jsonNormalisation/v4alpha1"
+    "make product"
+    "build/product-ctf"
+    "--recursive"
+    "digest mismatch"
+    "copy-or-fail"
+    "ocm verify cv"
+    "(#resolvers)"
+    "(#canonical-component-repositories)"
+    "(#signing-and-verification)"
+    "(#transfer-and-transport)"
+  )
+  for check in "${checks[@]}"; do
+    assert_contains "$section" "$check" "README section contains: $check" || return 1
+  done
+
+  # Drift guard: README yaml block (minus # lines) == constructor (minus # lines)
+  local readme_yaml constructor_yaml
+  readme_yaml="$(echo "$section" | awk '/^```yaml/{f=1;next} /^```/{f=0} f' | grep -v '^#')"
+  constructor_yaml="$(grep -v '^#' "$ROOT/components/product/component-constructor.yaml")"
+  [[ "$readme_yaml" = "$constructor_yaml" ]] || \
+    { echo "  README yaml block differs from components/product/component-constructor.yaml" >&2; return 1; }
+
+  # Resolvers section must no longer say "no componentReferences" and must link to this section
+  local resolvers_section
+  resolvers_section="$(awk '/^## Resolvers/{f=1;next} /^## /{f=0} f' "$readme")"
+  assert_not_contains "$resolvers_section" "This repository has no \`componentReferences\`" || return 1
+  assert_contains "$resolvers_section" "(#component-references)" || return 1
+}
+
 # ── Run all tests ─────────────────────────────────────────────────────────────
 
 run_test "build produces application tree" test_build_produces_application_tree
@@ -2709,6 +2893,12 @@ run_test "sbom regenerated at build time" test_sbom_regenerated_at_build_time
 run_test "sbom generation is deterministic" test_sbom_generation_is_deterministic
 run_test "sbom link is signed" test_sbom_link_is_signed
 run_test "readme documents sboms" test_readme_documents_sboms
+run_test "product references application" test_product_references_application
+run_test "product signature covers reference" test_product_signature_covers_reference
+run_test "recursive transfer enforces reference digest" test_recursive_transfer_enforces_reference_digest
+run_test "product requires resolvable reference" test_product_requires_resolvable_reference
+run_test "make product target" test_make_product_target
+run_test "readme documents component references" test_readme_documents_component_references
 
 echo ""
 echo "Results: $PASS passed, $FAIL failed"
