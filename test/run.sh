@@ -8,6 +8,9 @@ source "$ROOT/scripts/lib.sh"
 # Set up golden directory for testing
 GOLDEN_DIR="${GOLDEN_DIR:-$ROOT/.test-golden}"
 
+# OCM >= 0.19.0 is needed for --constraint and versioning schemes.
+VERSIONS_OCM="${VERSIONS_OCM:-$OCM}"
+
 PASS=0
 FAIL=0
 
@@ -357,6 +360,15 @@ _build_product() {
   _build
   PRODUCT_CTF="$tmp/product-ctf" bash "$ROOT/scripts/product.sh" build >/dev/null
   echo "$tmp/product-ctf"
+}
+
+# _build_versions <tmp>
+# Builds the release and nightly version CTFs into <tmp>.
+_build_versions() {
+  local tmp="$1"
+  VERSIONS_CTF="$tmp/versions-ctf" \
+  NIGHTLY_CTF="$tmp/nightly-ctf" \
+    OCM="$VERSIONS_OCM" bash "$ROOT/scripts/versions.sh" build >/dev/null
 }
 
 # _product_ref <ctf>
@@ -2798,6 +2810,268 @@ test_readme_documents_component_references() {
   assert_contains "$resolvers_section" "(#component-references)" || return 1
 }
 
+test_versions_lists_newest_first() {
+  local tmp="$1"
+  _build_versions "$tmp"
+  local list
+  list="$(VERSIONS_CTF="$tmp/versions-ctf" OCM="$VERSIONS_OCM" \
+    bash "$ROOT/scripts/versions.sh" list | tr '\n' ' ' | sed 's/ $//')"
+  assert_eq "$list" "1.1.0-rc.1 1.0.0 0.10.0 0.2.0 0.1.0" "release list order" || return 1
+
+  # Each component version's release-notes resource must carry the matching version.
+  local cv_json
+  cv_json="$("$VERSIONS_OCM" get cv \
+    "ctf::$tmp/versions-ctf//github.com/lioramilbaum/versions-demo" \
+    --config "$tmp/versions-default.ocmconfig" -o json)" || return 1
+  for v in 0.1.0 0.2.0 0.10.0 1.0.0 1.1.0-rc.1; do
+    local rn_ver
+    rn_ver="$(echo "$cv_json" \
+      | jq -r --arg v "$v" \
+        '.[] | select(.component.version==$v) | .component.resources[] | select(.name=="release-notes") | .version')"
+    assert_eq "$rn_ver" "$v" "release-notes version for $v" || return 1
+  done
+
+  # Download the 0.2.0 release-notes and check its content.
+  local dl_file="$tmp/release-notes-0.2.0.txt"
+  "$VERSIONS_OCM" download resource \
+    "ctf::$tmp/versions-ctf//github.com/lioramilbaum/versions-demo:0.2.0" \
+    --identity "name=release-notes" \
+    --config "$tmp/versions-default.ocmconfig" \
+    --output "$dl_file" >/dev/null 2>&1 || return 1
+  assert_eq "$(cat "$dl_file")" "github.com/lioramilbaum/versions-demo 0.2.0" \
+    "release-notes content for 0.2.0" || return 1
+}
+
+test_versions_constraint_filters() {
+  local tmp="$1"
+  _build_versions "$tmp"
+  local versions_env=(VERSIONS_CTF="$tmp/versions-ctf" OCM="$VERSIONS_OCM")
+
+  local r
+  r="$(env "${versions_env[@]}" bash "$ROOT/scripts/versions.sh" list '^0.1')"
+  assert_eq "$r" "0.1.0" "^0.1 gives 0.1.0" || return 1
+
+  r="$(env "${versions_env[@]}" bash "$ROOT/scripts/versions.sh" list '>= 0.2.0, < 1.0.0' | tr '\n' ' ' | sed 's/ $//')"
+  assert_eq "$r" "0.10.0 0.2.0" ">= 0.2.0, < 1.0.0 gives 0.10.0 0.2.0" || return 1
+
+  r="$(env "${versions_env[@]}" bash "$ROOT/scripts/versions.sh" list '1.x')"
+  assert_eq "$r" "1.0.0" "1.x gives 1.0.0 (rc excluded)" || return 1
+
+  r="$(env "${versions_env[@]}" bash "$ROOT/scripts/versions.sh" list '>= 1.1.0-0')"
+  assert_eq "$r" "1.1.0-rc.1" ">= 1.1.0-0 gives 1.1.0-rc.1" || return 1
+
+  # No match → die with helpful message.
+  local err
+  err="$(env "${versions_env[@]}" bash "$ROOT/scripts/versions.sh" list '>= 9.0.0' 2>&1)" \
+    && { echo "  >= 9.0.0 should have failed" >&2; return 1; }
+  assert_contains "$err" "no version of github.com/lioramilbaum/versions-demo" \
+    ">= 9.0.0 error message" || return 1
+
+  # Malformed constraint → ocm reports improper constraint.
+  err="$(env "${versions_env[@]}" bash "$ROOT/scripts/versions.sh" list 'not-a-constraint' 2>&1)" \
+    && { echo "  not-a-constraint should have failed" >&2; return 1; }
+  assert_contains "$err" "constraint" "malformed constraint error" || return 1
+}
+
+test_versions_latest_includes_prereleases_by_default() {
+  local tmp="$1"
+  _build_versions "$tmp"
+  local versions_env=(VERSIONS_CTF="$tmp/versions-ctf" OCM="$VERSIONS_OCM")
+
+  local r
+  r="$(env "${versions_env[@]}" bash "$ROOT/scripts/versions.sh" latest)"
+  assert_eq "$r" "1.1.0-rc.1" "latest (default) returns pre-release" || return 1
+
+  r="$(env "${versions_env[@]}" bash "$ROOT/scripts/versions.sh" latest '>= 0.0.0')"
+  assert_eq "$r" "1.0.0" "latest >= 0.0.0 returns stable" || return 1
+
+  r="$(env "${versions_env[@]}" bash "$ROOT/scripts/versions.sh" latest '^0')"
+  assert_eq "$r" "0.10.0" "latest ^0 returns 0.10.0" || return 1
+}
+
+test_versions_scheme_orders_build_numbers() {
+  local tmp="$1"
+  _build_versions "$tmp"
+
+  local nightly_out
+  nightly_out="$(env VERSIONS_CTF="$tmp/versions-ctf" NIGHTLY_CTF="$tmp/nightly-ctf" OCM="$VERSIONS_OCM" \
+    bash "$ROOT/scripts/versions.sh" nightly)"
+  assert_contains "$nightly_out" $'nightly\tall\tr100 r10 r9 r2' \
+    "nightly all order" || return 1
+  assert_contains "$nightly_out" $'nightly\tlatest\tr100' \
+    "nightly latest" || return 1
+
+  # Adding r9 without the scheme config must fail.
+  local err
+  printf '%s\n' 'type: generic.config.ocm.software/v1' 'configurations: []' > "$tmp/empty.ocmconfig"
+  err="$(VERSION=r9 "$VERSIONS_OCM" add cv \
+    --repository "ctf::$tmp/nightly-reject" \
+    --constructor "$ROOT/components/versions/component-constructor.yaml" \
+    --config "$tmp/empty.ocmconfig" 2>&1)" \
+    && { echo "  r9 without scheme should have failed" >&2; return 1; }
+  assert_contains "$err" "invalid version" "r9 without scheme error" || return 1
+
+  # Adding 1.0.0 to the nightly CTF (which uses the build-number scheme) must also fail.
+  err="$(VERSION=1.0.0 "$VERSIONS_OCM" add cv \
+    --repository "ctf::$tmp/nightly-reject2" \
+    --constructor "$ROOT/components/versions/component-constructor.yaml" \
+    --config "$ROOT/components/versions/versioning.ocmconfig" 2>&1)" \
+    && { echo "  1.0.0 with build-number scheme should have failed" >&2; return 1; }
+  assert_contains "$err" "invalid version" "1.0.0 with build-number scheme error" || return 1
+}
+
+test_versions_without_scheme_misorders() {
+  local tmp="$1"
+  _build_versions "$tmp"
+
+  local nightly_out
+  nightly_out="$(env VERSIONS_CTF="$tmp/versions-ctf" NIGHTLY_CTF="$tmp/nightly-ctf" OCM="$VERSIONS_OCM" \
+    bash "$ROOT/scripts/versions.sh" nightly)"
+  # Without the scheme, OCM uses reverse-lexical order and returns r9 as latest.
+  assert_contains "$nightly_out" $'nightly\tall (no scheme)\tr9 r2 r100 r10' \
+    "no-scheme order is reverse lexical" || return 1
+  assert_contains "$nightly_out" $'nightly\tlatest (no scheme)\tr9' \
+    "no-scheme latest is r9" || return 1
+}
+
+test_versions_reference_requires_semver() {
+  local tmp="$1"
+  _build_versions "$tmp"
+
+  # ocm download resource with a non-semver version string fails.
+  local err
+  err="$("$VERSIONS_OCM" download resource \
+    "ctf::$tmp/nightly-ctf//github.com/lioramilbaum/versions-demo:r100" \
+    --identity "name=release-notes" \
+    --config "$ROOT/components/versions/versioning.ocmconfig" \
+    --output "$tmp/rn-r100.txt" 2>&1)" \
+    && { echo "  download resource :r100 should fail (limitation may be fixed — update README)" >&2; return 1; }
+  assert_contains "$err" "invalid semantic version" \
+    "download resource :r100 fails with invalid semantic version" || return 1
+
+  # ocm transfer cv with a non-semver version does work.
+  "$VERSIONS_OCM" transfer cv \
+    "ctf::$tmp/nightly-ctf//github.com/lioramilbaum/versions-demo:r100" \
+    "ctf::$tmp/transfer-target" \
+    --config "$ROOT/components/versions/versioning.ocmconfig" >/dev/null 2>&1 || \
+    { echo "  transfer cv :r100 should succeed" >&2; return 1; }
+  assert_contains \
+    "$(jq -r '[.artifacts[].tag] | join(" ")' "$tmp/transfer-target/artifact-index.json")" \
+    "r100" "transfer target artifact-index has r100 tag" || return 1
+}
+
+test_versions_requires_ocm_019() {
+  local tmp="$1"
+
+  # Stub that mimics an older OCM binary with --semver-constraint instead of --constraint.
+  local stub_bin="$tmp/stub-bin"
+  mkdir -p "$stub_bin"
+  cat > "$stub_bin/ocm" <<'STUB'
+#!/usr/bin/env bash
+if [[ "${1:-}" == "get" && "${2:-}" == "cv" && "${3:-}" == "--help" ]]; then
+  echo "      --semver-constraint string   filter by semver constraint"
+  exit 0
+fi
+exit 0
+STUB
+  chmod +x "$stub_bin/ocm"
+
+  local err
+  err="$(OCM="$stub_bin/ocm" VERSIONS_CTF="$tmp/vc" NIGHTLY_CTF="$tmp/nc" \
+    bash "$ROOT/scripts/versions.sh" list 2>&1)" \
+    && { echo "  old-stub ocm should trigger the version gate" >&2; return 1; }
+  assert_contains "$err" "requires OCM CLI >= 0.19.0" "version gate message" || return 1
+}
+
+test_versions_show_reports_selection() {
+  local tmp="$1"
+  _build_versions "$tmp"
+
+  local out
+  out="$(env VERSIONS_CTF="$tmp/versions-ctf" NIGHTLY_CTF="$tmp/nightly-ctf" OCM="$VERSIONS_OCM" \
+    bash "$ROOT/scripts/versions.sh" show)"
+  local line_count
+  line_count="$(echo "$out" | wc -l | tr -d ' ')"
+  assert_eq "$line_count" "10" "show output has 10 lines" || return 1
+  assert_contains "$out" $'release\tlatest >= 0.0.0\t1.0.0' \
+    "show: latest >= 0.0.0 line" || return 1
+  assert_contains "$out" $'release\t1.x\t1.0.0' \
+    "show: 1.x line" || return 1
+}
+
+test_make_versions_target() {
+  local tmp="$1"
+
+  local dry_run
+  dry_run="$(make -s --dry-run -C "$ROOT" versions 2>/dev/null)"
+  assert_contains "$dry_run" "scripts/versions.sh" "dry-run includes versions.sh" || return 1
+
+  local help_out
+  help_out="$(make -s -C "$ROOT" help 2>/dev/null)"
+  assert_contains "$help_out" "versions" "make help lists versions" || return 1
+}
+
+test_readme_documents_version_selection() {
+  local readme="$ROOT/README.md"
+  local section
+  section="$(awk '/^## Version selection/{f=1;next} /^## /{f=0} f' "$readme")"
+  [[ -n "$section" ]] || \
+    { echo "  README missing '## Version selection' section" >&2; return 1; }
+
+  local checks=(
+    "https://ocm.software/docs/tutorials/configure-versioning/"
+    "versioning.config.ocm.software/v1alpha1"
+    "--constraint"
+    "--semver-constraint"
+    "--latest"
+    "> 0.0.0-0"
+    "1.1.0-rc.1"
+    "make versions"
+    "build/versions-ctf"
+    "build/versions-nightly-ctf"
+    "loose-semver"
+    "invalid semantic version"
+    "semverFilter"
+    "versionConstraint"
+    "(#resolvers)"
+    "(#kubernetes-controller)"
+    "(#component-references)"
+    "(#component-identity)"
+  )
+  for check in "${checks[@]}"; do
+    assert_contains "$section" "$check" "README section contains: $check" || return 1
+  done
+
+  # Drift guard: README yaml blocks (minus # lines) must match the two config files.
+  # Block 1: constructor yaml
+  local readme_yaml1 constructor_yaml
+  readme_yaml1="$(awk '/^```yaml/{n++; f=(n==1); next} /^```/{f=0} f' <<<"$section" \
+    | grep -v '^#')"
+  constructor_yaml="$(grep -v '^#' "$ROOT/components/versions/component-constructor.yaml")"
+  [[ "$readme_yaml1" = "$constructor_yaml" ]] || \
+    { echo "  README yaml block 1 differs from components/versions/component-constructor.yaml" >&2
+      echo "  README: $readme_yaml1" >&2
+      echo "  File:   $constructor_yaml" >&2
+      return 1; }
+
+  # Block 2: versioning config yaml
+  local readme_yaml2 versioning_yaml
+  readme_yaml2="$(awk '/^```yaml/{n++; f=(n==2); next} /^```/{f=0} f' <<<"$section" \
+    | grep -v '^#')"
+  versioning_yaml="$(grep -v '^#' "$ROOT/components/versions/versioning.ocmconfig")"
+  [[ "$readme_yaml2" = "$versioning_yaml" ]] || \
+    { echo "  README yaml block 2 differs from components/versions/versioning.ocmconfig" >&2
+      echo "  README: $readme_yaml2" >&2
+      echo "  File:   $versioning_yaml" >&2
+      return 1; }
+
+  # Component identity section must link to version-selection.
+  local id_section
+  id_section="$(awk '/^## Component identity/{f=1;next} /^## /{f=0} f' "$readme")"
+  assert_contains "$id_section" "(#version-selection)" \
+    "Component identity section links to version-selection" || return 1
+}
+
 # ── Run all tests ─────────────────────────────────────────────────────────────
 
 run_test "build produces application tree" test_build_produces_application_tree
@@ -2899,6 +3173,16 @@ run_test "recursive transfer enforces reference digest" test_recursive_transfer_
 run_test "product requires resolvable reference" test_product_requires_resolvable_reference
 run_test "make product target" test_make_product_target
 run_test "readme documents component references" test_readme_documents_component_references
+run_test "versions lists newest first" test_versions_lists_newest_first
+run_test "versions constraint filters" test_versions_constraint_filters
+run_test "versions latest includes prereleases by default" test_versions_latest_includes_prereleases_by_default
+run_test "versions scheme orders build numbers" test_versions_scheme_orders_build_numbers
+run_test "versions without scheme misorders" test_versions_without_scheme_misorders
+run_test "versions reference requires semver" test_versions_reference_requires_semver
+run_test "versions requires ocm 0.19" test_versions_requires_ocm_019
+run_test "versions show reports selection" test_versions_show_reports_selection
+run_test "make versions target" test_make_versions_target
+run_test "readme documents version selection" test_readme_documents_version_selection
 
 echo ""
 echo "Results: $PASS passed, $FAIL failed"
