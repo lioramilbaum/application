@@ -361,7 +361,7 @@ test_build_produces_application_tree() {
   local resource_names
   resource_names=$("$OCM" get cv "$(cv_ref "$ROOT_COMPONENT")" \
     -o json 2>/dev/null | jq -r '.[0].component.resources[].name' | sort | paste -sd, -)
-  assert_eq "$resource_names" "deploy-bundle,hello-world-config,hello-world-image,hello-world-image,hello-world-localization,hello-world-manifests" "resource names"
+  assert_eq "$resource_names" "deploy-bundle,hello-world-config,hello-world-image,hello-world-image,hello-world-localization,hello-world-manifests,hello-world-sbom" "resource names"
 
   local image_archs
   image_archs=$("$OCM" get cv "$(cv_ref "$ROOT_COMPONENT")" \
@@ -902,7 +902,7 @@ test_deploy_bundle_metadata() {
   assert_eq "$tar_contents" "component-constructor.yaml,scripts/deploy.sh,scripts/lib.sh,scripts/manifests.sh,scripts/verify.sh" "deploy-bundle contents"
 
   # Verify build-time scripts are NOT in the tar
-  for script in build sign publish keys sigstore e2e cluster; do
+  for script in build sign publish keys sigstore e2e cluster sbom; do
     assert_not_contains "$tar_contents" "scripts/$script.sh" "scripts/$script.sh must not be in deploy-bundle"
   done
 }
@@ -1529,7 +1529,7 @@ test_resource_access_types() {
     [[ "$img" == docker.io/* ]] || { echo "  $a image not referenced on docker.io: $img" >&2; return 1; }
   done
 
-  for name in hello-world-manifests hello-world-localization deploy-bundle; do
+  for name in hello-world-manifests hello-world-localization hello-world-sbom deploy-bundle; do
     relation=$(echo "$cv_json" | jq -r --arg n "$name" '.[0].component.resources[] | select(.name==$n) | .relation')
     assert_eq "$relation" "local" "$name relation" || return 1
     access=$(echo "$cv_json" | jq -r --arg n "$name" '.[0].component.resources[] | select(.name==$n) | .access.type')
@@ -2071,7 +2071,7 @@ test_component_identity_selects_artifacts() {
   out="$("$OCM" download resource "$(cv_ref)" --identity "version=$VERSION" \
     --output "$tmp/bad.yaml" 2>&1)" \
     && { echo "  version-only identity should fail" >&2; return 1; }
-  assert_contains "$out" "got 6" || return 1
+  assert_contains "$out" "got 7" || return 1
 
   out="$("$OCM" download resource "$(cv_ref)" \
     --identity "name=hello-world-manifests,version=9.9.9" \
@@ -2432,6 +2432,188 @@ test_readme_documents_ownership() {
   [[ "$readme_yaml" = "$disk_yaml" ]] || { echo "  README YAML block differs from components/ownership/component-constructor.yaml" >&2; return 1; }
 }
 
+test_sbom_resource_metadata() {
+  local tmp="$1"
+  _build
+
+  local cv_json sbom_json
+  cv_json="$("$OCM" get cv "$(cv_ref "$ROOT_COMPONENT")" -o json)"
+  sbom_json="$(echo "$cv_json" | jq '.[0].component.resources[] | select(.name=="hello-world-sbom")')"
+
+  assert_eq "$(echo "$sbom_json" | jq -r '.type')" "sbom" "SBOM resource type" || return 1
+  assert_eq "$(echo "$sbom_json" | jq -r '.relation')" "local" "SBOM resource relation" || return 1
+  local access_type
+  access_type="$(echo "$sbom_json" | jq -r '.access.type')"
+  [[ "$access_type" =~ [Ll]ocal[Bb]lob ]] || \
+    { echo "  expected LocalBlob access type, got: $access_type" >&2; return 1; }
+  assert_eq "$(echo "$sbom_json" | jq -r '.access.mediaType')" \
+    "application/vnd.cyclonedx+json" "SBOM media type" || return 1
+  assert_eq "$(echo "$sbom_json" | jq -r '.version')" "$VERSION" "SBOM version" || return 1
+
+  local label_signing
+  label_signing="$(echo "$sbom_json" | jq -r \
+    '.labels[] | select(.name=="ocm.software/artifact-references") | .signing')"
+  assert_eq "$label_signing" "true" "artifact-references signing" || return 1
+
+  "$OCM" download resource "$(cv_ref "$ROOT_COMPONENT")" \
+    --identity "name=hello-world-sbom" --output "$tmp/sbom.cdx.json" >/dev/null
+  local sbom_file="$tmp/sbom.cdx.json"
+  [[ -f "$sbom_file" ]] || \
+    { echo "  SBOM download did not write $sbom_file" >&2; return 1; }
+
+  assert_eq "$(jq -r '.bomFormat' "$sbom_file")" "CycloneDX" "bomFormat" || return 1
+  assert_eq "$(jq -r '.specVersion' "$sbom_file")" "1.6" "specVersion" || return 1
+  assert_eq "$(jq -r '.metadata.component.name' "$sbom_file")" \
+    "$ROOT_COMPONENT" "SBOM component name" || return 1
+  assert_eq "$(jq -r '.metadata.component.version' "$sbom_file")" \
+    "$VERSION" "SBOM component version" || return 1
+  assert_eq "$(jq -r '.timestamp // "absent"' "$sbom_file")" "absent" "no timestamp" || return 1
+  assert_eq "$(jq -r '.serialNumber // "absent"' "$sbom_file")" "absent" "no serialNumber" || return 1
+}
+
+test_sbom_describes_component_resources() {
+  local tmp="$1"
+  _build
+
+  local cv_json
+  cv_json="$("$OCM" get cv "$(cv_ref "$ROOT_COMPONENT")" -o json)"
+
+  "$OCM" download resource "$(cv_ref "$ROOT_COMPONENT")" \
+    --identity "name=hello-world-sbom" --output "$tmp/sbom.cdx.json" >/dev/null
+  local sbom_file="$tmp/sbom.cdx.json"
+
+  for arch in amd64 arm64; do
+    local img_ref img_digest sbom_hash purl
+    img_ref="$(echo "$cv_json" | jq -r --arg arch "$arch" \
+      '.[0].component.resources[] | select(.name=="hello-world-image" and .extraIdentity.architecture==$arch) | .access.imageReference')"
+    img_digest="${img_ref##*@sha256:}"
+    sbom_hash="$(jq -r --arg ref "hello-world-image/$arch" \
+      '.components[] | select(.["bom-ref"]==$ref) | .hashes[0].content' "$sbom_file")"
+    assert_eq "$sbom_hash" "$img_digest" "SBOM hash matches image $arch digest" || return 1
+
+    purl="$(jq -r --arg ref "hello-world-image/$arch" \
+      '.components[] | select(.["bom-ref"]==$ref) | .purl' "$sbom_file")"
+    [[ "$purl" == *"arch=$arch"* ]] || \
+      { echo "  purl missing arch=$arch: $purl" >&2; return 1; }
+  done
+
+  while IFS=$'\t' read -r res_name rel_path; do
+    local file_hash sbom_hash
+    file_hash="$(sha256 "$ROOT/$rel_path")"
+    sbom_hash="$(jq -r --arg ref "$res_name" \
+      '.components[] | select(.["bom-ref"]==$ref) | .hashes[0].content' "$sbom_file")"
+    assert_eq "$sbom_hash" "$file_hash" "SBOM hash matches $res_name source file" || return 1
+  done <<'TABLE'
+hello-world-manifests	components/hello-world/manifests.yaml
+hello-world-localization	components/hello-world/localization.json
+hello-world-config	components/hello-world/config.json
+TABLE
+
+  local dep_count comp_count
+  dep_count="$(jq '.dependencies[0].dependsOn | length' "$sbom_file")"
+  comp_count="$(jq '.components | length' "$sbom_file")"
+  assert_eq "$dep_count" "$comp_count" "dependencies covers all components" || return 1
+}
+
+test_sbom_discovered_via_artifact_references() {
+  local tmp="$1"
+  _build
+
+  "$OCM" download resource "$(cv_ref "$ROOT_COMPONENT")" \
+    --identity "name=hello-world-sbom" --output "$tmp/direct.cdx.json" >/dev/null
+  [[ -f "$tmp/direct.cdx.json" ]] || \
+    { echo "  direct SBOM download did not write file" >&2; return 1; }
+
+  "$OCM" download resource "$(cv_ref "$ROOT_COMPONENT")" \
+    --identity "name=hello-world-manifests" --sbom --output "$tmp/s1" >/dev/null
+  local s1_files=("$tmp/s1/"*.cdx.json)
+  [[ ${#s1_files[@]} -eq 1 && -f "${s1_files[0]}" ]] || \
+    { echo "  --sbom via manifests did not write exactly one .cdx.json" >&2; return 1; }
+
+  "$OCM" download resource "$(cv_ref "$ROOT_COMPONENT")" \
+    --identity "name=hello-world-image,architecture=arm64" --sbom --output "$tmp/s2" >/dev/null
+  local s2_files=("$tmp/s2/"*.cdx.json)
+  [[ ${#s2_files[@]} -eq 1 && -f "${s2_files[0]}" ]] || \
+    { echo "  --sbom via arm64 image did not write exactly one .cdx.json" >&2; return 1; }
+
+  cmp "$tmp/direct.cdx.json" "${s1_files[0]}" || \
+    { echo "  --sbom output differs from direct download" >&2; return 1; }
+}
+
+test_sbom_regenerated_at_build_time() {
+  local tmp="$1"
+  export VERSION=9.9.9
+  # SBOM_FILE is a shared on-disk path; must not run concurrently with test_sbom_generation_is_deterministic
+  bash "$ROOT/scripts/build.sh" >/dev/null
+
+  "$OCM" download resource "ctf::${tmp}/ctf//${ROOT_COMPONENT}:9.9.9" \
+    --identity "name=hello-world-sbom" --output "$tmp/v999.cdx.json" >/dev/null
+  local sbom_version
+  sbom_version="$(jq -r '.metadata.component.version' "$tmp/v999.cdx.json")"
+  assert_eq "$sbom_version" "9.9.9" "SBOM version propagates" || return 1
+}
+
+test_sbom_generation_is_deterministic() {
+  local tmp="$1"
+  _build
+
+  # SBOM_FILE is a shared on-disk path; must not run concurrently with test_sbom_regenerated_at_build_time
+  bash "$ROOT/scripts/sbom.sh" >/dev/null
+  local h1
+  h1="$(sha256 "$SBOM_FILE")"
+  bash "$ROOT/scripts/sbom.sh" >/dev/null
+  local h2
+  h2="$(sha256 "$SBOM_FILE")"
+  assert_eq "$h1" "$h2" "SBOM generation is deterministic" || return 1
+}
+
+test_sbom_link_is_signed() {
+  local tmp="$1" out work
+  _build
+  bash "$ROOT/scripts/sign.sh" >/dev/null
+
+  local filter='(.component.resources[] | select(.name=="hello-world-sbom") | .labels[] | select(.name=="ocm.software/artifact-references") | .value) = [{"identity":{"name":"deploy-bundle"}}]'
+  work="$tmp/tampered"
+  _tamper_descriptor "$CTF" "$VERSION" "$filter" "$work" || return 1
+
+  out="$(CTF="$work" bash "$ROOT/scripts/verify.sh" </dev/null 2>&1)" \
+    && { echo "  verify accepted tampered artifact-references label" >&2; return 1; }
+  assert_contains "$out" "digest mismatch" || return 1
+}
+
+test_readme_documents_sboms() {
+  local section
+  section="$(awk '/^## Software Bills of Materials/{f=1;next} /^## /{f=0} f' "$ROOT/README.md")"
+  [[ -n "$section" ]] || \
+    { echo "  README missing '## Software Bills of Materials' section" >&2; return 1; }
+
+  local checks=(
+    "https://ocm.software/docs/concepts/sboms/"
+    "https://ocm.software/docs/tutorials/working-with-sboms/"
+    "CycloneDX"
+    "application/vnd.cyclonedx+json"
+    "type: sbom"
+    "ocm.software/artifact-references"
+    "signing: true"
+    "scripts/sbom.sh"
+    "make build"
+    "make sbom"
+    "build/sbom/hello-world.cdx.json"
+    "ocm get cv"
+    "ocm download resource"
+    "--sbom"
+    "name=hello-world-sbom"
+    "(#signing-and-verification)"
+    "(#transfer-and-transport)"
+  )
+
+  for check in "${checks[@]}"; do
+    assert_contains "$section" "$check" "README SBOM section contains: $check" || return 1
+  done
+
+  assert_not_contains "$section" "ocm get resource " || return 1
+}
+
 # ── Run all tests ─────────────────────────────────────────────────────────────
 
 run_test "build produces application tree" test_build_produces_application_tree
@@ -2520,6 +2702,13 @@ run_test "ownership record is deterministic" test_ownership_record_is_determinis
 run_test "ownership survives transfer" test_ownership_survives_transfer
 run_test "ownership trace reports owner" test_ownership_trace_reports_owner
 run_test "readme documents ownership" test_readme_documents_ownership
+run_test "sbom resource metadata" test_sbom_resource_metadata
+run_test "sbom describes component resources" test_sbom_describes_component_resources
+run_test "sbom discovered via artifact references" test_sbom_discovered_via_artifact_references
+run_test "sbom regenerated at build time" test_sbom_regenerated_at_build_time
+run_test "sbom generation is deterministic" test_sbom_generation_is_deterministic
+run_test "sbom link is signed" test_sbom_link_is_signed
+run_test "readme documents sboms" test_readme_documents_sboms
 
 echo ""
 echo "Results: $PASS passed, $FAIL failed"

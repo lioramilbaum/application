@@ -3,7 +3,7 @@ set -euo pipefail
 # shellcheck source=scripts/lib.sh
 source "$(dirname "$0")/lib.sh"
 
-require "$OCM" git
+require "$OCM" git jq
 
 SOURCE_COMMIT="${SOURCE_COMMIT:-$(git -C "$ROOT" rev-parse HEAD 2>/dev/null || true)}"
 [[ "$SOURCE_COMMIT" =~ ^[0-9a-f]{40}$ ]] || \
@@ -12,6 +12,7 @@ export SOURCE_COMMIT
 
 mkdir -p "$BUILD_DIR"
 rm -rf "$CTF"
+bash "$ROOT/scripts/sbom.sh" >/dev/null
 
 # OCM_ADD_FLAGS is a user-supplied, space-separated list of extra flags;
 # word splitting is intentional and an unset value must add no argument.

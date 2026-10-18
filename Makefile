@@ -3,7 +3,7 @@ OCM            ?= ocm
 
 export VERSION OCM
 
-.PHONY: help build sign verify resolvers manifests deploy publish transfer-plan ownership lint test e2e cluster-up cluster-down e2e-run clean
+.PHONY: help build sign verify resolvers manifests deploy publish transfer-plan ownership sbom lint test e2e cluster-up cluster-down e2e-run clean
 
 help: ## Show this help
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | \
@@ -35,6 +35,9 @@ transfer-plan: ## Dry-run the publish transfer and write build/transfer-plan.jso
 
 ownership: ## Build and trace the ownership demo component
 	@bash scripts/ownership.sh
+
+sbom: ## Generate the CycloneDX SBOM (build/sbom/hello-world.cdx.json); also run by build
+	@bash scripts/sbom.sh
 
 lint: ## Lint shell scripts (if shellcheck is available)
 	@if command -v shellcheck >/dev/null 2>&1; then \
