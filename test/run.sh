@@ -3802,6 +3802,256 @@ test_readme_documents_http_resources() {
   assert_contains "$res_section" "(#http-resources)" "Resource repositories links to http resources"
 }
 
+_pki_env() {
+  local tmp="$1"
+  export PKI_DEMO_CTF="$tmp/pki-ctf" PKI_DEMO_OUT="$tmp/pki"
+}
+
+_pki_ref() {
+  echo "ctf::${1}//github.com/lioramilbaum/pki-demo:${VERSION}"
+}
+
+# Prints the fingerprint of the first certificate in PEM file $1.
+_pki_fingerprint() {
+  openssl x509 -in "$1" -noout -fingerprint -sha256 | sed 's/^.*=//'
+}
+
+test_pki_signature_is_pem_encoded() {
+  local tmp="$1" sig value first
+  _pki_env "$tmp"
+  bash "$ROOT/scripts/pki.sh" >/dev/null 2>&1 || return 1
+
+  sig="$("$OCM" get cv "$(_pki_ref "$tmp/pki-ctf")" -o json | jq -c '.[0].signatures[] | select(.name=="pki")')"
+  [[ -n "$sig" ]] || { echo "  no 'pki' signature on the component" >&2; return 1; }
+  assert_eq "$(jq -r '.signature.mediaType' <<<"$sig")" "application/x-pem-file" "signature mediaType" || return 1
+  assert_eq "$(jq -r '.signature.algorithm' <<<"$sig")" "RSASSA-PSS" "signature algorithm" || return 1
+  assert_eq "$(jq -r '.digest.normalisationAlgorithm' <<<"$sig")" "jsonNormalisation/v4alpha1" "normalisation" || return 1
+
+  value="$(jq -r '.signature.value' <<<"$sig")"
+  assert_eq "$(head -n1 <<<"$value")" "-----BEGIN SIGNATURE-----" "first PEM block" || return 1
+  assert_eq "$(grep -c -- '-----BEGIN CERTIFICATE-----' <<<"$value")" "2" "embedded certificates" || return 1
+
+  # The first embedded certificate is the leaf; the root is never embedded.
+  awk '/-----BEGIN CERTIFICATE-----/{f=1} f{print} /-----END CERTIFICATE-----/{exit}' <<<"$value" > "$tmp/first.pem"
+  first="$(_pki_fingerprint "$tmp/first.pem")"
+  assert_eq "$first" "$(_pki_fingerprint "$tmp/pki/certs/leaf.crt")" "leaf is first" || return 1
+}
+
+test_pki_verifier_pins_only_root() {
+  local tmp="$1" cfg subject issuer
+  _pki_env "$tmp"
+  bash "$ROOT/scripts/pki.sh" >/dev/null 2>&1 || return 1
+
+  cfg="$(cat "$tmp/pki/verify.ocmconfig")"
+  assert_contains "$cfg" "publicKeyPEMFile: $tmp/pki/certs/root.crt" || return 1
+  assert_contains "$cfg" "signature: pki" || return 1
+  assert_not_contains "$cfg" "privateKeyPEMFile" || return 1
+  assert_not_contains "$cfg" "leaf" || return 1
+  assert_not_contains "$cfg" "verifier:" || return 1
+
+  subject="$(openssl x509 -in "$tmp/pki/certs/root.crt" -noout -subject -nameopt RFC2253 | sed 's/^subject= *//')"
+  issuer="$(openssl x509 -in "$tmp/pki/certs/root.crt" -noout -issuer -nameopt RFC2253 | sed 's/^issuer= *//')"
+  assert_eq "$subject" "$issuer" "root is self-signed" || return 1
+
+  assert_contains "$(cat "$tmp/pki/sign.ocmconfig")" "signatureEncodingPolicy: PEM" || return 1
+  bash "$ROOT/scripts/pki.sh" verify >/dev/null 2>&1 || { echo "  verify with the root CA failed" >&2; return 1; }
+}
+
+test_pki_scenarios() {
+  local tmp="$1" out expected
+  _pki_env "$tmp"
+  out="$(bash "$ROOT/scripts/pki.sh" scenarios 2>/dev/null)" || return 1
+  expected="$(printf '%s\n' \
+    $'valid\tok\tok\t-' \
+    $'rotated-leaf\tok\tok\t-' \
+    $'leaf-only-chain\tok\tfail\tunknown-authority' \
+    $'verifier-supplies-intermediate\tok\tok\t-' \
+    $'rogue-root\tok\tfail\tunknown-authority' \
+    $'expired-leaf\tok\tfail\texpired' \
+    $'server-auth-leaf\tok\tfail\tkey-usage' \
+    $'root-in-chain\tok\tfail\troot-embedded' \
+    $'pinned-public-key\tok\tfail\tnot-a-certificate' \
+    $'intermediate-as-anchor\tok\tfail\tunknown-authority')"
+  assert_eq "$out" "$expected" "scenario matrix"
+}
+
+test_pki_rotation_keeps_verifier_config() {
+  local tmp="$1"
+  _pki_env "$tmp"
+  bash "$ROOT/scripts/pki.sh" scenarios >/dev/null 2>&1 || return 1
+
+  cmp -s "$tmp/pki/scenarios/rotated-leaf-verify.ocmconfig" "$tmp/pki/verify.ocmconfig" || {
+    echo "  rotation changed the verifier config" >&2
+    return 1
+  }
+  local old new
+  old="$(openssl x509 -in "$tmp/pki/certs/leaf.crt" -noout -pubkey)"
+  new="$(openssl x509 -in "$tmp/pki/certs/leaf2.crt" -noout -pubkey)"
+  [[ "$old" != "$new" ]] || { echo "  rotated leaf reuses the old key" >&2; return 1; }
+}
+
+test_pki_certs_are_reused() {
+  local tmp="$1" before
+  _pki_env "$tmp"
+  bash "$ROOT/scripts/pki.sh" certs >/dev/null 2>&1 || return 1
+  before="$(sha256 "$tmp/pki/certs/root.crt")"
+  bash "$ROOT/scripts/pki.sh" >/dev/null 2>&1 || return 1
+  assert_eq "$(sha256 "$tmp/pki/certs/root.crt")" "$before" "root CA unchanged across runs"
+}
+
+test_pki_reissues_expiring_leaf() {
+  local tmp="$1" root_before leaf_before
+  _pki_env "$tmp"
+  bash "$ROOT/scripts/pki.sh" scenarios >/dev/null 2>&1 || return 1
+  root_before="$(sha256 "$tmp/pki/certs/root.crt")"
+  leaf_before="$(_pki_fingerprint "$tmp/pki/certs/leaf.crt")"
+  # Simulate a build directory whose leaf has expired.
+  cp "$tmp/pki/certs/expired.crt" "$tmp/pki/certs/leaf.crt"
+  cp "$tmp/pki/certs/expired.key" "$tmp/pki/certs/leaf.key"
+
+  bash "$ROOT/scripts/pki.sh" >/dev/null 2>&1 || { echo "  make pki failed with an expired leaf on disk" >&2; return 1; }
+  assert_eq "$(sha256 "$tmp/pki/certs/root.crt")" "$root_before" "root CA unchanged" || return 1
+  [[ "$(_pki_fingerprint "$tmp/pki/certs/leaf.crt")" != "$leaf_before" ]] || { echo "  leaf was not reissued" >&2; return 1; }
+  openssl x509 -checkend 86400 -noout -in "$tmp/pki/certs/leaf.crt" >/dev/null || { echo "  reissued leaf is not valid" >&2; return 1; }
+}
+
+test_pki_signature_covers_descriptor() {
+  local tmp="$1" out
+  _pki_env "$tmp"
+  bash "$ROOT/scripts/pki.sh" >/dev/null 2>&1 || return 1
+
+  _tamper_descriptor "$tmp/pki-ctf" "$VERSION" '(.component.provider) = "github.com/someoneelse"' "$tmp/tampered" || return 1
+  if out="$(PKI_DEMO_CTF="$tmp/tampered" bash "$ROOT/scripts/pki.sh" verify 2>&1)"; then
+    echo "  verify accepted a tampered descriptor" >&2
+    return 1
+  fi
+  assert_contains "$out" "digest mismatch"
+}
+
+test_pki_signature_survives_transfer() {
+  local tmp="$1"
+  _pki_env "$tmp"
+  bash "$ROOT/scripts/pki.sh" >/dev/null 2>&1 || return 1
+
+  "$OCM" transfer cv --config "$tmp/pki/verify.ocmconfig" \
+    "$(_pki_ref "$tmp/pki-ctf")" "ctf::$tmp/transferred-ctf" </dev/null >/dev/null 2>&1 || return 1
+  "$OCM" verify cv --config "$tmp/pki/verify.ocmconfig" --signature pki \
+    "$(_pki_ref "$tmp/transferred-ctf")" </dev/null >/dev/null 2>&1 || {
+    echo "  transferred copy does not verify against the root CA" >&2
+    return 1
+  }
+}
+
+test_pki_verify_requires_signature() {
+  local tmp="$1" out
+  _pki_env "$tmp"
+  bash "$ROOT/scripts/pki.sh" build >/dev/null 2>&1 || return 1
+  if bash "$ROOT/scripts/pki.sh" verify >/dev/null 2>&1; then
+    echo "  verify of an unsigned component should fail" >&2
+    return 1
+  fi
+  if out="$(bash "$ROOT/scripts/pki.sh" show 2>&1)"; then
+    echo "  show of an unsigned component should fail" >&2
+    return 1
+  fi
+  assert_contains "$out" "no 'pki' signature"
+}
+
+test_pki_own_pki_requires_all_vars() {
+  local tmp="$1" out
+  _pki_env "$tmp"
+  if out="$(PKI_LEAF_KEY="$tmp/leaf.key" bash "$ROOT/scripts/pki.sh" build 2>&1)"; then
+    echo "  a partial PKI_* set should fail" >&2
+    return 1
+  fi
+  assert_contains "$out" "set all of PKI_LEAF_KEY, PKI_CHAIN and PKI_ROOT_CERT"
+}
+
+test_pki_own_pki_uses_supplied_files() {
+  local tmp="$1"
+  local own="$tmp/own/certs"
+  PKI_DEMO_OUT="$tmp/own" bash "$ROOT/scripts/pki.sh" certs >/dev/null 2>&1 || return 1
+  _pki_env "$tmp"
+
+  PKI_LEAF_KEY="$own/leaf.key" PKI_CHAIN="$own/chain.pem" PKI_ROOT_CERT="$own/root.crt" \
+    bash "$ROOT/scripts/pki.sh" >/dev/null 2>&1 || return 1
+
+  [[ ! -e "$tmp/pki/certs" ]] || { echo "  demo CA generated despite PKI_* overrides" >&2; return 1; }
+  assert_contains "$(cat "$tmp/pki/sign.ocmconfig")" "privateKeyPEMFile: $own/leaf.key" || return 1
+  assert_contains "$(cat "$tmp/pki/verify.ocmconfig")" "publicKeyPEMFile: $own/root.crt" || return 1
+}
+
+test_pki_show_reports_chain() {
+  local tmp="$1" out
+  _pki_env "$tmp"
+  out="$(bash "$ROOT/scripts/pki.sh" 2>/dev/null)" || return 1
+  out="$(bash "$ROOT/scripts/pki.sh" show 2>/dev/null)" || return 1
+  assert_eq "$(wc -l <<<"$out" | tr -d ' ')" "4" "show prints 4 lines" || return 1
+  assert_contains "$out" $'signature\tpki\tRSASSA-PSS\tapplication/x-pem-file' || return 1
+  assert_contains "$out" $'digest\tjsonNormalisation/v4alpha1\tSHA-256\t' || return 1
+  assert_contains "$out" $'cert\t0\tCN=OCM Demo Signer\tCN=OCM Demo Intermediate CA' || return 1
+  assert_contains "$out" $'cert\t1\tCN=OCM Demo Intermediate CA\tCN=OCM Demo Root CA'
+}
+
+test_make_pki_target() {
+  local dry_run help_out
+  dry_run="$(make -s --dry-run -C "$ROOT" pki 2>/dev/null)"
+  assert_contains "$dry_run" "scripts/pki.sh" "dry-run includes pki.sh" || return 1
+  help_out="$(make -s -C "$ROOT" help 2>/dev/null)"
+  assert_contains "$help_out" "pki" "make help lists pki"
+}
+
+test_readme_documents_certificate_chain_signing() {
+  local tmp="$1" readme="$ROOT/README.md" section check name
+  section="$(awk '/^## Certificate-chain signing/{f=1;next} /^## /{f=0} f' "$readme")"
+  [[ -n "$section" ]] || { echo "  README missing '## Certificate-chain signing' section" >&2; return 1; }
+
+  local checks=(
+    "https://ocm.software/docs/concepts/signing-and-verification/#certificate-chain-trust-pem-encoding"
+    "signatureEncodingPolicy: PEM"
+    "RSASigningConfiguration/v1alpha1"
+    "application/x-pem-file"
+    "codeSigning"
+    "system trust store"
+    "--force"
+    "RFC 3161"
+    "#3636"
+    "revocation"
+    "PKI_LEAF_KEY"
+    "PKI_CHAIN"
+    "PKI_ROOT_CERT"
+    "ocm sign cv"
+    "ocm verify cv"
+    "make pki"
+    "build/pki-ctf"
+    "(#signing-and-verification)"
+    "(#transfer-and-transport)"
+  )
+  for check in "${checks[@]}"; do
+    assert_contains "$section" "$check" "README section contains: $check" || return 1
+  done
+
+  # Drift guard: first yaml block (minus # lines) must match the constructor.
+  local readme_yaml constructor_yaml
+  readme_yaml="$(awk '/^```yaml/{n++; f=(n==1); next} /^```/{f=0} f' <<<"$section" | grep -v '^#')"
+  constructor_yaml="$(grep -v '^#' "$ROOT/components/pki/component-constructor.yaml")"
+  [[ "$readme_yaml" == "$constructor_yaml" ]] || {
+    echo "  README yaml block differs from components/pki/component-constructor.yaml" >&2
+    return 1
+  }
+
+  # Drift guard: every scenario row printed by the script is in the README table.
+  _pki_env "$tmp"
+  while IFS=$'\t' read -r name _ _ reason; do
+    assert_contains "$section" "| \`$name\` |" "scenario $name documented" || return 1
+    [[ "$reason" == "-" ]] || assert_contains "$section" "\`$reason\`" "reason $reason documented" || return 1
+  done < <(bash "$ROOT/scripts/pki.sh" scenarios 2>/dev/null)
+
+  local sv
+  sv="$(awk '/^## Signing and verification/{f=1;next} /^## /{f=0} f' "$readme")"
+  assert_contains "$sv" "(#certificate-chain-signing)" "Signing and verification links to certificate-chain signing"
+}
+
 # ── Run all tests ─────────────────────────────────────────────────────────────
 
 run_test "build produces application tree" test_build_produces_application_tree
@@ -3947,6 +4197,20 @@ run_test "wget server port in use" test_wget_server_port_in_use
 run_test "wget show reports resources" test_wget_show_reports_resources
 run_test "make wget target" test_make_wget_target
 run_test "readme documents http resources" test_readme_documents_http_resources
+run_test "pki signature is pem encoded" test_pki_signature_is_pem_encoded
+run_test "pki verifier pins only root" test_pki_verifier_pins_only_root
+run_test "pki scenarios" test_pki_scenarios
+run_test "pki rotation keeps verifier config" test_pki_rotation_keeps_verifier_config
+run_test "pki certs are reused" test_pki_certs_are_reused
+run_test "pki reissues expiring leaf" test_pki_reissues_expiring_leaf
+run_test "pki signature covers descriptor" test_pki_signature_covers_descriptor
+run_test "pki signature survives transfer" test_pki_signature_survives_transfer
+run_test "pki verify requires signature" test_pki_verify_requires_signature
+run_test "pki own pki requires all vars" test_pki_own_pki_requires_all_vars
+run_test "pki own pki uses supplied files" test_pki_own_pki_uses_supplied_files
+run_test "pki show reports chain" test_pki_show_reports_chain
+run_test "make pki target" test_make_pki_target
+run_test "readme documents certificate-chain signing" test_readme_documents_certificate_chain_signing
 
 echo ""
 echo "Results: $PASS passed, $FAIL failed"
