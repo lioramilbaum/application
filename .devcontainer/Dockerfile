@@ -1,6 +1,6 @@
 FROM mcr.microsoft.com/devcontainers/base:3.0.10-ubuntu24.04
 RUN apt-get update && export DEBIAN_FRONTEND=noninteractive \
-    && apt-get install -y --no-install-recommends make shellcheck jq curl openssl ca-certificates \
+    && apt-get install -y --no-install-recommends make shellcheck jq curl openssl ca-certificates python3 \
     && rm -rf /var/lib/apt/lists/*
 
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]

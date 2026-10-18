@@ -1,0 +1,3 @@
+wget-demo 0.1.0
+- Added HTTP resources: an input fetched with Wget/v1 and an access served by an upstream HTTP server.
+- Fictional release, used only to exercise the Wget/v1 demo.

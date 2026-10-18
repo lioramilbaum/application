@@ -1,0 +1,4 @@
+type: generic.config.ocm.software/v1
+configurations:
+  - type: localblob.uploader.transfer.config.ocm.software/v1alpha1
+    match: resource.access.isType("Wget")
