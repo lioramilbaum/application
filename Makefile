@@ -3,7 +3,7 @@ OCM            ?= ocm
 
 export VERSION OCM
 
-.PHONY: help build sign verify resolvers manifests deploy publish transfer-plan ownership sbom product lint test e2e cluster-up cluster-down e2e-run clean
+.PHONY: help build sign verify resolvers manifests deploy publish transfer-plan ownership sbom product versions lint test e2e cluster-up cluster-down e2e-run clean
 
 help: ## Show this help
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | \
@@ -41,6 +41,9 @@ sbom: ## Generate the CycloneDX SBOM (build/sbom/hello-world.cdx.json); also run
 
 product: build sign ## Build, sign, verify and show tree of the product component that references the application
 	@bash scripts/product.sh
+
+versions: ## Build the versions demo (release + nightly CTFs) and show constraint, --latest and versioning-scheme selection (requires OCM CLI >= 0.19.0)
+	@bash scripts/versions.sh
 
 lint: ## Lint shell scripts (if shellcheck is available)
 	@if command -v shellcheck >/dev/null 2>&1; then \

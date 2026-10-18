@@ -83,7 +83,7 @@ organization URL where the owner controls the namespace.
 
 **Component version** is relaxed SemVer: the `v` prefix is optional, pre-release and build
 metadata are allowed, and `latest` is rejected. `release.yaml` strips the tag's `v` prefix, so
-Git tag `v0.1.0` becomes component version `0.1.0`.
+Git tag `v0.1.0` becomes component version `0.1.0`. This is OCM's default `loose-semver` scheme; see [Version selection](#version-selection) for constraints and custom schemes.
 
 **Reference syntax** is `[<type>::]<repository>//<name>[:<version>]`. For this component:
 
@@ -833,9 +833,121 @@ The transfer produces a canonical repository containing both components. `make v
 
 Related: [Resolvers](#resolvers) · [Canonical component repositories](#canonical-component-repositories) · [Signing and verification](#signing-and-verification) · [Transfer and transport](#transfer-and-transport)
 
+## Version selection
+
+A **component version** is part of a component's identity — a component version reference is `<name>:<version>`. Consumers pick versions by constraint; producers only publish exact versions.
+
+OCM's default versioning scheme is **loose-semver**: any string that `golang.org/x/mod/semver` accepts, plus relaxed two-part `MAJOR.MINOR` forms. The resulting ordering is numeric: `0.10.0 > 0.2.0`.
+
+See also the [configure-versioning tutorial](https://ocm.software/docs/tutorials/configure-versioning/) and the [versioning-configuration reference](https://ocm.software/docs/reference/versioning-configuration/).
+
+### Demo component
+
+`components/versions/component-constructor.yaml`:
+
+```yaml
+name: github.com/lioramilbaum/versions-demo
+version: ${VERSION}
+provider:
+  name: github.com/lioramilbaum
+resources:
+  - name: release-notes
+    type: blob
+    version: ${VERSION}
+    input:
+      type: utf8
+      text: "github.com/lioramilbaum/versions-demo ${VERSION}"
+```
+
+```sh
+make versions   # builds build/versions-ctf (releases) and build/versions-nightly-ctf (nightlies)
+```
+
+Release versions in `build/versions-ctf`: `0.1.0 0.2.0 0.10.0 1.0.0 1.1.0-rc.1`  
+Nightly versions in `build/versions-nightly-ctf`: `r2 r9 r10 r100`
+
+Expected output:
+
+```text
+release  all                 1.1.0-rc.1 1.0.0 0.10.0 0.2.0 0.1.0
+release  latest              1.1.0-rc.1
+release  latest >= 0.0.0     1.0.0
+release  ^0.1                0.1.0
+release  >= 0.2.0, < 1.0.0   0.10.0 0.2.0
+release  1.x                 1.0.0
+nightly  all                 r100 r10 r9 r2
+nightly  latest              r100
+nightly  all (no scheme)     r9 r2 r100 r10
+nightly  latest (no scheme)  r9
+```
+
+### Constraints
+
+`ocm get cv <repo>//<name> --constraint '<range>'` uses [Masterminds semver](https://github.com/Masterminds/semver) syntax:
+
+| Query | Result |
+|---|---|
+| *(none)* | `1.1.0-rc.1 1.0.0 0.10.0 0.2.0 0.1.0` |
+| `^0.1` | `0.1.0` |
+| `>= 0.2.0, < 1.0.0` | `0.10.0 0.2.0` |
+| `1.x` | `1.0.0` |
+| `>= 9.0.0` | error: no match |
+
+Results are returned newest-first, ordered numerically (`0.10.0 > 0.2.0`). A constraint that matches nothing exits 1 with `no roots`.
+
+### Pre-releases and --latest
+
+The default constraint `> 0.0.0-0` includes pre-releases, so `--latest` returns `1.1.0-rc.1`. To get the latest stable release, add `--constraint '>= 0.0.0'`:
+
+```sh
+ocm get cv "ctf::./build/versions-ctf//github.com/lioramilbaum/versions-demo" \
+  --constraint '>= 0.0.0' --latest
+# 1.0.0
+```
+
+Constraints without a pre-release suffix (`1.x`, `>= 1.0.0`) exclude pre-releases; `>= 1.1.0-0` opts in.
+
+### Versioning schemes
+
+For non-semver version strings, configure a custom scheme. `components/versions/versioning.ocmconfig`:
+
+```yaml
+type: generic.config.ocm.software/v1
+configurations:
+  - type: versioning.config.ocm.software/v1alpha1
+    schemes:
+      - name: build-number
+        pattern: '^r(?P<build>\d+)$'
+        comparisonGroups: [build]
+```
+
+Schemes are **consumer-side config**: pass `--config versioning.ocmconfig` to `ocm add cv` (validates the version string) and to `ocm get cv` (defines the ordering).
+
+Configuring any scheme drops the built-in `loose-semver` scheme. `build/versions-nightly-ctf` therefore rejects `1.0.0`. Add `- builtin: loose-semver` under `schemes` to accept both formats in the same repo.
+
+Without the config, the nightly CTF reads as **reverse lexical** order: `r9 r2 r100 r10`, with `--latest` returning `r9`. Use `ocm get config` to inspect the active schemes.
+
+CalVer strings like `2026.03.15` parse as loose-semver already (no scheme needed). Avoid uppercase letters and `+` in version strings — OCI tag rules require lowercase and treat `+` specially.
+
+### Where constraints apply
+
+| Context | How versions are filtered |
+|---|---|
+| CLI `--constraint` / `--latest` | Masterminds semver range against the active scheme |
+| Resolver `versionConstraint` | Same; picks the resolver entry — see [Resolvers](#resolvers) |
+| Controller `Component.spec.semver` | Always uses loose-semver, ignores custom schemes — see [Kubernetes controller](#kubernetes-controller); `semverFilter` is a regex; `downgradePolicy: Deny` is the default |
+| `componentReferences` | Exact versions only; `^0.1` fails — see [Component References](#component-references) |
+
+### Limitations
+
+- `--semver-constraint` (OCM ≤ 0.17) was renamed to `--constraint` in 0.19.0 with no alias; versioning schemes also need ≥ 0.19.0. `scripts/versions.sh` gates on this and exits early with a clear message on older binaries.
+- Non-semver versions cannot be used in `<name>:<version>` syntax. `ocm download resource …:r100` fails with `invalid semantic version`; `ocm get cv …:r10` mangles the component name. Select non-semver versions with `--latest` or `--constraint`; `ocm transfer cv` handles them correctly.
+
+Related: [Resolvers](#resolvers) · [Kubernetes controller](#kubernetes-controller) · [Component identity](#component-identity) · [Transfer and transport](#transfer-and-transport)
+
 ## Prerequisites
 
-- OCM CLI v2 ≥ 0.17.0 (publishing with `OCM_REGISTRY_USERNAME`/`OCM_REGISTRY_PASSWORD` requires ≥ 0.19.1)
+- OCM CLI v2 ≥ 0.17.0 (publishing with `OCM_REGISTRY_USERNAME`/`OCM_REGISTRY_PASSWORD` requires ≥ 0.19.1); `make versions` requires ≥ 0.19.0
 - kind
 - `make`
 - `shellcheck` (for linting)
@@ -867,6 +979,7 @@ make publish OCM_REPO=ghcr.io/<you>/ocm  # transfer to an OCI registry, copying 
 make ownership       # build the ownership demo component and trace the owner of each resource
 make sbom            # regenerate the CycloneDX SBOM (build/sbom/hello-world.cdx.json); also run by make build
 make product         # build, sign and verify the product component that references the application
+make versions  # build the versions demo and show constraint/--latest/scheme selection
 ```
 
 ## Consuming the component
@@ -1005,6 +1118,7 @@ Tests include:
 - Component identity: `component identity selects artifacts`, `component identity rules enforced`, `readme documents component identity`
 - Kubernetes component discovery: `discovery selects image variants`, `readme documents kubernetes component discovery`
 - Ownership: `ownership records owner`, `ownership record is deterministic`, `ownership survives transfer`, `ownership trace reports owner`, `readme documents ownership`
+- Version selection: `versions lists newest first`, `versions constraint filters`, `versions latest includes prereleases by default`, `versions scheme orders build numbers`, `versions without scheme misorders`, `versions reference requires semver`, `versions requires ocm 0.19`, `versions show reports selection`, `make versions target`, `readme documents version selection`
 
 ## CI
 

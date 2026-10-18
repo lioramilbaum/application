@@ -1,0 +1,10 @@
+# Consumer-side versioning scheme for nightly build-number versions (r2, r9, r10, r100).
+# Configuring any scheme drops the default loose-semver scheme, so this repo rejects 1.0.0.
+# Add "- builtin: loose-semver" under schemes to accept both formats.
+type: generic.config.ocm.software/v1
+configurations:
+  - type: versioning.config.ocm.software/v1alpha1
+    schemes:
+      - name: build-number
+        pattern: '^r(?P<build>\d+)$'
+        comparisonGroups: [build]
