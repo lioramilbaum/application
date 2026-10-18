@@ -12,6 +12,8 @@ GOLDEN_DIR="${GOLDEN_DIR:-$ROOT/.test-golden}"
 VERSIONS_OCM="${VERSIONS_OCM:-$OCM}"
 # OCM >= 0.19.0 is needed for checksum.http.config (Wget/v1 integrity checks).
 WGET_OCM="${WGET_OCM:-$OCM}"
+# OCM >= 0.19.0 is needed for Git/v1 input and access.
+GIT_OCM="${GIT_OCM:-$OCM}"
 
 PASS=0
 FAIL=0
@@ -4052,6 +4054,420 @@ test_readme_documents_certificate_chain_signing() {
   assert_contains "$sv" "(#certificate-chain-signing)" "Signing and verification links to certificate-chain signing"
 }
 
+_git_env() {
+  local tmp="$1"
+  unset GIT_DEMO_REPO GIT_DEMO_COMMIT GIT_DEMO_REF 2>/dev/null || true
+  export GIT_DEMO_CTF="$tmp/git-ctf" GIT_DEMO_OUT="$tmp/git" OCM="$GIT_OCM"
+}
+_build_git() { _git_env "$1"; bash "$ROOT/scripts/git.sh" build; }
+_gitdemo_ref() { echo "ctf::${1}//github.com/lioramilbaum/git-demo:${VERSION}"; }
+_gitdemo_json() { "$OCM" get cv "$(_gitdemo_ref "$1")" -o json </dev/null; }
+_gitdemo_upstream_commit() { GIT_CONFIG_GLOBAL=/dev/null git --git-dir "$1/git/upstream.git" rev-parse 'v0.1.0^{commit}'; }
+_gitdemo_commit_on() {
+  local repo="$1" branch="$2" content="$3" work
+  work="$(mktemp -d)"
+  # shellcheck disable=SC2064
+  trap "rm -rf '$work'" RETURN
+  GIT_CONFIG_GLOBAL=/dev/null git clone -q "$repo" "$work/w"
+  printf '%s\n' "$content" > "$work/w/index.html"
+  GIT_CONFIG_GLOBAL=/dev/null git -C "$work/w" -c user.name=test -c user.email=test@example.com commit -q -am "$content"
+  GIT_CONFIG_GLOBAL=/dev/null git -C "$work/w" push -q origin "HEAD:refs/heads/$branch"
+  GIT_CONFIG_GLOBAL=/dev/null git -C "$work/w" rev-parse HEAD
+}
+_gitdemo_same_tree() {
+  local repo="$1" c
+  c="$(GIT_CONFIG_GLOBAL=/dev/null git --git-dir "$repo" -c user.name=test -c user.email=test@example.com \
+    commit-tree -m "same tree, other commit" 'v0.1.0^{tree}')"
+  GIT_CONFIG_GLOBAL=/dev/null git --git-dir "$repo" update-ref refs/heads/same-tree "$c"
+  echo "$c"
+}
+# _gitdemo_own_commit <dir> <message>: commits all changes in a non-bare repository and prints the commit.
+_gitdemo_own_commit() {
+  local dir="$1" msg="$2"
+  GIT_CONFIG_GLOBAL=/dev/null git -C "$dir" add -A
+  GIT_CONFIG_GLOBAL=/dev/null git -C "$dir" -c user.name=test -c user.email=test@example.com commit -q -m "$msg"
+  GIT_CONFIG_GLOBAL=/dev/null git -C "$dir" rev-parse HEAD
+}
+# _gitdemo_own_repo <dir>: non-bare repository holding the demo files; prints its commit.
+_gitdemo_own_repo() {
+  local dir="$1"
+  mkdir -p "$dir"
+  GIT_CONFIG_GLOBAL=/dev/null git init -q -b main "$dir"
+  cp "$ROOT/components/git/upstream/index.html" "$ROOT/components/git/upstream/build.sh" "$dir/"
+  _gitdemo_own_commit "$dir" "hello-world 0.1.0"
+}
+
+test_git_resource_metadata() {
+  local tmp="$1" json commit src snap trk
+  _build_git "$tmp" >/dev/null 2>&1 || return 1
+  json="$(_gitdemo_json "$tmp/git-ctf")" || return 1
+  commit="$(_gitdemo_upstream_commit "$tmp")"
+  src="$(jq -c '.[0].component.sources[] | select(.name=="hello-world-source")' <<<"$json")"
+  snap="$(jq -c '.[0].component.resources[] | select(.name=="hello-world-source-snapshot")' <<<"$json")"
+  trk="$(jq -c '.[0].component.resources[] | select(.name=="hello-world-source-tracked")' <<<"$json")"
+
+  assert_eq "$(jq -r '.access.type' <<<"$src")" "Git/v1" "source access" || return 1
+  assert_eq "$(jq -r '.access.commit' <<<"$src")" "$commit" "source commit" || return 1
+  assert_eq "$(jq -r 'has("digest")' <<<"$src")" "false" "source has no digest" || return 1
+
+  assert_eq "$(jq -r '.access.type' <<<"$snap")" "LocalBlob/v1" "snapshot access" || return 1
+  assert_eq "$(jq -r '.access.mediaType' <<<"$snap")" "application/x-tgz" "snapshot mediaType" || return 1
+  assert_eq "$(jq -r '.labels[] | select(.name=="git.lioramilbaum.github.com/commit" and .signing==true) | .value' <<<"$snap")" \
+    "$commit" "snapshot commit label" || return 1
+
+  assert_eq "$(jq -r '.access.type' <<<"$trk")" "Git/v1" "tracked access" || return 1
+  assert_eq "$(jq -r '.access.commit' <<<"$trk")" "$commit" "tracked commit pinned" || return 1
+  assert_eq "$(jq -r '.digest.hashAlgorithm' <<<"$trk")" "SHA-256" "tracked hashAlgorithm" || return 1
+  assert_eq "$(jq -r '.digest.value' <<<"$snap")" "$(jq -r '.digest.value' <<<"$trk")" "snapshot and tracked digests equal"
+}
+
+test_git_ref_pinned_at_build_time() {
+  local tmp="$1" want
+  _build_git "$tmp" >/dev/null 2>&1 || return 1
+  bash "$ROOT/scripts/git.sh" sign >/dev/null 2>&1 || return 1
+  # The constructor names a ref for the tracked resource; the commit only exists in the built component.
+  if awk '/name: hello-world-source-tracked/{f=1} f' "$ROOT/components/git/component-constructor.yaml" | grep -q 'commit:'; then
+    echo "  tracked resource should name a ref, not a commit" >&2
+    return 1
+  fi
+  want="$(_gitdemo_json "$tmp/git-ctf" | jq -r '.[0].component.resources[] | select(.name=="hello-world-source-tracked") | .digest.value')"
+  assert_eq "$(_gitdemo_json "$tmp/git-ctf" | jq -r '.[0].component.resources[] | select(.name=="hello-world-source-tracked") | .access.commit')" \
+    "$(_gitdemo_upstream_commit "$tmp")" "tracked commit pinned at build time" || return 1
+
+  _gitdemo_commit_on "$tmp/git/upstream.git" main "<p>main moved on</p>" >/dev/null || return 1
+  "$OCM" download resource --identity name=hello-world-source-tracked --output "$tmp/tracked.tgz" \
+    "$(_gitdemo_ref "$tmp/git-ctf")" </dev/null >/dev/null 2>&1 || {
+    echo "  tracked download should survive a moved branch" >&2
+    return 1
+  }
+  assert_eq "$(sha256 "$tmp/tracked.tgz")" "$want" "tracked archive digest after branch moved"
+}
+
+test_git_upstream_is_deterministic() {
+  local tmp="$1" first second
+  _build_git "$tmp" >/dev/null 2>&1 || return 1
+  first="$(_gitdemo_json "$tmp/git-ctf" | jq -r '.[0].component.resources[] | select(.name=="hello-world-source-snapshot") | .digest.value')"
+  _build_git "$tmp/second" >/dev/null 2>&1 || return 1
+  second="$(_gitdemo_json "$tmp/second/git-ctf" | jq -r '.[0].component.resources[] | select(.name=="hello-world-source-snapshot") | .digest.value')"
+  assert_eq "$(_gitdemo_upstream_commit "$tmp/second")" "$(_gitdemo_upstream_commit "$tmp")" "upstream commit" || return 1
+  assert_eq "$second" "$first" "snapshot digest"
+}
+
+test_git_snapshot_matches_commit_tree() {
+  local tmp="$1" commit
+  _build_git "$tmp" >/dev/null 2>&1 || return 1
+  bash "$ROOT/scripts/git.sh" sign >/dev/null 2>&1 || return 1
+  commit="$(_gitdemo_upstream_commit "$tmp")"
+  "$OCM" download resource --identity name=hello-world-source-snapshot --output "$tmp/snapshot.tgz" \
+    "$(_gitdemo_ref "$tmp/git-ctf")" </dev/null >/dev/null 2>&1 || return 1
+  mkdir -p "$tmp/snapshot" "$tmp/archive"
+  tar -xzf "$tmp/snapshot.tgz" -C "$tmp/snapshot" || return 1
+
+  # OCM 0.19.1
+  [[ ! -e "$tmp/snapshot/.git" ]] || { echo "  snapshot contains .git" >&2; return 1; }
+  [[ -x "$tmp/snapshot/build.sh" ]] || { echo "  build.sh lost its executable bit" >&2; return 1; }
+  python3 -I -c 'import sys, tarfile
+mtimes = {m.mtime for m in tarfile.open(sys.argv[1]).getmembers() if m.isfile()}
+sys.exit(0 if mtimes == {0} else 1)' "$tmp/snapshot.tgz" || { echo "  snapshot files do not have epoch mtime" >&2; return 1; }
+
+  GIT_CONFIG_GLOBAL=/dev/null git --git-dir "$tmp/git/upstream.git" archive "$commit" | tar -x -C "$tmp/archive" || return 1
+  diff -r "$tmp/snapshot" "$tmp/archive" >/dev/null || { echo "  snapshot differs from git archive of $commit" >&2; return 1; }
+}
+
+test_git_digest_covers_tree_not_commit() {
+  local tmp="$1" same other
+  _build_git "$tmp" >/dev/null 2>&1 || return 1
+  bash "$ROOT/scripts/git.sh" sign >/dev/null 2>&1 || return 1
+
+  # Access is not signed: a commit with the same tree verifies and downloads.
+  same="$(_gitdemo_same_tree "$tmp/git/upstream.git")"
+  _tamper_descriptor "$tmp/git-ctf" "$VERSION" \
+    "(.component.resources[] | select(.name==\"hello-world-source-tracked\") | .access.commit) = \"$same\"" \
+    "$tmp/same-ctf" || return 1
+  GIT_DEMO_CTF="$tmp/same-ctf" bash "$ROOT/scripts/git.sh" download >/dev/null 2>&1 || {
+    echo "  a commit with the same tree should download" >&2
+    return 1
+  }
+
+  # A commit with a different tree does not match the recorded archive digest.
+  other="$(_gitdemo_commit_on "$tmp/git/upstream.git" other "<p>other tree</p>")"
+  _tamper_descriptor "$tmp/git-ctf" "$VERSION" \
+    "(.component.resources[] | select(.name==\"hello-world-source-tracked\") | .access.commit) = \"$other\"" \
+    "$tmp/other-ctf" || return 1
+  local out
+  if out="$(GIT_DEMO_CTF="$tmp/other-ctf" bash "$ROOT/scripts/git.sh" download 2>&1)"; then
+    echo "  a commit with a different tree should fail to download" >&2
+    return 1
+  fi
+  assert_contains "$out" "archive-mismatch"
+}
+
+test_git_signature_binds_commit_label() {
+  local tmp="$1" fake hex name want filter got
+  _build_git "$tmp" >/dev/null 2>&1 || return 1
+  bash "$ROOT/scripts/git.sh" sign >/dev/null 2>&1 || return 1
+  fake="$(printf 'a%.0s' {1..40})"
+  hex="$(printf 'b%.0s' {1..64})"
+  for name in source-commit tracked-commit snapshot-label snapshot-digest tracked-digest; do
+    case "$name" in
+      source-commit)   want=ok;   filter="(.component.sources[] | select(.name==\"hello-world-source\") | .access.commit) = \"$fake\"" ;;
+      tracked-commit)  want=ok;   filter="(.component.resources[] | select(.name==\"hello-world-source-tracked\") | .access.commit) = \"$fake\"" ;;
+      snapshot-label)  want=fail; filter="(.component.resources[] | select(.name==\"hello-world-source-snapshot\") | .labels[] | select(.name==\"git.lioramilbaum.github.com/commit\") | .value) = \"$fake\"" ;;
+      snapshot-digest) want=fail; filter="(.component.resources[] | select(.name==\"hello-world-source-snapshot\") | .digest.value) = \"$hex\"" ;;
+      tracked-digest)  want=fail; filter="(.component.resources[] | select(.name==\"hello-world-source-tracked\") | .digest.value) = \"$hex\"" ;;
+    esac
+    _tamper_descriptor "$tmp/git-ctf" "$VERSION" "$filter" "$tmp/$name-ctf" || return 1
+    if GIT_DEMO_CTF="$tmp/$name-ctf" bash "$ROOT/scripts/git.sh" verify >/dev/null 2>&1; then got=ok; else got=fail; fi
+    assert_eq "$got" "$want" "$name verify" || return 1
+  done
+}
+
+test_git_audit_matches_snapshot() {
+  local tmp="$1" commit digest out
+  _git_env "$tmp"
+  out="$(bash "$ROOT/scripts/git.sh" 2>&1)" || return 1
+  commit="$(_gitdemo_upstream_commit "$tmp")"
+  digest="$(_gitdemo_json "$tmp/git-ctf" | jq -r '.[0].component.resources[] | select(.name=="hello-world-source-snapshot") | .digest.value')"
+  assert_contains "$out" $'audit\t'"$commit"$'\t'"$digest"$'\tmatch'
+}
+
+test_git_audit_rejects_wrong_commit_label() {
+  local tmp="$1" a b ctor out
+  _git_env "$tmp"
+  a="$(_gitdemo_own_repo "$tmp/own")"
+  printf '<p>second</p>\n' >> "$tmp/own/index.html"
+  b="$(_gitdemo_own_commit "$tmp/own" "second")"
+  # Label points at the second commit while the snapshot holds the first commit's tree.
+  ctor="$tmp/wrong-label.yaml"
+  # shellcheck disable=SC2016
+  sed -e 's|value: "\${GIT_DEMO_COMMIT}"|value: "'"$b"'"|' "$ROOT/components/git/component-constructor.yaml" > "$ctor"
+  export GIT_DEMO_REPO="$tmp/own" GIT_DEMO_COMMIT="$a" GIT_DEMO_CONSTRUCTOR="$ctor"
+  bash "$ROOT/scripts/git.sh" build >/dev/null 2>&1 || return 1
+  bash "$ROOT/scripts/git.sh" sign >/dev/null 2>&1 || return 1
+  if out="$(bash "$ROOT/scripts/git.sh" audit 2>&1)"; then
+    echo "  audit should reject a label naming another commit" >&2
+    return 1
+  fi
+  assert_contains "$out" "snapshot does not match commit $b"
+}
+
+test_git_audit_requires_signature() {
+  local tmp="$1" out
+  _build_git "$tmp" >/dev/null 2>&1 || return 1
+  if out="$(bash "$ROOT/scripts/git.sh" audit 2>&1)"; then
+    echo "  audit of an unsigned component should fail" >&2
+    return 1
+  fi
+  assert_not_contains "$out" $'\tmatch'
+}
+
+test_git_scenarios() {
+  local tmp="$1" out expected
+  _git_env "$tmp"
+  out="$(bash "$ROOT/scripts/git.sh" scenarios 2>/dev/null)" || return 1
+  expected="$(printf '%s\n' \
+    $'baseline\tok\tok\tok\t-' \
+    $'branch-moved\tok\tok\tok\t-' \
+    $'history-rewritten\tok\tok\tfail\tmissing-commit' \
+    $'upstream-deleted\tok\tok\tfail\trepository-not-found')"
+  assert_eq "$out" "$expected" "scenario matrix"
+}
+
+test_git_transfer_carries_snapshot_only() {
+  local tmp="$1" out
+  _build_git "$tmp" >/dev/null 2>&1 || return 1
+  bash "$ROOT/scripts/git.sh" sign >/dev/null 2>&1 || return 1
+  out="$(bash "$ROOT/scripts/git.sh" transfer 2>&1)" || return 1
+  assert_contains "$out" $'source\thello-world-source\tGit/v1' || return 1
+  assert_contains "$out" $'resource\thello-world-source-snapshot\tLocalBlob/v1' || return 1
+  # OCM 0.19.1; copying Git/v1 access arrives in v0.20.0-rc.1 (#3709)
+  assert_contains "$out" $'resource\thello-world-source-tracked\tGit/v1' || return 1
+
+  GIT_DEMO_CTF="$tmp/git/transfer-ctf" bash "$ROOT/scripts/git.sh" verify >/dev/null 2>&1 || {
+    echo "  transferred copy should verify" >&2
+    return 1
+  }
+
+  rm -rf "$tmp/git/upstream.git"
+  "$OCM" download resource --identity name=hello-world-source-snapshot --output "$tmp/snapshot.tgz" \
+    "$(_gitdemo_ref "$tmp/git/transfer-ctf")" </dev/null >/dev/null 2>&1 || {
+    echo "  snapshot should download without the repository" >&2
+    return 1
+  }
+  if "$OCM" download resource --identity name=hello-world-source-tracked --output "$tmp/tracked.tgz" \
+    "$(_gitdemo_ref "$tmp/git/transfer-ctf")" </dev/null >/dev/null 2>&1; then
+    echo "  tracked resource should need the repository" >&2
+    return 1
+  fi
+}
+
+test_git_uploader_cannot_copy_git_access() {
+  local tmp="$1" cfg out
+  _build_git "$tmp" >/dev/null 2>&1 || return 1
+  bash "$ROOT/scripts/git.sh" sign >/dev/null 2>&1 || return 1
+  cfg="$tmp/git-transfer.ocmconfig"
+  cat > "$cfg" <<'EOF'
+type: generic.config.ocm.software/v1
+configurations:
+  - type: localblob.uploader.transfer.config.ocm.software/v1alpha1
+    match: resource.access.isType("Git")
+EOF
+  # OCM 0.19.1
+  if out="$("$OCM" transfer cv --config "$cfg" "$(_gitdemo_ref "$tmp/git-ctf")" "ctf::$tmp/git-uploader-ctf" </dev/null 2>&1)"; then
+    echo "  an uploader rule matching Git/v1 access should fail" >&2
+    return 1
+  fi
+  assert_contains "$out" "cannot copy access type Git/v1"
+}
+
+test_git_own_repo_requires_both_vars() {
+  local tmp="$1" out
+  _git_env "$tmp"
+  if out="$(GIT_DEMO_REPO="$tmp/own" bash "$ROOT/scripts/git.sh" build 2>&1)"; then
+    echo "  a repository without a commit should fail" >&2
+    return 1
+  fi
+  assert_contains "$out" "set both GIT_DEMO_REPO and GIT_DEMO_COMMIT, or neither" || return 1
+  if out="$(GIT_DEMO_COMMIT="$(printf 'a%.0s' {1..40})" bash "$ROOT/scripts/git.sh" build 2>&1)"; then
+    echo "  a commit without a repository should fail" >&2
+    return 1
+  fi
+  assert_contains "$out" "set both GIT_DEMO_REPO and GIT_DEMO_COMMIT, or neither"
+}
+
+test_git_own_repo_uses_supplied_repository() {
+  local tmp="$1" commit out
+  _git_env "$tmp"
+  commit="$(_gitdemo_own_repo "$tmp/own")" || return 1
+  export GIT_DEMO_REPO="$tmp/own" GIT_DEMO_COMMIT="$commit"
+  bash "$ROOT/scripts/git.sh" build >/dev/null 2>&1 || return 1
+  bash "$ROOT/scripts/git.sh" sign >/dev/null 2>&1 || return 1
+  out="$(bash "$ROOT/scripts/git.sh" audit 2>&1)" || return 1
+  assert_contains "$out" $'\tmatch' || return 1
+  [[ ! -e "$tmp/git/upstream.git" ]] || { echo "  own repository should not create upstream.git" >&2; return 1; }
+}
+
+test_git_rejects_sha256_repository() {
+  local tmp="$1" out repo sha256_commit sha1_commit
+  _git_env "$tmp"
+  sha256_commit="$(printf 'a%.0s' {1..64})"
+  export GIT_DEMO_REPO="$tmp/own" GIT_DEMO_COMMIT="$sha256_commit"
+  if out="$(bash "$ROOT/scripts/git.sh" build 2>&1)"; then
+    echo "  a SHA-256 object name should be rejected" >&2
+    return 1
+  fi
+  assert_contains "$out" "SHA-256 object name" || return 1
+
+  repo="$tmp/sha256-repo"
+  GIT_CONFIG_GLOBAL=/dev/null git init -q --object-format=sha256 "$repo"
+  printf '<h1>sha256</h1>\n' > "$repo/index.html"
+  _gitdemo_own_commit "$repo" "sha256" >/dev/null
+  # OCM 0.19.1
+  sha1_commit="$(printf 'a%.0s' {1..40})"
+  export GIT_DEMO_REPO="$repo" GIT_DEMO_COMMIT="$sha1_commit"
+  if out="$(bash "$ROOT/scripts/git.sh" build 2>&1)"; then
+    echo "  a SHA-256 repository should be rejected" >&2
+    return 1
+  fi
+  assert_contains "$out" "mismatched algorithms"
+}
+
+test_git_requires_ocm_019() {
+  local tmp="$1" out
+  cat > "$tmp/fake-ocm" <<'EOF'
+#!/usr/bin/env bash
+if [[ "${1:-}" == version ]]; then
+  printf 'OCM CLI (Open Component Model v2)\n  Version:  0.17.0\n'
+  exit 0
+fi
+exit 1
+EOF
+  chmod 0755 "$tmp/fake-ocm"
+  GIT_OCM="$tmp/fake-ocm"
+  _git_env "$tmp"
+
+  if out="$(bash "$ROOT/scripts/git.sh" show 2>&1)"; then
+    echo "  git.sh should refuse OCM 0.17.0" >&2
+    return 1
+  fi
+  assert_contains "$out" "requires OCM CLI >= 0.19.0"
+}
+
+test_git_show_reports_provenance() {
+  local tmp="$1" commit out snap trk
+  _build_git "$tmp" >/dev/null 2>&1 || return 1
+  bash "$ROOT/scripts/git.sh" sign >/dev/null 2>&1 || return 1
+  commit="$(_gitdemo_upstream_commit "$tmp")"
+  out="$(bash "$ROOT/scripts/git.sh" show 2>&1)" || return 1
+  assert_eq "$(wc -l <<<"$out" | tr -d ' ')" "3" "show prints 3 lines" || return 1
+  snap="$(awk -F'\t' '$2=="hello-world-source-snapshot"{print $6}' <<<"$out")"
+  trk="$(awk -F'\t' '$2=="hello-world-source-tracked"{print $6}' <<<"$out")"
+  assert_eq "$snap" "$trk" "snapshot and tracked digests equal" || return 1
+  assert_contains "$out" $'source\thello-world-source\tGit/v1\t'"$commit"$'\tno\t-' || return 1
+  assert_contains "$out" $'resource\thello-world-source-snapshot\tLocalBlob/v1\t'"$commit"$'\tyes\t'"$snap" || return 1
+  assert_contains "$out" $'resource\thello-world-source-tracked\tGit/v1\t'"$commit"$'\tno\t'"$trk"
+}
+
+test_make_git_target() {
+  local dry_run help_out
+  dry_run="$(make -s --dry-run -C "$ROOT" git 2>/dev/null)"
+  assert_contains "$dry_run" "scripts/git.sh" "dry-run includes git.sh" || return 1
+  help_out="$(make -s -C "$ROOT" help 2>/dev/null)"
+  assert_contains "$help_out" "git" "make help lists git"
+}
+
+test_readme_documents_git_repositories() {
+  local tmp="$1" readme="$ROOT/README.md" section check name
+  section="$(awk '/^## Git repositories/{f=1;next} /^## /{f=0} f' "$readme")"
+  [[ -n "$section" ]] || { echo "  README missing '## Git repositories' section" >&2; return 1; }
+
+  local checks=(
+    "https://ocm.software/docs/reference/input-and-access-types/#gitv1-input"
+    "#gitv1-access"
+    "LocalBlob/v1"
+    "application/x-tgz"
+    "signing: true"
+    "source content is recorded without a digest and is not verifiable"
+    "git archive digest mismatch"
+    "GitCredentials/v1"
+    "localblob.uploader.transfer.config.ocm.software/v1alpha1"
+    "cannot copy access type Git/v1"
+    "#3709"
+    "#3794"
+    "mismatched algorithms"
+    "--object-format=sha1"
+    "srcRefs"
+    "GIT_DEMO_REPO"
+    "GIT_DEMO_COMMIT"
+    "GIT_DEMO_REF"
+    "make git"
+    "build/git-ctf"
+    "(#source-provenance)"
+    "(#signing-and-verification)"
+    "(#transfer-and-transport)"
+    "(#credential-system)"
+  )
+  for check in "${checks[@]}"; do
+    assert_contains "$section" "$check" "README section contains: $check" || return 1
+  done
+
+  # Drift guard: first yaml block (minus # lines) must match the constructor.
+  local readme_yaml constructor_yaml
+  readme_yaml="$(awk '/^```yaml/{n++; f=(n==1); next} /^```/{f=0} f' <<<"$section" | grep -v '^#')"
+  constructor_yaml="$(grep -v '^#' "$ROOT/components/git/component-constructor.yaml")"
+  [[ "$readme_yaml" == "$constructor_yaml" ]] || {
+    echo "  README yaml block differs from components/git/component-constructor.yaml" >&2
+    return 1
+  }
+
+  # Drift guard: every scenario row printed by the script is in the README table.
+  _git_env "$tmp"
+  while IFS=$'\t' read -r name _ _ _ reason; do
+    assert_contains "$section" "| \`$name\` |" "scenario $name documented" || return 1
+    [[ "$reason" == "-" ]] || assert_contains "$section" "\`$reason\`" "reason $reason documented" || return 1
+  done < <(bash "$ROOT/scripts/git.sh" scenarios 2>/dev/null)
+}
+
 # ── Run all tests ─────────────────────────────────────────────────────────────
 
 run_test "build produces application tree" test_build_produces_application_tree
@@ -4211,6 +4627,25 @@ run_test "pki own pki uses supplied files" test_pki_own_pki_uses_supplied_files
 run_test "pki show reports chain" test_pki_show_reports_chain
 run_test "make pki target" test_make_pki_target
 run_test "readme documents certificate-chain signing" test_readme_documents_certificate_chain_signing
+run_test "git resource metadata" test_git_resource_metadata
+run_test "git ref pinned at build time" test_git_ref_pinned_at_build_time
+run_test "git upstream is deterministic" test_git_upstream_is_deterministic
+run_test "git snapshot matches commit tree" test_git_snapshot_matches_commit_tree
+run_test "git digest covers tree not commit" test_git_digest_covers_tree_not_commit
+run_test "git signature binds commit label" test_git_signature_binds_commit_label
+run_test "git audit matches snapshot" test_git_audit_matches_snapshot
+run_test "git audit rejects wrong commit label" test_git_audit_rejects_wrong_commit_label
+run_test "git audit requires signature" test_git_audit_requires_signature
+run_test "git scenarios" test_git_scenarios
+run_test "git transfer carries snapshot only" test_git_transfer_carries_snapshot_only
+run_test "git uploader cannot copy git access" test_git_uploader_cannot_copy_git_access
+run_test "git own repo requires both vars" test_git_own_repo_requires_both_vars
+run_test "git own repo uses supplied repository" test_git_own_repo_uses_supplied_repository
+run_test "git rejects sha256 repository" test_git_rejects_sha256_repository
+run_test "git requires ocm 0.19" test_git_requires_ocm_019
+run_test "git show reports provenance" test_git_show_reports_provenance
+run_test "make git target" test_make_git_target
+run_test "readme documents git repositories" test_readme_documents_git_repositories
 
 echo ""
 echo "Results: $PASS passed, $FAIL failed"
