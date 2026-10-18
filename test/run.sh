@@ -371,6 +371,18 @@ _build_versions() {
     OCM="$VERSIONS_OCM" bash "$ROOT/scripts/versions.sh" build >/dev/null
 }
 
+# _build_helm <tmp>
+# Builds the helm demo CTF into <tmp>/helm-ctf. No signing.
+_build_helm() {
+  local tmp="$1"
+  HELM_DEMO_CTF="$tmp/helm-ctf" bash "$ROOT/scripts/helm.sh" build >/dev/null
+}
+
+# _helm_ref <ctf>
+_helm_ref() {
+  echo "ctf::${1}//github.com/lioramilbaum/helm-demo:${VERSION}"
+}
+
 # _product_ref <ctf>
 # Prints the OCM reference for the product component in the given CTF.
 _product_ref() {
@@ -3072,6 +3084,353 @@ test_readme_documents_version_selection() {
     "Component identity section links to version-selection" || return 1
 }
 
+
+test_helm_chart_resource_metadata() {
+  local tmp="$1"
+  _build_helm "$tmp"
+  local res
+  res="$("$OCM" get cv "$(_helm_ref "$tmp/helm-ctf")" -o json \
+    | jq -c '.[0].component.resources[] | select(.name=="hello-world-chart")')"
+  assert_eq "$(jq -r '.type' <<<"$res")" "helmChart" "resource type" || return 1
+  assert_eq "$(jq -r '.relation' <<<"$res")" "local" "resource relation" || return 1
+  local chart_version
+  chart_version="$(awk '/^version:/{gsub(/"/,"",$2);print $2}' \
+    "$ROOT/components/helm/chart/hello-world/Chart.yaml")"
+  assert_eq "$(jq -r '.version' <<<"$res")" "$chart_version" "resource version" || return 1
+  assert_eq "$(jq -r '.access.type' <<<"$res")" "LocalBlob/v1" "access type" || return 1
+  assert_eq "$(jq -r '.access.mediaType' <<<"$res")" "application/vnd.oci.image.manifest.v1+json" "access mediaType" || return 1
+  assert_eq "$(jq -r '.digest.normalisationAlgorithm' <<<"$res")" "genericBlobDigest/v1" "digest normalisation" || return 1
+}
+
+test_helm_chart_is_oci_artifact() {
+  local tmp="$1"
+  _build_helm "$tmp"
+  "$OCM" sign cv --config "$BUILD_DIR/sign.ocmconfig" --signature default \
+    "$(_helm_ref "$tmp/helm-ctf")" < /dev/null >/dev/null || return 1
+  HELM_DEMO_CTF="$tmp/helm-ctf" HELM_DEMO_OUT="$tmp/helm-out" SKIP_VERIFY=1 \
+    bash "$ROOT/scripts/helm.sh" download >/dev/null || return 1
+
+  local layout="$tmp/helm-out/oci-layout"
+  assert_eq "$(jq -r '.manifests[0].mediaType' "$layout/index.json")" \
+    "application/vnd.oci.image.manifest.v1+json" "index manifest mediaType" || return 1
+  assert_eq "$(jq -r '.manifests[0].annotations["org.opencontainers.image.ref.name"]' "$layout/index.json")" \
+    "0.1.0" "index ref name" || return 1
+
+  local manifest
+  manifest="$layout/blobs/sha256/$(jq -r '.manifests[0].digest' "$layout/index.json" | sed 's/^sha256://')"
+  assert_eq "$(jq -r '.config.mediaType' "$manifest")" \
+    "application/vnd.cncf.helm.config.v1+json" "config mediaType" || return 1
+  assert_eq "$(jq -r '.layers | length' "$manifest")" "1" "layer count" || return 1
+  assert_eq "$(jq -r '.layers[0].mediaType' "$manifest")" \
+    "application/vnd.cncf.helm.chart.content.v1.tar+gzip" "layer mediaType" || return 1
+}
+
+test_helm_transformer_extracts_chart() {
+  local tmp="$1"
+  _build_helm "$tmp"
+  "$OCM" sign cv --config "$BUILD_DIR/sign.ocmconfig" --signature default \
+    "$(_helm_ref "$tmp/helm-ctf")" < /dev/null >/dev/null || return 1
+  HELM_DEMO_CTF="$tmp/helm-ctf" HELM_DEMO_OUT="$tmp/helm-out" SKIP_VERIFY=1 \
+    bash "$ROOT/scripts/helm.sh" download >/dev/null || return 1
+
+  local tgz="$tmp/helm-out/chart/hello-world-0.1.0.tgz"
+  [[ -f "$tgz" ]] || { echo "  chart tgz not extracted" >&2; return 1; }
+
+  local listing
+  listing="$(tar -tzf "$tgz")"
+  assert_contains "$listing" "hello-world/Chart.yaml" "tgz contains Chart.yaml" || return 1
+  assert_contains "$listing" "hello-world/values.yaml" "tgz contains values.yaml" || return 1
+  assert_contains "$listing" "hello-world/templates/deployment.yaml" "tgz contains deployment.yaml" || return 1
+
+  local expected_app_version
+  expected_app_version="$(awk '/^appVersion:/{gsub(/"/,"",$2);print $2}' \
+    "$ROOT/components/helm/chart/hello-world/Chart.yaml")"
+
+  # Helm re-serializes Chart.yaml when packaging, so compare the fields, not the bytes
+  local extracted
+  extracted="$(tar -xzOf "$tgz" hello-world/Chart.yaml)"
+  assert_contains "$extracted" "name: hello-world" "Chart.yaml name" || return 1
+  assert_contains "$extracted" "version: 0.1.0" "Chart.yaml version" || return 1
+  assert_contains "$extracted" "$expected_app_version" "Chart.yaml appVersion" || return 1
+
+  local manifest layer_digest
+  manifest="$tmp/helm-out/oci-layout/blobs/sha256/$(jq -r '.manifests[0].digest' "$tmp/helm-out/oci-layout/index.json" | sed 's/^sha256://')"
+  layer_digest="$(jq -r '.layers[] | select(.mediaType=="application/vnd.cncf.helm.chart.content.v1.tar+gzip") | .digest' "$manifest")"
+  assert_eq "sha256:$(sha256 "$tgz")" "$layer_digest" "layer digest is sha256 of chart tgz" || return 1
+
+  # With --output ending in .tgz, OCM still writes a directory of that name
+  "$OCM" download resource "$(_helm_ref "$tmp/helm-ctf")" \
+    --identity name=hello-world-chart --transformer helm --output "$tmp/x.tgz" >/dev/null || return 1
+  [[ -d "$tmp/x.tgz" ]] || { echo "  --output x.tgz should be a directory" >&2; return 1; }
+}
+
+test_helm_download_verifies_chart() {
+  local tmp="$1"
+  _build_helm "$tmp"
+  "$OCM" sign cv --config "$BUILD_DIR/sign.ocmconfig" --signature default \
+    "$(_helm_ref "$tmp/helm-ctf")" < /dev/null >/dev/null || return 1
+
+  HELM_DEMO_CTF="$tmp/helm-ctf" HELM_DEMO_OUT="$tmp/helm-out" \
+    bash "$ROOT/scripts/helm.sh" download >/dev/null || return 1
+  [[ -f "$tmp/helm-out/chart/hello-world-0.1.0.tgz" ]] || { echo "  verified download produced no chart" >&2; return 1; }
+
+  local wrong_config
+  wrong_config=$(_wrong_verify_config "$tmp")
+  if VERIFY_CONFIG="$wrong_config" HELM_DEMO_CTF="$tmp/helm-ctf" HELM_DEMO_OUT="$tmp/helm-out2" \
+    bash "$ROOT/scripts/helm.sh" download >/dev/null 2>&1; then
+    echo "  download should fail with the wrong verification key" >&2
+    return 1
+  fi
+  [[ ! -e "$tmp/helm-out2/chart" ]] || { echo "  chart must not be extracted after failed verification" >&2; return 1; }
+}
+
+test_helm_download_requires_signature() {
+  local tmp="$1"
+  _build_helm "$tmp"
+  if HELM_DEMO_CTF="$tmp/helm-ctf" HELM_DEMO_OUT="$tmp/helm-out" \
+    bash "$ROOT/scripts/helm.sh" download >/dev/null 2>&1; then
+    echo "  download should fail for an unsigned component" >&2
+    return 1
+  fi
+  [[ ! -e "$tmp/helm-out/chart" ]] || { echo "  chart must not be extracted without a signature" >&2; return 1; }
+}
+
+test_helm_build_from_any_directory() {
+  local tmp="$1"
+  (cd / && HELM_DEMO_CTF="$tmp/helm-ctf-root" bash "$ROOT/scripts/helm.sh" build >/dev/null) || \
+    { echo "  build from / failed" >&2; return 1; }
+  [[ -d "$tmp/helm-ctf-root" ]] || { echo "  CTF not created from /" >&2; return 1; }
+}
+
+test_helm_chart_version_independent_of_component() {
+  local tmp="$1"
+  local chart_version
+  chart_version="$(awk '/^version:/{gsub(/"/,"",$2);print $2}' \
+    "$ROOT/components/helm/chart/hello-world/Chart.yaml")"
+
+  VERSION=9.9.9 HELM_DEMO_CTF="$tmp/helm-ctf" bash "$ROOT/scripts/helm.sh" build >/dev/null || return 1
+
+  local cv_json
+  cv_json="$("$OCM" get cv "ctf::$tmp/helm-ctf//github.com/lioramilbaum/helm-demo:9.9.9" -o json)" || return 1
+  assert_eq "$(jq -r '.[0].component.version' <<<"$cv_json")" "9.9.9" "component version" || return 1
+  assert_eq "$(jq -r '.[0].component.resources[] | select(.name=="hello-world-chart") | .version' <<<"$cv_json")" \
+    "$chart_version" "chart resource version" || return 1
+
+  VERSION=9.9.9 HELM_DEMO_CTF="$tmp/helm-ctf" HELM_DEMO_OUT="$tmp/helm-out" SKIP_VERIFY=1 \
+    bash "$ROOT/scripts/helm.sh" download >/dev/null || return 1
+  [[ -f "$tmp/helm-out/chart/hello-world-$chart_version.tgz" ]] || { echo "  chart tgz should be named after the chart version" >&2; return 1; }
+}
+
+test_helm_chart_layer_is_reproducible() {
+  local tmp="$1" side
+  for side in a b; do
+    HELM_DEMO_CTF="$tmp/ctf-$side" bash "$ROOT/scripts/helm.sh" build >/dev/null || return 1
+    HELM_DEMO_CTF="$tmp/ctf-$side" HELM_DEMO_OUT="$tmp/out-$side" SKIP_VERIFY=1 \
+      bash "$ROOT/scripts/helm.sh" download >/dev/null || return 1
+  done
+  # chart layer reproducibility is an implementation detail; revisit on OCM upgrades
+  assert_eq "$(sha256 "$tmp/out-a/chart/hello-world-0.1.0.tgz")" \
+    "$(sha256 "$tmp/out-b/chart/hello-world-0.1.0.tgz")" "chart tgz identical across builds" || return 1
+
+  local manifest created
+  manifest="$tmp/out-a/oci-layout/blobs/sha256/$(jq -r '.manifests[0].digest' "$tmp/out-a/oci-layout/index.json" | sed 's/^sha256://')"
+  created="$(jq -r '.annotations["org.opencontainers.image.created"] // ""' "$manifest")"
+  [[ -n "$created" ]] || { echo "  manifest missing org.opencontainers.image.created" >&2; return 1; }
+}
+
+test_helm_input_rejects_invalid_chart() {
+  local tmp="$1"
+  local chart="$tmp/no-chart"
+  mkdir -p "$chart"
+  echo 'replicaCount: 1' > "$chart/values.yaml"
+
+  local constructor="$tmp/bad-constructor.yaml"
+  cat > "$constructor" <<YAML
+name: github.com/lioramilbaum/helm-demo
+version: 0.1.0
+provider:
+  name: github.com/lioramilbaum
+resources:
+  - name: hello-world-chart
+    type: helmChart
+    version: 0.1.0
+    input:
+      type: helm/v1
+      path: ${chart}
+YAML
+
+  local out
+  if out="$("$OCM" add cv --repository "ctf::$tmp/bad-ctf" --constructor "$constructor" 2>&1)"; then
+    echo "  add cv should reject a directory without Chart.yaml" >&2
+    return 1
+  fi
+  assert_contains "$out" "Chart.yaml" "error names Chart.yaml"
+}
+
+test_helm_access_resolved_at_build_time() {
+  local tmp="$1"
+  local constructor="$tmp/access-constructor.yaml"
+  cat > "$constructor" <<YAML
+name: github.com/lioramilbaum/helm-demo
+version: 0.1.0
+provider:
+  name: github.com/lioramilbaum
+resources:
+  - name: hello-world-chart
+    type: helmChart
+    version: 0.1.0
+    access:
+      type: Helm/v1
+      helmRepository: http://127.0.0.1:1/charts
+      helmChart: hello-world:0.1.0
+YAML
+
+  local out
+  if out="$("$OCM" add cv --repository "ctf::$tmp/access-ctf" --constructor "$constructor" 2>&1)"; then
+    echo "  add cv should fail when the Helm repository is unreachable" >&2
+    return 1
+  fi
+  # error message may vary across OCM versions
+  assert_contains "$out" "repository index"
+}
+
+test_helm_transfer_keeps_chart_local() {
+  local tmp="$1"
+  _build_helm "$tmp"
+  "$OCM" transfer cv "$(_helm_ref "$tmp/helm-ctf")" "ctf::$tmp/helm-transferred" >/dev/null || return 1
+
+  local src_res tgt_res
+  src_res="$("$OCM" get cv "$(_helm_ref "$tmp/helm-ctf")" -o json \
+    | jq -c '.[0].component.resources[] | select(.name=="hello-world-chart")')"
+  tgt_res="$("$OCM" get cv "ctf::$tmp/helm-transferred//github.com/lioramilbaum/helm-demo:${VERSION}" -o json \
+    | jq -c '.[0].component.resources[] | select(.name=="hello-world-chart")')"
+  assert_eq "$(jq -r '.access.type' <<<"$tgt_res")" "LocalBlob/v1" "transferred access type" || return 1
+  assert_eq "$(jq -r '.access.localReference' <<<"$tgt_res")" \
+    "$(jq -r '.access.localReference' <<<"$src_res")" "localReference unchanged by transfer" || return 1
+
+  "$OCM" download resource "$(_helm_ref "$tmp/helm-ctf")" \
+    --identity name=hello-world-chart --transformer helm --output "$tmp/src-chart" >/dev/null || return 1
+  "$OCM" download resource "ctf::$tmp/helm-transferred//github.com/lioramilbaum/helm-demo:${VERSION}" \
+    --identity name=hello-world-chart --transformer helm --output "$tmp/tgt-chart" >/dev/null || return 1
+  assert_eq "$(sha256 "$tmp/src-chart/hello-world-0.1.0.tgz")" \
+    "$(sha256 "$tmp/tgt-chart/hello-world-0.1.0.tgz")" "chart tgz identical after transfer"
+}
+
+test_helm_values_from_component() {
+  local tmp="$1"
+  _build
+  bash "$ROOT/scripts/sign.sh" >/dev/null || return 1
+
+  local amd64_file arm64_file
+  amd64_file="$(TARGET_ARCH=amd64 HELM_DEMO_OUT="$tmp/helm-amd64" SKIP_VERIFY=1 \
+    bash "$ROOT/scripts/helm.sh" values)" || return 1
+  arm64_file="$(TARGET_ARCH=arm64 HELM_DEMO_OUT="$tmp/helm-arm64" SKIP_VERIFY=1 \
+    bash "$ROOT/scripts/helm.sh" values)" || return 1
+
+  local amd64_values
+  amd64_values="$(cat "$amd64_file")"
+  assert_contains "$amd64_values" "repository: docker.io/library/nginx" "values repository" || return 1
+  assert_contains "$amd64_values" "tag: 1.31-alpine" "values tag" || return 1
+  assert_contains "$amd64_values" "digest: sha256:" "values digest" || return 1
+
+  local amd64_digest arm64_digest
+  amd64_digest="$(sed -n 's/^  digest: //p' "$amd64_file")"
+  arm64_digest="$(sed -n 's/^  digest: //p' "$arm64_file")"
+  [[ -n "$amd64_digest" && "$amd64_digest" != "$arm64_digest" ]] || \
+    { echo "  amd64 and arm64 values should carry different digests" >&2; return 1; }
+}
+
+test_helm_values_requires_application_ctf() {
+  local tmp="$1" out
+  if out="$(CTF="$tmp/missing" HELM_DEMO_OUT="$tmp/helm-out" bash "$ROOT/scripts/helm.sh" values 2>&1)"; then
+    echo "  values should fail without the application CTF" >&2
+    return 1
+  fi
+  assert_contains "$out" "Application CTF not found"
+}
+
+test_helm_show_reports_chart() {
+  local tmp="$1"
+  _build_helm "$tmp"
+  "$OCM" sign cv --config "$BUILD_DIR/sign.ocmconfig" --signature default \
+    "$(_helm_ref "$tmp/helm-ctf")" < /dev/null >/dev/null || return 1
+  HELM_DEMO_CTF="$tmp/helm-ctf" HELM_DEMO_OUT="$tmp/helm-out" SKIP_VERIFY=1 \
+    bash "$ROOT/scripts/helm.sh" download >/dev/null || return 1
+
+  local out
+  out="$(HELM_DEMO_CTF="$tmp/helm-ctf" HELM_DEMO_OUT="$tmp/helm-out" bash "$ROOT/scripts/helm.sh" show)" || return 1
+  assert_contains "$out" $'resource\thello-world-chart\thelmChart\t0.1.0' "show resource line" || return 1
+  assert_contains "$out" $'access\tLocalBlob/v1\tapplication/vnd.oci.image.manifest.v1+json' "show access line" || return 1
+  assert_contains "$out" $'config\tapplication/vnd.cncf.helm.config.v1+json' "show config line" || return 1
+  assert_contains "$out" $'layer\tapplication/vnd.cncf.helm.chart.content.v1.tar+gzip\tsha256:' "show layer line" || return 1
+
+  local err
+  if err="$(HELM_DEMO_CTF="$tmp/helm-ctf" HELM_DEMO_OUT="$tmp/none" bash "$ROOT/scripts/helm.sh" show 2>&1)"; then
+    echo "  show should fail before download" >&2
+    return 1
+  fi
+  assert_contains "$err" "run scripts/helm.sh download first" "show before download"
+}
+
+test_make_helm_target() {
+  local tmp="$1"
+
+  local dry_run
+  dry_run="$(make -s --dry-run -C "$ROOT" helm 2>/dev/null)"
+  assert_contains "$dry_run" "scripts/helm.sh" "dry-run includes helm.sh" || return 1
+
+  local help_out
+  help_out="$(make -s -C "$ROOT" help 2>/dev/null)"
+  assert_contains "$help_out" "helm" "make help lists helm"
+}
+
+test_readme_documents_helm_charts() {
+  local readme="$ROOT/README.md"
+  local section
+  section="$(awk '/^## Helm charts/{f=1;next} /^## /{f=0} f' "$readme")"
+  [[ -n "$section" ]] || \
+    { echo "  README missing '## Helm charts' section" >&2; return 1; }
+
+  local checks=(
+    "helmChart"
+    "helm/v1"
+    "Helm/v1"
+    "helmRepository"
+    "--transformer helm"
+    "application/vnd.cncf.helm.chart.content.v1.tar+gzip"
+    "application/vnd.cncf.helm.config.v1+json"
+    "org.opencontainers.image.created"
+    "#3901"
+    "error downloading repository index"
+    "make helm"
+    "build/helm-ctf"
+    "values.ocm.yaml"
+    "(#plugin-system)"
+    "(#signing-and-verification)"
+    "(#transfer-and-transport)"
+    "(#version-selection)"
+    "(#kubernetes-deployer)"
+  )
+  for check in "${checks[@]}"; do
+    assert_contains "$section" "$check" "README section contains: $check" || return 1
+  done
+
+  # Drift guard: first README yaml block (minus # lines) must match the constructor.
+  local readme_yaml constructor_yaml
+  readme_yaml="$(awk '/^```yaml/{n++; f=(n==1); next} /^```/{f=0} f' <<<"$section" \
+    | grep -v '^#')"
+  constructor_yaml="$(grep -v '^#' "$ROOT/components/helm/component-constructor.yaml")"
+  [[ "$readme_yaml" = "$constructor_yaml" ]] || \
+    { echo "  README yaml block differs from components/helm/component-constructor.yaml" >&2
+      echo "  README: $readme_yaml" >&2
+      echo "  File:   $constructor_yaml" >&2
+      return 1; }
+
+  local res_section
+  res_section="$(awk '/^## Resource repositories/{f=1;next} /^## /{f=0} f' "$readme")"
+  assert_contains "$res_section" "(#helm-charts)" "Resource repositories links to helm charts"
+}
+
 # ── Run all tests ─────────────────────────────────────────────────────────────
 
 run_test "build produces application tree" test_build_produces_application_tree
@@ -3183,6 +3542,22 @@ run_test "versions requires ocm 0.19" test_versions_requires_ocm_019
 run_test "versions show reports selection" test_versions_show_reports_selection
 run_test "make versions target" test_make_versions_target
 run_test "readme documents version selection" test_readme_documents_version_selection
+run_test "helm chart resource metadata" test_helm_chart_resource_metadata
+run_test "helm chart is oci artifact" test_helm_chart_is_oci_artifact
+run_test "helm transformer extracts chart" test_helm_transformer_extracts_chart
+run_test "helm download verifies chart" test_helm_download_verifies_chart
+run_test "helm download requires signature" test_helm_download_requires_signature
+run_test "helm build from any directory" test_helm_build_from_any_directory
+run_test "helm chart version independent of component" test_helm_chart_version_independent_of_component
+run_test "helm chart layer is reproducible" test_helm_chart_layer_is_reproducible
+run_test "helm input rejects invalid chart" test_helm_input_rejects_invalid_chart
+run_test "helm access resolved at build time" test_helm_access_resolved_at_build_time
+run_test "helm transfer keeps chart local" test_helm_transfer_keeps_chart_local
+run_test "helm values from component" test_helm_values_from_component
+run_test "helm values requires application ctf" test_helm_values_requires_application_ctf
+run_test "helm show reports chart" test_helm_show_reports_chart
+run_test "make helm target" test_make_helm_target
+run_test "readme documents helm charts" test_readme_documents_helm_charts
 
 echo ""
 echo "Results: $PASS passed, $FAIL failed"

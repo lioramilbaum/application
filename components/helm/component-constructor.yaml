@@ -1,0 +1,14 @@
+# Packaged from a local chart directory with the helm/v1 input; no helm binary needed.
+# The path is absolute (${ROOT}): OCM < 0.21 resolves relative helm/v1 paths against the
+# process working directory, ignoring --working-directory (fixed upstream in #3901).
+name: github.com/lioramilbaum/helm-demo
+version: ${VERSION}
+provider:
+  name: github.com/lioramilbaum
+resources:
+  - name: hello-world-chart
+    type: helmChart
+    version: ${CHART_VERSION}
+    input:
+      type: helm/v1
+      path: ${ROOT}/components/helm/chart/hello-world

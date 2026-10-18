@@ -3,7 +3,7 @@ OCM            ?= ocm
 
 export VERSION OCM
 
-.PHONY: help build sign verify resolvers manifests deploy publish transfer-plan ownership sbom product versions lint test e2e cluster-up cluster-down e2e-run clean
+.PHONY: help build sign verify resolvers manifests deploy publish transfer-plan ownership sbom product versions helm lint test e2e cluster-up cluster-down e2e-run clean
 
 help: ## Show this help
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | \
@@ -44,6 +44,9 @@ product: build sign ## Build, sign, verify and show tree of the product componen
 
 versions: ## Build the versions demo (release + nightly CTFs) and show constraint, --latest and versioning-scheme selection (requires OCM CLI >= 0.19.0)
 	@bash scripts/versions.sh
+
+helm: ## Build, sign, verify and download the Helm chart demo component (helm/v1 input, --transformer helm); offline
+	@bash scripts/helm.sh
 
 lint: ## Lint shell scripts (if shellcheck is available)
 	@if command -v shellcheck >/dev/null 2>&1; then \
