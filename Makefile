@@ -3,7 +3,7 @@ OCM            ?= ocm
 
 export VERSION OCM
 
-.PHONY: help build sign verify resolvers manifests deploy publish transfer-plan lint test e2e cluster-up cluster-down e2e-run clean
+.PHONY: help build sign verify resolvers manifests deploy publish transfer-plan ownership lint test e2e cluster-up cluster-down e2e-run clean
 
 help: ## Show this help
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | \
@@ -32,6 +32,9 @@ publish: ## Transfer the CTF and copy external resources (--copy-resources) to a
 
 transfer-plan: ## Dry-run the publish transfer and write build/transfer-plan.json (requires OCM_REPO=...; optional TRANSFER_CONFIG=transfer.ocmconfig)
 	@TRANSFER_PLAN=1 bash scripts/publish.sh
+
+ownership: ## Build and trace the ownership demo component
+	@bash scripts/ownership.sh
 
 lint: ## Lint shell scripts (if shellcheck is available)
 	@if command -v shellcheck >/dev/null 2>&1; then \

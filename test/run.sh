@@ -274,6 +274,33 @@ _build_variant() {
   echo "$dir/variant-ctf"
 }
 
+_build_ownership() {
+  OWNERSHIP_CTF="$1/ownership-ctf" bash "$ROOT/scripts/ownership.sh" build >/dev/null
+  echo "$1/ownership-ctf"
+}
+
+# Prints the digest of the ownership manifest recorded for resource $2 in CTF $1, or nothing.
+_ownership_record_digest() {
+  local ctf="$1" name="$2" ref referrers
+  ref="$("$OCM" get cv "ctf::$ctf//github.com/lioramilbaum/ownership-demo:$VERSION" -o json \
+    | jq -r --arg n "$name" '.[0].component.resources[] | select(.name==$n) | .access.localReference')"
+  referrers="$(jq -r --arg t "${ref/:/-}" \
+    '[.artifacts[] | select(.tag==$t)] | first | .digest // ""' "$ctf/artifact-index.json")"
+  [[ -n "$referrers" ]] || return 0
+  jq -r '[.manifests[] | select(.artifactType=="application/vnd.ocm.software.ownership.v1+json")] | first | .digest // ""' \
+    "$ctf/blobs/${referrers/:/.}"
+}
+
+# Prints how many ownership manifests are listed across all referrers indexes in CTF $1.
+_ownership_record_count() {
+  local ctf="$1" digest
+  while IFS= read -r digest; do
+    jq -r '.manifests[] | select(.artifactType=="application/vnd.ocm.software.ownership.v1+json") | .digest' \
+      "$ctf/blobs/${digest/:/.}"
+  done < <(jq -r '.artifacts[] | select((.tag // "") | startswith("sha256-")) | .digest' "$ctf/artifact-index.json") \
+    | wc -l | tr -d ' '
+}
+
 _download_bundle() {
   local dest="$1"
   mkdir -p "$dest"
@@ -2292,6 +2319,119 @@ test_readme_documents_kubernetes_component_discovery() {
   [[ "$readme_yaml" = "$disk_yaml" ]] || { echo "  README YAML block differs from k8s/discovery.yaml" >&2; return 1; }
 }
 
+test_ownership_records_owner() {
+  local tmp="$1" ctf cv_json local_ref own_blob name ref tag
+  local OWNERSHIP_COMPONENT="github.com/lioramilbaum/ownership-demo"
+  ctf="$(_build_ownership "$tmp")"
+  cv_json="$("$OCM" get cv "ctf::$ctf//$OWNERSHIP_COMPONENT:$VERSION" -o json)"
+
+  # The ownership policy is a construction directive and is not persisted in the descriptor
+  assert_not_contains "$cv_json" '"options"' || return 1
+
+  local_ref="$(jq -r '.[0].component.resources[] | select(.name=="hello-world-site") | .access.localReference' <<<"$cv_json")"
+  [[ "$local_ref" == sha256:* ]] || { echo "  no localReference for hello-world-site"; return 1; }
+  own_blob="$ctf/blobs/$(_ownership_record_digest "$ctf" hello-world-site | sed 's/:/./')"
+  [[ -f "$own_blob" ]] || { echo "  no ownership record for hello-world-site"; return 1; }
+
+  assert_eq "$(jq -r .subject.digest "$own_blob")" "$local_ref" "subject digest" || return 1
+  assert_eq "$(jq -r '.annotations["software.ocm.component.name"]' "$own_blob")" \
+    "$OWNERSHIP_COMPONENT" "component name annotation" || return 1
+  assert_eq "$(jq -r '.annotations["software.ocm.component.version"]' "$own_blob")" \
+    "$VERSION" "component version annotation" || return 1
+  assert_eq "$(jq -r '.annotations["software.ocm.artifact"] | fromjson | .kind' "$own_blob")" \
+    "resource" "artifact kind annotation" || return 1
+  assert_eq "$(jq -r '.annotations["software.ocm.artifact"] | fromjson | .identity.name' "$own_blob")" \
+    "hello-world-site" "artifact identity annotation" || return 1
+
+  # Resources without a policy, and raw blobs, must not leave a referrers tag behind
+  for name in hello-world-site-untracked hello-world-manifests; do
+    ref="$(jq -r --arg n "$name" '.[0].component.resources[] | select(.name==$n) | .access.localReference' <<<"$cv_json")"
+    tag="${ref/:/-}"
+    assert_eq "$(jq -r --arg t "$tag" '[.artifacts[] | select(.tag==$t)] | length' "$ctf/artifact-index.json")" \
+      "0" "no referrers tag for $name" || return 1
+  done
+}
+
+test_ownership_record_is_deterministic() {
+  local tmp="$1" first second count
+  OWNERSHIP_CTF="$tmp/ctf1" bash "$ROOT/scripts/ownership.sh" build >/dev/null
+  OWNERSHIP_CTF="$tmp/ctf2" bash "$ROOT/scripts/ownership.sh" build >/dev/null
+
+  first="$(_ownership_record_digest "$tmp/ctf1" hello-world-site)"
+  second="$(_ownership_record_digest "$tmp/ctf2" hello-world-site)"
+  [[ -n "$first" ]] || { echo "  no ownership record in first build"; return 1; }
+  assert_eq "$second" "$first" "record digest across builds" || return 1
+
+  # Re-adding into the same CTF with --component-version-conflict-policy replace must
+  # converge to a single ownership record (idempotency), not duplicate it.
+  OWNERSHIP_CTF="$tmp/ctf1" OCM_ADD_FLAGS="--component-version-conflict-policy replace" \
+    bash "$ROOT/scripts/ownership.sh" readd >/dev/null
+  count="$(_ownership_record_count "$tmp/ctf1")"
+  assert_eq "$count" "1" "ownership records after replace" || return 1
+}
+
+test_ownership_survives_transfer() {
+  local tmp="$1" ctf target source_record target_record out
+  ctf="$(_build_ownership "$tmp")"
+  target="$tmp/target"
+
+  "$OCM" transfer cv "ctf::$ctf//github.com/lioramilbaum/ownership-demo:$VERSION" "ctf::$target" \
+    >/dev/null || { echo "  ctf-to-ctf transfer failed"; return 1; }
+
+  source_record="$(_ownership_record_digest "$ctf" hello-world-site)"
+  target_record="$(_ownership_record_digest "$target" hello-world-site)"
+  [[ -n "$source_record" ]] || { echo "  no ownership record in source CTF"; return 1; }
+  assert_eq "$target_record" "$source_record" "record digest after transfer" || return 1
+
+  out="$(OWNERSHIP_CTF="$target" bash "$ROOT/scripts/ownership.sh" trace)"
+  assert_contains "$out" "hello-world-site" || return 1
+  assert_contains "$out" "github.com/lioramilbaum/ownership-demo:$VERSION" || return 1
+}
+
+test_ownership_trace_reports_owner() {
+  local tmp="$1" ctf out
+  ctf="$(_build_ownership "$tmp")"
+  out="$(OWNERSHIP_CTF="$ctf" bash "$ROOT/scripts/ownership.sh" trace)"
+
+  grep -qF $'hello-world-site\t'"github.com/lioramilbaum/ownership-demo:$VERSION" <<<"$out" \
+    || { echo "  expected hello-world-site owner line" >&2; return 1; }
+  grep -qF $'hello-world-site-untracked\t-\tno ownership record' <<<"$out" \
+    || { echo "  expected hello-world-site-untracked no-record line" >&2; return 1; }
+  grep -qF $'hello-world-manifests\t-\tno ownership record (not an OCI manifest)' <<<"$out" \
+    || { echo "  expected hello-world-manifests not-an-oci-manifest line" >&2; return 1; }
+  assert_eq "$(wc -l <<<"$out" | tr -d ' ')" "3" "trace line count" || return 1
+}
+
+test_readme_documents_ownership() {
+  local section readme_yaml disk_yaml
+  section="$(awk '/^## Ownership/{f=1;next} /^## /{f=0} f' "$ROOT/README.md")"
+  [[ -n "$section" ]] || { echo "  README missing '## Ownership' section" >&2; return 1; }
+
+  assert_contains "$section" "https://ocm.software/docs/concepts/ownership/" || return 1
+  assert_contains "$section" "https://ocm.software/docs/how-to/add-and-verify-ownership/" || return 1
+  assert_contains "$section" "ownershipPolicy: Always" || return 1
+  assert_contains "$section" "Never" || return 1
+  assert_contains "$section" "application/vnd.ocm.software.ownership.v1+json" || return 1
+  assert_contains "$section" "software.ocm.component.name" || return 1
+  assert_contains "$section" "software.ocm.component.version" || return 1
+  assert_contains "$section" "software.ocm.artifact" || return 1
+  assert_contains "$section" "subject" || return 1
+  assert_contains "$section" "sha256-" || return 1
+  assert_contains "$section" "artifact-index.json" || return 1
+  assert_contains "$section" "oras discover" || return 1
+  assert_contains "$section" "make ownership" || return 1
+  assert_contains "$section" "401" || return 1
+  assert_contains "$section" "(#transfer-and-transport)" || return 1
+  assert_contains "$section" "(#signing-and-verification)" || return 1
+
+  assert_not_contains "$section" "ComponentVersion" || return 1
+
+  # Drift guard: the YAML block in the README must match the constructor
+  readme_yaml="$(echo "$section" | awk '/^```yaml/{f=1;next} /^```/{f=0} f' | grep -v '^#')"
+  disk_yaml="$(grep -v '^#' "$ROOT/components/ownership/component-constructor.yaml")"
+  [[ "$readme_yaml" = "$disk_yaml" ]] || { echo "  README YAML block differs from components/ownership/component-constructor.yaml" >&2; return 1; }
+}
+
 # ── Run all tests ─────────────────────────────────────────────────────────────
 
 run_test "build produces application tree" test_build_produces_application_tree
@@ -2375,6 +2515,11 @@ run_test "readme documents component identity" test_readme_documents_component_i
 run_test "manifests selects target architecture variant" test_manifests_selects_target_arch_variant
 run_test "discovery selects image variants" test_discovery_selects_image_variants
 run_test "readme documents kubernetes component discovery" test_readme_documents_kubernetes_component_discovery
+run_test "ownership records owner" test_ownership_records_owner
+run_test "ownership record is deterministic" test_ownership_record_is_deterministic
+run_test "ownership survives transfer" test_ownership_survives_transfer
+run_test "ownership trace reports owner" test_ownership_trace_reports_owner
+run_test "readme documents ownership" test_readme_documents_ownership
 
 echo ""
 echo "Results: $PASS passed, $FAIL failed"

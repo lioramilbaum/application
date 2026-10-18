@@ -594,6 +594,120 @@ Key pinning is the simplest: rotate the key by deleting the existing key files a
 verification does not require a long-lived key: `SIGNING_METHOD=sigstore make sign` uses the
 OIDC token from the CI environment.
 
+## Ownership
+
+A descriptor points at its resources, but nothing points back. A resource in a registry is
+indistinguishable from any other OCI artifact with the same digest, so nothing in the registry says
+which component owns it. OCM can record that owner. See the
+[ownership concept](https://ocm.software/docs/concepts/ownership/) and the
+[how-to](https://ocm.software/docs/how-to/add-and-verify-ownership/).
+
+### The mechanism
+
+Set `options.ownershipPolicy: Always` on a resource. The default is `Never`. The policy is a
+construction-time directive: it is not persisted in the component descriptor, so it is not signed and
+does not appear in `ocm get cv`. When OCM constructs the component, it writes a separate OCI referrer
+manifest for each opted-in resource that is an OCI manifest:
+
+- `artifactType: application/vnd.ocm.software.ownership.v1+json`
+- `subject` is the resource manifest. `subject.digest` equals the resource's `access.localReference`
+  (`sha256:` plus the resource `digest.value`).
+- An empty config and an empty layer.
+- Three annotations:
+  - `software.ocm.component.name`: the owning component, for example `github.com/lioramilbaum/ownership-demo`
+  - `software.ocm.component.version`: the owning component version
+  - `software.ocm.artifact`: a JSON string, for example `{"identity":{"name":"hello-world-site","version":"0.1.0"},"kind":"resource"}`
+
+The record is idempotent. Re-running construction converges to one record per resource.
+
+### Where the record lives
+
+- In a registry, the record is a referrer of the resource manifest, found through the Referrers API.
+- In a CTF, the referrers index is stored under the tag `sha256-<hex>` in `artifact-index.json`, where
+  `<hex>` is the digest of the resource manifest.
+
+### Which resources get a record
+
+| Resource | Policy | Record | Reason |
+|---|---|---|---|
+| `hello-world-image` | not set | none | Pushing a referrer to `docker.io/library/nginx` requires write access. Opting in without it fails with `401`. |
+| `hello-world-manifests`, `hello-world-localization`, `hello-world-config`, `deploy-bundle` | not set | none | Raw blobs (non-manifest media types) are silently skipped, even with `Always`. |
+| `hello-world-site` (ownership-demo) | `Always` | yes | OCI manifest, stored locally. |
+| `hello-world-site-untracked` (ownership-demo) | `Never` (default) | none | Not opted in. |
+| `hello-world-manifests` (ownership-demo) | `Always` | none | Raw blob, silently skipped. |
+
+### Constructor
+
+The ownership demo lives in `components/ownership/`. Its constructor is:
+
+```yaml
+# Demonstrates three ownership outcomes side by side:
+#   hello-world-site         ownershipPolicy: Always  → 1 ownership record
+#   hello-world-site-untracked  (default Never)       → no record
+#   hello-world-manifests    ownershipPolicy: Always  → no record (raw blob, silently skipped)
+name: github.com/lioramilbaum/ownership-demo
+version: ${VERSION}
+provider:
+  name: github.com/lioramilbaum
+resources:
+  - name: hello-world-site
+    type: ociArtifact
+    version: ${VERSION}
+    options:
+      ownershipPolicy: Always
+    input:
+      type: file
+      path: ${OWNERSHIP_INPUT_DIR}/hello-world-site.oci.tar.gz
+      mediaType: application/vnd.ocm.software.oci.layout.v1+tar+gzip
+  - name: hello-world-site-untracked
+    type: ociArtifact
+    version: ${VERSION}
+    input:
+      type: file
+      path: ${OWNERSHIP_INPUT_DIR}/hello-world-site-untracked.oci.tar.gz
+      mediaType: application/vnd.ocm.software.oci.layout.v1+tar+gzip
+  - name: hello-world-manifests
+    type: blob
+    version: ${VERSION}
+    options:
+      ownershipPolicy: Always
+    input:
+      type: file
+      path: ${ROOT}/components/hello-world/manifests.yaml
+      mediaType: application/yaml
+```
+
+### Trace the owner
+
+```bash
+make ownership
+```
+
+`make ownership` builds the demo component into `build/ownership-ctf` and prints the owner of each
+resource:
+
+```text
+hello-world-site	github.com/lioramilbaum/ownership-demo:0.1.0	{"identity":{"name":"hello-world-site","version":"0.1.0"},"kind":"resource"}
+hello-world-site-untracked	-	no ownership record
+hello-world-manifests	-	no ownership record (not an OCI manifest)
+```
+
+In a registry, query the referrers for the resource image instead:
+
+```bash
+oras discover "$IMAGE_REF" --artifact-type application/vnd.ocm.software.ownership.v1+json --format json | jq '.referrers[0].annotations'
+```
+
+### Trust
+
+The record is not signed. Before relying on it, confirm that `subject.digest` matches the `digest` of
+the resource in a component version you have verified. See [Signing and verification](#signing-and-verification).
+
+### Transfer
+
+A by-value record travels with its subject, so a transfer that copies the resource also copies its
+ownership record. See [Transfer and transport](#transfer-and-transport).
+
 ## Prerequisites
 
 - OCM CLI v2 ≥ 0.17.0 (publishing with `OCM_REGISTRY_USERNAME`/`OCM_REGISTRY_PASSWORD` requires ≥ 0.19.1)
@@ -625,6 +739,7 @@ make e2e-run         # run e2e against an existing cluster
 make cluster-down    # delete the kind cluster
 make e2e             # spin up kind cluster, deploy, verify pod ready, tear down (requires docker)
 make publish OCM_REPO=ghcr.io/<you>/ocm  # transfer to an OCI registry, copying external resources (e.g. the nginx image) as OCI artifacts; optional OCM_REGISTRY_USERNAME/OCM_REGISTRY_PASSWORD
+make ownership       # build the ownership demo component and trace the owner of each resource
 ```
 
 ## Consuming the component
@@ -762,6 +877,7 @@ Tests include:
 - Signing and verification: `signature covers normalized descriptor`, `readme documents signing and verification`
 - Component identity: `component identity selects artifacts`, `component identity rules enforced`, `readme documents component identity`
 - Kubernetes component discovery: `discovery selects image variants`, `readme documents kubernetes component discovery`
+- Ownership: `ownership records owner`, `ownership record is deterministic`, `ownership survives transfer`, `ownership trace reports owner`, `readme documents ownership`
 
 ## CI
 

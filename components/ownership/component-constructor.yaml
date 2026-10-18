@@ -1,0 +1,34 @@
+# Demonstrates three ownership outcomes side by side:
+#   hello-world-site         ownershipPolicy: Always  → 1 ownership record
+#   hello-world-site-untracked  (default Never)       → no record
+#   hello-world-manifests    ownershipPolicy: Always  → no record (raw blob, silently skipped)
+name: github.com/lioramilbaum/ownership-demo
+version: ${VERSION}
+provider:
+  name: github.com/lioramilbaum
+resources:
+  - name: hello-world-site
+    type: ociArtifact
+    version: ${VERSION}
+    options:
+      ownershipPolicy: Always
+    input:
+      type: file
+      path: ${OWNERSHIP_INPUT_DIR}/hello-world-site.oci.tar.gz
+      mediaType: application/vnd.ocm.software.oci.layout.v1+tar+gzip
+  - name: hello-world-site-untracked
+    type: ociArtifact
+    version: ${VERSION}
+    input:
+      type: file
+      path: ${OWNERSHIP_INPUT_DIR}/hello-world-site-untracked.oci.tar.gz
+      mediaType: application/vnd.ocm.software.oci.layout.v1+tar+gzip
+  - name: hello-world-manifests
+    type: blob
+    version: ${VERSION}
+    options:
+      ownershipPolicy: Always
+    input:
+      type: file
+      path: ${ROOT}/components/hello-world/manifests.yaml
+      mediaType: application/yaml
