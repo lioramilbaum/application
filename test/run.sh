@@ -10,6 +10,8 @@ GOLDEN_DIR="${GOLDEN_DIR:-$ROOT/.test-golden}"
 
 # OCM >= 0.19.0 is needed for --constraint and versioning schemes.
 VERSIONS_OCM="${VERSIONS_OCM:-$OCM}"
+# OCM >= 0.19.0 is needed for checksum.http.config (Wget/v1 integrity checks).
+WGET_OCM="${WGET_OCM:-$OCM}"
 
 PASS=0
 FAIL=0
@@ -41,9 +43,9 @@ assert_eq() {
 }
 
 assert_contains() {
-  local haystack="$1" needle="$2"
+  local haystack="$1" needle="$2" msg="${3:-}"
   if ! grep -qF -e "$needle" <<< "$haystack"; then
-    echo "  assert_contains failed: '$needle' not found in output" >&2
+    echo "  assert_contains failed${msg:+ ($msg)}: '$needle' not found in output" >&2
     return 1
   fi
 }
@@ -3431,6 +3433,375 @@ test_readme_documents_helm_charts() {
   assert_contains "$res_section" "(#helm-charts)" "Resource repositories links to helm charts"
 }
 
+_wget_env() {
+  local tmp="$1"
+  export WGET_DEMO_CTF="$tmp/wget-ctf" WGET_DEMO_OUT="$tmp/wget" OCM="$WGET_OCM"
+}
+
+_build_wget() {
+  local tmp="$1"
+  _wget_env "$tmp"
+  bash "$ROOT/scripts/wget.sh" build
+}
+
+_wget_ref() {
+  local ctf="$1"
+  echo "ctf::${ctf}//github.com/lioramilbaum/wget-demo:${VERSION}"
+}
+
+test_wget_resources_metadata() {
+  local tmp="$1"
+  _build_wget "$tmp" >/dev/null 2>&1 || return 1
+
+  local json rn hp
+  json="$("$OCM" get cv "$(_wget_ref "$tmp/wget-ctf")" -o json)" || return 1
+  rn="$(jq -c '.[0].component.resources[] | select(.name=="release-notes")' <<<"$json")"
+  hp="$(jq -c '.[0].component.resources[] | select(.name=="hello-world-page")' <<<"$json")"
+
+  assert_eq "$(jq -r '.access.type' <<<"$rn")" "LocalBlob/v1" "release-notes access" || return 1
+  assert_contains "$(jq -r '.access.mediaType' <<<"$rn")" "text/plain" "release-notes mediaType" || return 1
+  assert_eq "$(jq -r '.digest.hashAlgorithm' <<<"$rn")" "SHA-256" "release-notes hashAlgorithm" || return 1
+  assert_eq "$(jq -r '.digest.value' <<<"$rn")" "$(sha256 "$ROOT/components/wget/upstream/release-notes.txt")" "release-notes digest" || return 1
+
+  assert_eq "$(jq -r '.access.type' <<<"$hp")" "Wget/v1" "hello-world-page access" || return 1
+  assert_eq "$(jq -r '.access.url' <<<"$hp")" "http://127.0.0.1:18431/index.html" "hello-world-page url" || return 1
+  assert_eq "$(jq -r '.digest.hashAlgorithm' <<<"$hp")" "SHA-256" "hello-world-page hashAlgorithm" || return 1
+  assert_eq "$(jq -r '.digest.value' <<<"$hp")" "$(sha256 "$ROOT/components/wget/upstream/index.html")" "hello-world-page digest" || return 1
+}
+
+test_wget_pinned_digest_matches_upstream_file() {
+  local pinned
+  pinned="$(awk '/name: hello-world-page/{f=1} f && /value:/{gsub(/"/,"",$2); print $2; exit}' \
+    "$ROOT/components/wget/component-constructor.yaml")"
+  assert_eq "$pinned" "$(sha256 "$ROOT/components/wget/upstream/index.html")" "pinned digest equals upstream file"
+}
+
+test_wget_pinned_digest_rejects_mismatch() {
+  local tmp="$1" bad fake_digest out
+  bad="$tmp/constructor-bad.yaml"
+  fake_digest="$(printf 'a%.0s' {1..64})"
+  sed "s/value: \"[0-9a-f]*\"/value: \"$fake_digest\"/" "$ROOT/components/wget/component-constructor.yaml" > "$bad"
+
+  _wget_env "$tmp"
+  if out="$(WGET_DEMO_CONSTRUCTOR="$bad" bash "$ROOT/scripts/wget.sh" build 2>&1)"; then
+    echo "  build with a wrong pinned digest should fail" >&2
+    return 1
+  fi
+  assert_contains "$out" "digest mismatch" || assert_contains "$out" "provided digest" || return 1
+  if "$OCM" get cv "$(_wget_ref "$tmp/wget-ctf")" -o json >/dev/null 2>&1; then
+    echo "  component version should not exist after a rejected build" >&2
+    return 1
+  fi
+}
+
+test_wget_input_embeds_bytes_at_build_time() {
+  local tmp="$1" r
+  _build_wget "$tmp" >/dev/null 2>&1 || return 1
+  bash "$ROOT/scripts/wget.sh" tamper >/dev/null || return 1
+
+  "$OCM" download resource --identity name=release-notes --output "$tmp/rn" \
+    "$(_wget_ref "$tmp/wget-ctf")" >/dev/null 2>&1
+  r=$?
+  assert_eq "$r" "0" "download release-notes without a server" || return 1
+  cmp -s "$tmp/rn" "$ROOT/components/wget/upstream/release-notes.txt" || {
+    echo "  release-notes bytes differ from the upstream file" >&2
+    return 1
+  }
+}
+
+test_wget_access_needs_server_at_consume_time() {
+  local tmp="$1"
+  _build_wget "$tmp" >/dev/null 2>&1 || return 1
+  if "$OCM" download resource --identity name=hello-world-page --output "$tmp/page" \
+    "$(_wget_ref "$tmp/wget-ctf")" >/dev/null 2>&1; then
+    echo "  download of the Wget/v1 access should fail without a server" >&2
+    return 1
+  fi
+}
+
+test_wget_download_rejects_changed_upstream() {
+  local tmp="$1" out json f want got
+  _build_wget "$tmp" >/dev/null 2>&1 || return 1
+  bash "$ROOT/scripts/wget.sh" sign >/dev/null 2>&1 || return 1
+  bash "$ROOT/scripts/wget.sh" tamper >/dev/null || return 1
+
+  if out="$(bash "$ROOT/scripts/wget.sh" download 2>&1)"; then
+    echo "  download of a changed upstream should fail" >&2
+    return 1
+  fi
+  assert_contains "$out" "hello-world-page" || return 1
+  assert_contains "$out" "mismatch" || return 1
+  [[ ! -d "$tmp/wget/download" ]] || { echo "  download dir should not exist" >&2; return 1; }
+  if compgen -G "$tmp/wget/.download.*" >/dev/null; then
+    echo "  temporary download dirs were left behind" >&2
+    return 1
+  fi
+
+  bash "$ROOT/scripts/wget.sh" restore || return 1
+  SKIP_VERIFY=1 bash "$ROOT/scripts/wget.sh" download >/dev/null 2>&1 || return 1
+  json="$("$OCM" get cv "$(_wget_ref "$tmp/wget-ctf")" -o json)" || return 1
+  for f in release-notes hello-world-page; do
+    want="$(jq -r --arg r "$f" '.[0].component.resources[] | select(.name==$r) | .digest.value' <<<"$json")"
+    got="$(sha256 "$tmp/wget/download/$f")"
+    assert_eq "$got" "$want" "$f digest after restore" || return 1
+  done
+}
+
+test_wget_download_requires_signature() {
+  local tmp="$1"
+  _build_wget "$tmp" >/dev/null 2>&1 || return 1
+  if bash "$ROOT/scripts/wget.sh" download >/dev/null 2>&1; then
+    echo "  download of an unsigned component should fail" >&2
+    return 1
+  fi
+  [[ ! -d "$tmp/wget/download" ]] || { echo "  download dir should not exist" >&2; return 1; }
+}
+
+test_wget_checksum_require_rejects_unadvertised() {
+  local tmp="$1" out
+  _wget_env "$tmp"
+  if out="$(WGET_DEMO_DIGEST=none WGET_DEMO_CHECKSUM_MODE=Require bash "$ROOT/scripts/wget.sh" build 2>&1)"; then
+    echo "  Require should reject a response without a checksum" >&2
+    return 1
+  fi
+  assert_contains "$out" "no advertised checksum" || assert_contains "$out" "onMissing" || return 1
+  WGET_DEMO_DIGEST=sha-256 WGET_DEMO_CHECKSUM_MODE=Require bash "$ROOT/scripts/wget.sh" build >/dev/null 2>&1 || {
+    echo "  Require should accept an advertised sha-256 checksum" >&2
+    return 1
+  }
+}
+
+test_wget_checksum_matrix() {
+  local tmp="$1" out line
+  _wget_env "$tmp"
+  out="$(bash "$ROOT/scripts/wget.sh" checksum 2>/dev/null)" || return 1
+  assert_eq "$(wc -l <<<"$out" | tr -d ' ')" "7" "matrix has 7 rows" || return 1
+
+  local rows=(
+    $'none\tSkip\tok\tSHA-256'
+    $'none\tPrefer\tok\tSHA-256'
+    $'none\tRequire\tfail\tmissing-checksum'
+    $'sha-256\tRequire\tok\tSHA-256'
+    $'wrong\tPrefer\tfail\tmismatch'
+    $'wrong\tSkip\tok\tSHA-256'
+    $'sha-512\tPrefer\tfail\talgorithm-mismatch'
+  )
+  for line in "${rows[@]}"; do
+    assert_contains "$out" "$line" "matrix row" || return 1
+  done
+}
+
+test_wget_rejects_invalid_checksum_mode() {
+  local tmp="$1" out
+  _wget_env "$tmp"
+  if out="$(WGET_DEMO_CHECKSUM_MODE=Requre bash "$ROOT/scripts/wget.sh" build 2>&1)"; then
+    echo "  an invalid checksum mode should fail" >&2
+    return 1
+  fi
+  assert_contains "$out" "must be Require, Prefer or Skip"
+}
+
+test_wget_credentials_resolved_by_url_identity() {
+  local tmp="$1" port=18432 pid cfg creds_cfg constructor out
+  mkdir -p "$tmp/auth-root"
+  printf 'hello\n' > "$tmp/auth-root/secret.txt"
+  printf 'none\n' > "$tmp/digest-mode"
+  printf 'demo:s3cret\n' > "$tmp/auth"
+  python3 -I "$ROOT/scripts/upstream-server.py" --root "$tmp/auth-root" --port "$port" \
+    --digest-file "$tmp/digest-mode" --auth-file "$tmp/auth" >"$tmp/auth-server.log" 2>&1 &
+  pid=$!
+  # shellcheck disable=SC2064
+  trap "kill $pid 2>/dev/null || true" EXIT
+  for _ in $(seq 1 20); do
+    curl -fsS --max-time 1 "http://127.0.0.1:$port/-/ready" >/dev/null 2>&1 && break
+    sleep 0.25
+  done
+
+  cfg="$tmp/empty.ocmconfig"
+  printf 'type: generic.config.ocm.software/v1\nconfigurations: []\n' > "$cfg"
+  constructor="$tmp/auth-constructor.yaml"
+  cat > "$constructor" <<EOF
+name: github.com/lioramilbaum/wget-auth-demo
+version: 0.1.0
+provider:
+  name: github.com/lioramilbaum
+resources:
+  - name: secret
+    type: blob
+    version: 0.1.0
+    input:
+      type: Wget/v1
+      url: http://127.0.0.1:$port/secret.txt
+      mediaType: text/plain
+EOF
+
+  if out="$("$WGET_OCM" add cv --repository "ctf::$tmp/auth-ctf" --constructor "$constructor" --config "$cfg" 2>&1)"; then
+    echo "  unauthenticated fetch should fail" >&2
+    return 1
+  fi
+  assert_contains "$out" "401" || return 1
+
+  creds_cfg="$tmp/creds.ocmconfig"
+  cat > "$creds_cfg" <<'EOF'
+type: generic.config.ocm.software/v1
+configurations:
+  - type: credentials.config.ocm.software
+    consumers:
+      - identity:
+          type: Wget
+          hostname: 127.0.0.1
+          port: "18432"
+          scheme: http
+        credentials:
+          - type: WgetCredentials/v1
+            username: demo
+            password: s3cret
+EOF
+  "$WGET_OCM" add cv --repository "ctf::$tmp/auth-ctf-ok" --constructor "$constructor" --config "$creds_cfg" >/dev/null 2>&1 || {
+    echo "  authenticated fetch should succeed" >&2
+    return 1
+  }
+}
+
+test_wget_transfer_reference_vs_copy() {
+  local tmp="$1" out
+  _build_wget "$tmp" >/dev/null 2>&1 || return 1
+  bash "$ROOT/scripts/wget.sh" sign >/dev/null 2>&1 || return 1
+
+  out="$(bash "$ROOT/scripts/wget.sh" transfer 2>&1)" || return 1
+  assert_contains "$out" $'reference\thello-world-page\texternal\tWget/v1' || return 1
+  assert_contains "$out" $'copy\thello-world-page\texternal\tLocalBlob/v1' || return 1
+  "$OCM" verify cv --config "$tmp/verify.ocmconfig" --signature default \
+    "ctf::$tmp/wget/transfer-copy-ctf//github.com/lioramilbaum/wget-demo:$VERSION" </dev/null >/dev/null 2>&1 || {
+    echo "  signature on the transferred copy should verify" >&2
+    return 1
+  }
+}
+
+test_wget_transfer_copy_enforces_digest() {
+  local tmp="$1" out
+  _build_wget "$tmp" >/dev/null 2>&1 || return 1
+  bash "$ROOT/scripts/wget.sh" sign >/dev/null 2>&1 || return 1
+  bash "$ROOT/scripts/wget.sh" tamper >/dev/null || return 1
+
+  if out="$(bash "$ROOT/scripts/wget.sh" transfer 2>&1)"; then
+    echo "  transfer of a changed upstream should fail" >&2
+    return 1
+  fi
+  assert_contains "$out" "digest mismatch"
+}
+
+test_wget_requires_ocm_019() {
+  local tmp="$1" out
+  cat > "$tmp/fake-ocm" <<'EOF'
+#!/usr/bin/env bash
+if [[ "${1:-}" == version ]]; then
+  printf 'OCM CLI (Open Component Model v2)\n  Version:  0.17.0\n'
+  exit 0
+fi
+exit 1
+EOF
+  chmod 0755 "$tmp/fake-ocm"
+  WGET_OCM="$tmp/fake-ocm"
+  _wget_env "$tmp"
+
+  if out="$(bash "$ROOT/scripts/wget.sh" show 2>&1)"; then
+    echo "  wget.sh should refuse OCM 0.17.0" >&2
+    return 1
+  fi
+  assert_contains "$out" "requires OCM CLI >= 0.19.0"
+}
+
+test_wget_server_port_in_use() {
+  local tmp="$1" port="${WGET_DEMO_PORT:-18431}" pid out
+  _wget_env "$tmp"
+  # SO_REUSEADDR: a port left in TIME_WAIT by earlier tests must not stop the listener from binding.
+  python3 -I -c "import socket,time; s=socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1); s.bind(('127.0.0.1', $port)); s.listen(); time.sleep(60)" &
+  pid=$!
+  # shellcheck disable=SC2064
+  trap "kill $pid 2>/dev/null || true" EXIT
+  # Poll with a TCP connect (not HTTP) since the holder is a raw socket, not an HTTP server.
+  local i=0
+  while ! (exec 3<>"/dev/tcp/127.0.0.1/$port") 2>/dev/null; do
+    i=$((i+1)); [[ $i -lt 10 ]] || { echo "port holder never bound" >&2; return 1; }
+    sleep 0.3
+  done
+  exec 3>&- 2>/dev/null || true
+
+  if out="$(bash "$ROOT/scripts/wget.sh" build 2>&1)"; then
+    echo "  build should fail when the port is in use" >&2
+    return 1
+  fi
+  assert_contains "$out" "upstream server failed to start"
+}
+
+test_wget_show_reports_resources() {
+  local tmp="$1" out
+  _build_wget "$tmp" >/dev/null 2>&1 || return 1
+  out="$(bash "$ROOT/scripts/wget.sh" show 2>&1)" || return 1
+  assert_contains "$out" $'release-notes\tlocal\tLocalBlob/v1\tSHA-256' || return 1
+  assert_contains "$out" $'hello-world-page\texternal\tWget/v1\tSHA-256'
+}
+
+test_make_wget_target() {
+  local tmp="$1"
+
+  local dry_run
+  dry_run="$(make -s --dry-run -C "$ROOT" wget 2>/dev/null)"
+  assert_contains "$dry_run" "scripts/wget.sh" "dry-run includes wget.sh" || return 1
+
+  local help_out
+  help_out="$(make -s -C "$ROOT" help 2>/dev/null)"
+  assert_contains "$help_out" "wget" "make help lists wget"
+}
+
+test_readme_documents_http_resources() {
+  local readme="$ROOT/README.md"
+  local section
+  section="$(awk '/^## HTTP resources/{f=1;next} /^## /{f=0} f' "$readme")"
+  [[ -n "$section" ]] || \
+    { echo "  README missing '## HTTP resources' section" >&2; return 1; }
+
+  local checks=(
+    "Wget/v1"
+    "HTTP/v1"
+    "checksum.http.config.ocm.software/v1alpha1"
+    "Require"
+    "Prefer"
+    "Skip"
+    "Content-Digest"
+    "WgetCredentials/v1"
+    "localblob.uploader.transfer.config.ocm.software/v1alpha1"
+    "digest mismatch"
+    "only SHA-256 is supported"
+    "#3889"
+    "make wget"
+    "build/wget-ctf"
+    "(#resource-repositories)"
+    "(#signing-and-verification)"
+    "(#credential-system)"
+    "(#transfer-and-transport)"
+  )
+  for check in "${checks[@]}"; do
+    assert_contains "$section" "$check" "README section contains: $check" || return 1
+  done
+
+  # Drift guard: first README yaml block (minus # lines) must match the constructor.
+  local readme_yaml constructor_yaml
+  readme_yaml="$(awk '/^```yaml/{n++; f=(n==1); next} /^```/{f=0} f' <<<"$section" \
+    | grep -v '^#')"
+  constructor_yaml="$(grep -v '^#' "$ROOT/components/wget/component-constructor.yaml")"
+  [[ "$readme_yaml" = "$constructor_yaml" ]] || \
+    { echo "  README yaml block differs from components/wget/component-constructor.yaml" >&2
+      echo "  README: $readme_yaml" >&2
+      echo "  File:   $constructor_yaml" >&2
+      return 1; }
+
+  local res_section
+  res_section="$(awk '/^## Resource repositories/{f=1;next} /^## /{f=0} f' "$readme")"
+  assert_contains "$res_section" "(#http-resources)" "Resource repositories links to http resources"
+}
+
 # ── Run all tests ─────────────────────────────────────────────────────────────
 
 run_test "build produces application tree" test_build_produces_application_tree
@@ -3558,6 +3929,24 @@ run_test "helm values requires application ctf" test_helm_values_requires_applic
 run_test "helm show reports chart" test_helm_show_reports_chart
 run_test "make helm target" test_make_helm_target
 run_test "readme documents helm charts" test_readme_documents_helm_charts
+run_test "wget resource metadata" test_wget_resources_metadata
+run_test "wget pinned digest matches upstream file" test_wget_pinned_digest_matches_upstream_file
+run_test "wget pinned digest rejects mismatch" test_wget_pinned_digest_rejects_mismatch
+run_test "wget input embeds bytes at build time" test_wget_input_embeds_bytes_at_build_time
+run_test "wget access needs server at consume time" test_wget_access_needs_server_at_consume_time
+run_test "wget download rejects changed upstream" test_wget_download_rejects_changed_upstream
+run_test "wget download requires signature" test_wget_download_requires_signature
+run_test "wget checksum require rejects unadvertised" test_wget_checksum_require_rejects_unadvertised
+run_test "wget checksum matrix" test_wget_checksum_matrix
+run_test "wget rejects invalid checksum mode" test_wget_rejects_invalid_checksum_mode
+run_test "wget credentials resolved by url identity" test_wget_credentials_resolved_by_url_identity
+run_test "wget transfer reference vs copy" test_wget_transfer_reference_vs_copy
+run_test "wget transfer copy enforces digest" test_wget_transfer_copy_enforces_digest
+run_test "wget requires ocm 0.19" test_wget_requires_ocm_019
+run_test "wget server port in use" test_wget_server_port_in_use
+run_test "wget show reports resources" test_wget_show_reports_resources
+run_test "make wget target" test_make_wget_target
+run_test "readme documents http resources" test_readme_documents_http_resources
 
 echo ""
 echo "Results: $PASS passed, $FAIL failed"

@@ -1,0 +1,24 @@
+name: github.com/lioramilbaum/wget-demo
+version: ${VERSION}
+provider:
+  name: github.com/lioramilbaum
+resources:
+  - name: release-notes
+    type: blob
+    version: ${VERSION}
+    input:
+      type: Wget/v1
+      url: ${WGET_DEMO_URL}/release-notes.txt
+      mediaType: text/plain
+  - name: hello-world-page
+    type: blob
+    version: ${VERSION}
+    relation: external
+    digest:
+      hashAlgorithm: SHA-256
+      normalisationAlgorithm: genericBlobDigest/v1
+      value: "c0bbf62451fea3d4cd065e104995118b3c9861473d4f5cffed42203d650f76f4"
+    access:
+      type: Wget/v1
+      url: ${WGET_DEMO_URL}/index.html
+      mediaType: text/html
