@@ -187,7 +187,7 @@ Note: `--config -` (stdin) requires OCM CLI ≥ 0.19.1. With an older CLI, put t
 
 A component reference does not carry a repository address. The repository on the command line locates the root component only. Resolvers map component name patterns to repositories, so `get cv --recursive`, `transfer cv --recursive`, and `add cv` can find the components that a component references. An explicit repository in a `componentReferences` entry always wins for that component. See the [OCM resolvers](https://ocm.software/docs/concepts/resolvers/) documentation for the full model.
 
-This repository has no `componentReferences`, so its own build scripts never consult a resolver. Resolvers matter to consumers that reference `github.com/lioramilbaum/application`.
+The application component itself has no `componentReferences`. `scripts/product.sh` uses `build/resolvers.ocmconfig` to resolve the application when building the product component — see [Component References](#component-references). Resolvers also matter to consumers that reference `github.com/lioramilbaum/application`.
 
 A resolver entry takes these fields, under `type: resolvers.config.ocm.software/v1alpha1` nested inside a `generic.config.ocm.software/v1` block:
 
@@ -283,7 +283,7 @@ See [Transfer and transport](#transfer-and-transport) for the dry-run → review
 
 A [canonical repository](https://ocm.software/docs/concepts/canonical-component-repositories/)
 holds every component of a component graph, so `get cv --recursive` and `transfer cv --recursive`
-need no resolvers. This component has no references, so any repository that holds it is canonical.
+need no resolvers. This component has no references, so any repository that holds it is canonical. The product component in `build/product-ctf/` is not canonical; `ocm transfer cv --recursive` into a fresh repository makes both components canonical — see [Component References](#component-references).
 
 `make build` always writes it to `build/ctf/` in the
 [Common Transport Format](https://ocm.software/docs/concepts/transfer-and-transport/) (CTF),
@@ -465,8 +465,10 @@ Discovery is read-only. It downloads nothing and gives no signature guarantee. S
 unsigned `tier` label is fine for queries but not for trust decisions; see
 [Signing and verification](#signing-and-verification).
 
-This component has no `componentReferences`, so its graph is just the root and `referenceSelector`
-has nothing to match here. It matters for consumers that reference `application`; see
+The application component has no `componentReferences`, so its graph is just the root and
+`referenceSelector` has nothing to match here. A `Component` that tracks
+`github.com/lioramilbaum/product` would have `application` in its reference graph, which is what
+`referenceSelector` applies to; see [Component References](#component-references) and
 [Resolvers](#resolvers).
 
 ```yaml
@@ -568,6 +570,7 @@ covers only the fields that survive normalization:
 | Resource `name`, `version`, `type`, `relation`, `digest` | yes | `make verify` fails with `digest mismatch` |
 | Source `name`, `version`, `type` | yes | `make verify` fails with `digest mismatch` |
 | Label with `signing: true` | yes | `make verify` fails with `digest mismatch` |
+| Component reference (`name`, `componentName`, `version`, `digest`) | yes | `make verify` fails with `digest mismatch` |
 | Label **without** `signing: true` | **no** | `make verify` still passes |
 | Resource and source `access` | **no** | `make verify` still passes |
 | `component.repositoryContexts` | **no** | `make verify` still passes (enables transfer) |
@@ -783,6 +786,53 @@ ocm download resource ctf::./build/ctf//github.com/lioramilbaum/application:0.1.
 
 Related: [Signing and verification](#signing-and-verification) · [Transfer and transport](#transfer-and-transport)
 
+## Component References
+
+A **component reference** (`componentReferences`) declares that one component version depends on another by name, version, and digest. OCM calls the set of a product's component versions its [Software Bill of Delivery](https://ocm.software/docs/how-to/model-products/).
+
+This repository adds `github.com/lioramilbaum/product` — a product component that references the `github.com/lioramilbaum/application` component:
+
+```yaml
+name: github.com/lioramilbaum/product
+version: ${VERSION}
+provider:
+  name: github.com/lioramilbaum
+componentReferences:
+  - name: application
+    componentName: github.com/lioramilbaum/application
+    version: ${VERSION}
+```
+
+When `ocm add cv` builds the product, it resolves the reference and computes a `digest` from the application's normalized descriptor (`jsonNormalisation/v4alpha1`, SHA-256). The product's own signature then covers that digest, so `ocm verify` detects any change to the product descriptor — including any change to `references[0].digest`, `name`, `componentName`, or `version`.
+
+```sh
+make product   # runs make build → make sign → scripts/product.sh (build, sign, verify, tree)
+```
+
+The product component is built into a separate `build/product-ctf/` that holds only the product descriptor. The referenced application is resolved at build time via `build/resolvers.ocmconfig` but is not copied in (use `--external-component-version-copy-policy copy-or-fail` to copy it).
+
+### Trust limitation
+
+`ocm verify cv` checks only the **product's own signature**. It does not fetch the referenced application or compare `references[0].digest` against the live descriptor. A tampered `build/ctf` (for example a provider change) still passes `make product verify`. Observed on OCM 0.17 and unchanged through 0.19.1 (see `bindings/go/cli/cmd/verify/component-version/cmd.go` in the upstream `github.com/open-component-model/ocm` repository).
+
+Mitigations:
+
+- Verify each component independently: `make verify` on the application, then `bash scripts/product.sh verify` on the product.
+- Use `ocm transfer cv --recursive`, which **does** enforce reference digests: it fetches the referenced component, recomputes the normalized digest, and fails with `digest mismatch` if they differ.
+
+```sh
+# Recursive transfer enforces reference digests at copy time:
+ocm transfer cv \
+  ctf::./build/product-ctf//github.com/lioramilbaum/product:0.1.0 \
+  ctf::./build/release-ctf \
+  --recursive \
+  --config build/resolvers.ocmconfig
+```
+
+The transfer produces a canonical repository containing both components. `make verify` and `bash scripts/product.sh verify` both succeed against it without a resolver config.
+
+Related: [Resolvers](#resolvers) · [Canonical component repositories](#canonical-component-repositories) · [Signing and verification](#signing-and-verification) · [Transfer and transport](#transfer-and-transport)
+
 ## Prerequisites
 
 - OCM CLI v2 ≥ 0.17.0 (publishing with `OCM_REGISTRY_USERNAME`/`OCM_REGISTRY_PASSWORD` requires ≥ 0.19.1)
@@ -816,6 +866,7 @@ make e2e             # spin up kind cluster, deploy, verify pod ready, tear down
 make publish OCM_REPO=ghcr.io/<you>/ocm  # transfer to an OCI registry, copying external resources (e.g. the nginx image) as OCI artifacts; optional OCM_REGISTRY_USERNAME/OCM_REGISTRY_PASSWORD
 make ownership       # build the ownership demo component and trace the owner of each resource
 make sbom            # regenerate the CycloneDX SBOM (build/sbom/hello-world.cdx.json); also run by make build
+make product         # build, sign and verify the product component that references the application
 ```
 
 ## Consuming the component
