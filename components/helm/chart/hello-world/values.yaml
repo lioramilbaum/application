@@ -1,0 +1,7 @@
+replicaCount: 1
+
+image:
+  repository: docker.io/library/nginx
+  tag: 1.31-alpine
+  # set from the OCM component: bash scripts/helm.sh values
+  digest: ""
