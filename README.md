@@ -1528,6 +1528,97 @@ The signature is stored in the descriptor, so `ocm transfer cv` carries it to th
 
 Related: [Signing and verification](#signing-and-verification) · [Certificate-chain signing](#certificate-chain-signing) · [Transfer and transport](#transfer-and-transport) · [Credential system](#credential-system)
 
+## Local OCI registry
+
+This demo runs a plain-HTTP OCI registry on your machine, pushes a demo component to it, signs and verifies it there, and pulls it back. The registry is a `registry:2` container on `127.0.0.1`, so it needs Docker. `build` does not.
+
+### Demo component
+
+`scripts/registry.sh` writes this constructor to `build/registry/component-constructor.yaml`:
+
+```yaml
+# Demo component for local OCI registry demo.
+name: github.com/lioramilbaum/registry-demo
+version: ${VERSION}
+provider:
+  name: github.com/lioramilbaum
+resources:
+  - name: release-notes
+    type: blob
+    version: ${VERSION}
+    input:
+      type: UTF8/v1
+      text: "github.com/lioramilbaum/registry-demo ${VERSION}"
+```
+
+```bash
+make registry                   # start the registry, then build, push, sign, verify, pull and show
+bash scripts/registry.sh stop   # remove the container and its data
+```
+
+### Start a registry
+
+`scripts/registry.sh start` runs `registry:2@sha256:a3d8…` (pinned by digest) as container `ocm-demo-registry`, published on `127.0.0.1:5055`. It is idempotent: when the container already runs, it waits until the registry answers and prints the repository. Override the defaults with `REGISTRY_NAME`, `REGISTRY_HOST`, `REGISTRY_PORT` and `REGISTRY_PATH`.
+
+### Push
+
+`scripts/registry.sh build` writes the component to `build/registry-ctf` with `ocm add cv`. `scripts/registry.sh push` copies it into the registry with `ocm transfer cv`:
+
+```bash
+ocm transfer cv ctf::build/registry-ctf//github.com/lioramilbaum/registry-demo:0.1.0 oci::http://127.0.0.1:5055/ocm
+```
+
+The registry has no authentication, so no credentials are needed. Authenticated registries need a consumer configuration; see [Credential system](#credential-system).
+
+### Repository identity
+
+The registry address for the component is `oci::http://127.0.0.1:5055/ocm//github.com/lioramilbaum/registry-demo:0.1.0`:
+
+- `oci::` is the optional repository type prefix.
+- `http://` selects plain HTTP. Without it OCM uses HTTPS, which fails against this registry.
+- `127.0.0.1:5055` is the registry host and port.
+- `/ocm` is the base path. It is part of the repository identity.
+- `//` separates the repository from the component name.
+- `:0.1.0` is the component version. OCI stores it as the tag `0.1.0` of `ocm/component-descriptors/github.com/lioramilbaum/registry-demo`.
+
+The registry catalog lists that repository:
+
+```bash
+curl http://127.0.0.1:5055/v2/_catalog
+# {"repositories":["ocm/component-descriptors/github.com/lioramilbaum/registry-demo"]}
+```
+
+`scripts/registry.sh show` prints the catalog, the component from `ocm get cv`, its resources and its signatures.
+
+### Sign and verify
+
+`scripts/registry.sh sign` runs `ocm sign cv` against the registry copy and stores the signature `default` in its descriptor. `scripts/registry.sh verify` runs `ocm verify cv` with `build/verify.ocmconfig`. The source CTF stays unsigned.
+
+Signing the registry copy again fails with `signature "default" already exists`.
+
+### Re-push overwrites signatures
+
+A second `ocm transfer cv` from the unsigned CTF replaces the registry descriptor and drops the registry signature (OCM 0.19.1). Sign again after each push. See [Transfer and transport](#transfer-and-transport) for how transfers carry signatures.
+
+### Pull
+
+`scripts/registry.sh pull` verifies the signature, then runs `ocm download resource` for `release-notes` and checks its sha256 against the descriptor digest. It transfers the component back into a CTF with `ocm transfer cv`:
+
+```text
+build/registry/download/release-notes
+ctf::build/registry/pulled-ctf
+```
+
+### Cleanup
+
+`bash scripts/registry.sh stop` removes the container and the registry data. The next `start` begins with an empty registry.
+
+### Limitations
+
+- Plain HTTP only, with no authentication and no TLS. Use it on `127.0.0.1` for demos, not for shared registries.
+- Registry data is lost on `stop`.
+- `start`, `stop` and `make registry` require a running Docker daemon. `build` works without Docker. `push`, `sign`, `verify`, `pull` and `show` need the registry to be running.
+
 ## Prerequisites
 
 - OCM CLI v2 ≥ 0.17.0 (publishing with `OCM_REGISTRY_USERNAME`/`OCM_REGISTRY_PASSWORD` requires ≥ 0.19.1); `make versions`, `make wget` and `make git` require ≥ 0.19.0
@@ -1541,7 +1632,7 @@ Related: [Signing and verification](#signing-and-verification) · [Certificate-c
 - `gpg` (GnuPG 2.2 or newer, for `make gpg`)
 - `kubectl` (for deploying and for `make manifests`, which uses `kubectl kustomize`)
 - `helm` is optional, only for rendering the downloaded chart with `helm template`
-- `docker` (for `make e2e` or `make e2e-run` only)
+- `docker` (for `make e2e` or `make e2e-run` only, and for `make registry`)
 - Docker Hub access for `make build` and `make test` (to resolve `nginx:1.31-alpine`)
 
 OCM CLI and kind are provided by the devcontainer image. Outside the devcontainer, put `ocm` and `kind` on your PATH.
@@ -1572,6 +1663,7 @@ make wget      # build, sign, verify and download the HTTP resources demo (Wget/
 make pki        # create a demo CA, build, sign with a PEM certificate-chain signature and verify against the root CA; offline
 make git        # build, sign, verify and audit the Git source demo (Git/v1 source, access and input); offline, requires OCM >= 0.19.0
 make gpg        # build, sign, verify and download the GPG (OpenPGP) signing demo; offline
+make registry   # start a local registry, push, sign, verify, pull and show the demo component; requires Docker
 ```
 
 ## Consuming the component
@@ -1717,6 +1809,7 @@ Tests include:
 - Certificate-chain signing: `pki signature is pem encoded`, `pki verifier pins only root`, `pki scenarios`, `pki rotation keeps verifier config`, `pki certs are reused`, `pki reissues expiring leaf`, `pki signature covers descriptor`, `pki signature survives transfer`, `pki verify requires signature`, `pki own pki requires all vars`, `pki own pki uses supplied files`, `pki show reports chain`, `make pki target`, `readme documents certificate-chain signing`
 - Git repositories: `git resource metadata`, `git ref pinned at build time`, `git upstream is deterministic`, `git snapshot matches commit tree`, `git digest covers tree not commit`, `git signature binds commit label`, `git audit matches snapshot`, `git audit rejects wrong commit label`, `git audit requires signature`, `git scenarios`, `git transfer carries snapshot only`, `git uploader cannot copy git access`, `git own repo requires both vars`, `git own repo uses supplied repository`, `git rejects sha256 repository`, `git requires ocm 0.19`, `git show reports provenance`, `make git target`, `readme documents git repositories`
 - Version selection: `versions lists newest first`, `versions constraint filters`, `versions latest includes prereleases by default`, `versions scheme orders build numbers`, `versions without scheme misorders`, `versions reference requires semver`, `versions requires ocm 0.19`, `versions show reports selection`, `make versions target`, `readme documents version selection`
+- Local OCI registry: `registry start creates container`, `registry push component`, `registry get cv from registry`, `registry sign in registry`, `registry verify signed component`, `registry pull downloads resource`, `registry stop removes container`, `registry push idempotent`, `registry transfer preserves resources`, `registry unsigned verify fails`, `registry oci url format` (these report SKIP without Docker); `registry docker available`, `make registry target` and `readme documents local oci registry` always run
 
 ## CI
 

@@ -15,20 +15,27 @@ WGET_OCM="${WGET_OCM:-$OCM}"
 # OCM >= 0.19.0 is needed for Git/v1 input and access.
 GIT_OCM="${GIT_OCM:-$OCM}"
 GPG_OCM="${GPG_OCM:-$OCM}"
+REGISTRY_OCM="${REGISTRY_OCM:-$OCM}"
 
 PASS=0
 FAIL=0
+SKIP=0
 
+# A test exits 77 to report SKIP (for example when Docker is unavailable).
 run_test() {
-  local name="$1"
+  local name="$1" rc=0
   local tmp
   tmp=$(mktemp -d)
   # shellcheck disable=SC2064
   trap "rm -rf '$tmp'" EXIT
   # shellcheck disable=SC2030
-  if (set -euo pipefail; export BUILD_DIR="$tmp" CTF="$tmp/ctf" DEPLOY_DIR="$tmp/deploy"; "$2" "$tmp"); then
+  (set -euo pipefail; export BUILD_DIR="$tmp" CTF="$tmp/ctf" DEPLOY_DIR="$tmp/deploy"; "$2" "$tmp") || rc=$?
+  if [[ $rc -eq 0 ]]; then
     echo "PASS: $name"
     PASS=$((PASS + 1))
+  elif [[ $rc -eq 77 ]]; then
+    echo "  SKIP: $name"
+    SKIP=$((SKIP + 1))
   else
     echo "FAIL: $name"
     FAIL=$((FAIL + 1))
@@ -4800,6 +4807,308 @@ test_readme_documents_gpg_signing() {
   assert_contains "$sv" "(#gpg-signing)" "Trust models link to GPG signing"
 }
 
+# ── Local OCI registry ──────────────────────────────────────────────────────
+
+_docker_available() { command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; }
+
+_registry_env() {
+  export REGISTRY_DEMO_CTF="$1/registry-ctf" \
+         REGISTRY_DEMO_OUT="$1/registry" \
+         OCM="$REGISTRY_OCM" \
+         REGISTRY_NAME=ocm-demo-registry-test \
+         REGISTRY_HOST=127.0.0.1 \
+         REGISTRY_PORT="${REGISTRY_TEST_PORT:-5056}" \
+         REGISTRY_PATH=ocm
+}
+
+# Starts an empty registry on the test port; returns 77 (SKIP) without Docker.
+_registry_fresh() {
+  _docker_available || { echo "  skip: docker not available"; return 77; }
+  _registry_env "$1"
+  docker rm -f "$REGISTRY_NAME" >/dev/null 2>&1 || true
+  trap 'docker rm -f "$REGISTRY_NAME" >/dev/null 2>&1 || true' EXIT
+  bash "$ROOT/scripts/registry.sh" start >/dev/null
+}
+
+_registry_ref() {
+  echo "oci::http://${REGISTRY_HOST:-127.0.0.1}:${REGISTRY_PORT:-5056}/ocm//github.com/lioramilbaum/registry-demo:${VERSION:-0.1.0}"
+}
+
+_registry_ctf_ref() {
+  echo "ctf::${REGISTRY_DEMO_CTF}//github.com/lioramilbaum/registry-demo:${VERSION:-0.1.0}"
+}
+
+_registry_pulled_ref() {
+  echo "ctf::${REGISTRY_DEMO_OUT}/pulled-ctf//github.com/lioramilbaum/registry-demo:${VERSION:-0.1.0}"
+}
+
+test_registry_docker_available() {
+  local tmp="$1" stub err
+  grep -qE 'registry:2@sha256:[0-9a-f]{64}' "$ROOT/scripts/registry.sh" || \
+    { echo "  registry.sh does not pin registry:2 by digest" >&2; return 1; }
+
+  # A docker that cannot reach a daemon must make the demo skip with exit 0.
+  stub="$tmp/docker-stub"
+  mkdir -p "$stub"
+  printf '#!/bin/sh\nexit 1\n' > "$stub/docker"
+  chmod +x "$stub/docker"
+  err="$tmp/skip.err"
+  PATH="$stub:$PATH" bash "$ROOT/scripts/registry.sh" >/dev/null 2>"$err" || \
+    { echo "  registry.sh should exit 0 without Docker" >&2; return 1; }
+  assert_contains "$(cat "$err")" "skip: Docker is not available" || return 1
+  if docker inspect ocm-demo-registry >/dev/null 2>&1; then
+    echo "  container ocm-demo-registry should not exist" >&2
+    return 1
+  fi
+}
+
+test_registry_start_creates_container() {
+  local tmp="$1" id_before id_after
+  _registry_fresh "$tmp" || return $?
+  assert_eq "$(docker inspect -f '{{.State.Running}}' "$REGISTRY_NAME")" "true" "container running" || return 1
+  assert_contains "$(docker port "$REGISTRY_NAME" 5000/tcp)" ":5056" "port published" || return 1
+  curl -fsS "http://127.0.0.1:5056/v2/" >/dev/null || { echo "  registry not reachable" >&2; return 1; }
+  id_before="$(docker inspect -f '{{.Id}}' "$REGISTRY_NAME")"
+  bash "$ROOT/scripts/registry.sh" start >/dev/null || return 1
+  id_after="$(docker inspect -f '{{.Id}}' "$REGISTRY_NAME")"
+  assert_eq "$id_after" "$id_before" "second start keeps the container"
+}
+
+test_registry_push_component_to_registry() {
+  local tmp="$1" catalog tags
+  _registry_fresh "$tmp" || return $?
+  bash "$ROOT/scripts/registry.sh" build >/dev/null 2>&1 || return 1
+  bash "$ROOT/scripts/registry.sh" push >/dev/null 2>&1 || return 1
+  catalog="$(curl -fsS "http://127.0.0.1:5056/v2/_catalog")" || return 1
+  assert_contains "$catalog" "component-descriptors/github.com/lioramilbaum/registry-demo" "catalog lists component" || return 1
+  tags="$(curl -fsS "http://127.0.0.1:5056/v2/ocm/component-descriptors/github.com/lioramilbaum/registry-demo/tags/list")" || return 1
+  assert_contains "$tags" '"0.1.0"' "tag 0.1.0"
+}
+
+test_registry_get_cv_from_registry() {
+  local tmp="$1" cv show
+  _registry_fresh "$tmp" || return $?
+  bash "$ROOT/scripts/registry.sh" build >/dev/null 2>&1 || return 1
+  bash "$ROOT/scripts/registry.sh" push >/dev/null 2>&1 || return 1
+  cv="$("$OCM" get cv "$(_registry_ref)" -o json 2>/dev/null)" || return 1
+  assert_eq "$(jq -r '.[0].component.name' <<<"$cv")" "github.com/lioramilbaum/registry-demo" "name" || return 1
+  assert_eq "$(jq -r '.[0].component.version' <<<"$cv")" "${VERSION:-0.1.0}" "version" || return 1
+  assert_eq "$(jq -r '.[0].component.provider' <<<"$cv")" "github.com/lioramilbaum" "provider" || return 1
+  show="$(bash "$ROOT/scripts/registry.sh" show 2>/dev/null)" || return 1
+  assert_contains "$show" $'component\tgithub.com/lioramilbaum/registry-demo' "show component row" || return 1
+  assert_contains "$show" $'resource\trelease-notes' "show resource row"
+}
+
+test_registry_sign_in_registry() {
+  local tmp="$1" sigs ctf_sigs out
+  _registry_fresh "$tmp" || return $?
+  bash "$ROOT/scripts/registry.sh" build >/dev/null 2>&1 || return 1
+  bash "$ROOT/scripts/registry.sh" push >/dev/null 2>&1 || return 1
+  bash "$ROOT/scripts/registry.sh" sign >/dev/null 2>&1 || return 1
+
+  sigs="$("$OCM" get cv "$(_registry_ref)" -o json 2>/dev/null | jq -r '[.[0].signatures[]?.name] | join(",")')" || return 1
+  assert_eq "$sigs" "default" "registry descriptor signature" || return 1
+
+  ctf_sigs="$("$OCM" get cv "$(_registry_ctf_ref)" -o json 2>/dev/null | jq -r '(.[0].signatures // []) | length')" || return 1
+  assert_eq "$ctf_sigs" "0" "source CTF stays unsigned" || return 1
+
+  if out="$(bash "$ROOT/scripts/registry.sh" sign 2>&1)"; then
+    echo "  second sign should fail" >&2
+    return 1
+  fi
+  assert_contains "$out" "already exists" || return 1
+}
+
+test_registry_verify_signed_component() {
+  local tmp="$1" wrong out
+  _registry_fresh "$tmp" || return $?
+  bash "$ROOT/scripts/registry.sh" build >/dev/null 2>&1 || return 1
+  bash "$ROOT/scripts/registry.sh" push >/dev/null 2>&1 || return 1
+  bash "$ROOT/scripts/registry.sh" sign >/dev/null 2>&1 || return 1
+  bash "$ROOT/scripts/registry.sh" verify >/dev/null 2>&1 || { echo "  verify should pass" >&2; return 1; }
+
+  wrong="$(_wrong_verify_config "$tmp")"
+  if out="$(VERIFY_CONFIG="$wrong" bash "$ROOT/scripts/registry.sh" verify 2>&1)"; then
+    echo "  verify with wrong key should fail" >&2
+    return 1
+  fi
+  assert_contains "$out" "SIGNATURE VERIFICATION FAILED"
+}
+
+test_registry_pull_downloads_resource() {
+  local tmp="$1" desc actual
+  _registry_fresh "$tmp" || return $?
+  bash "$ROOT/scripts/registry.sh" build >/dev/null 2>&1 || return 1
+  bash "$ROOT/scripts/registry.sh" push >/dev/null 2>&1 || return 1
+  bash "$ROOT/scripts/registry.sh" sign >/dev/null 2>&1 || return 1
+  bash "$ROOT/scripts/registry.sh" pull >/dev/null 2>&1 || return 1
+
+  assert_eq "$(cat "$REGISTRY_DEMO_OUT/download/release-notes")" \
+    "github.com/lioramilbaum/registry-demo ${VERSION:-0.1.0}" "release notes content" || return 1
+  desc="$("$OCM" get cv "$(_registry_ref)" -o json 2>/dev/null | jq -r '.[0].component.resources[] | select(.name=="release-notes") | .digest.value')" || return 1
+  actual="$(shasum -a 256 "$REGISTRY_DEMO_OUT/download/release-notes" | cut -d' ' -f1)"
+  assert_eq "$actual" "$desc" "downloaded sha256 matches descriptor" || return 1
+
+  "$OCM" verify cv --config "$BUILD_DIR/verify.ocmconfig" --signature default \
+    "$(_registry_pulled_ref)" </dev/null >/dev/null 2>&1 || { echo "  pulled CTF should verify" >&2; return 1; }
+}
+
+test_registry_stop_removes_container() {
+  local tmp="$1"
+  _registry_fresh "$tmp" || return $?
+  bash "$ROOT/scripts/registry.sh" build >/dev/null 2>&1 || return 1
+  bash "$ROOT/scripts/registry.sh" push >/dev/null 2>&1 || return 1
+  bash "$ROOT/scripts/registry.sh" stop >/dev/null || return 1
+  if docker inspect "$REGISTRY_NAME" >/dev/null 2>&1; then
+    echo "  container should be removed by stop" >&2
+    return 1
+  fi
+  if curl -fsS "http://127.0.0.1:5056/v2/" >/dev/null 2>&1; then
+    echo "  registry should not answer after stop" >&2
+    return 1
+  fi
+  bash "$ROOT/scripts/registry.sh" stop >/dev/null || { echo "  second stop should exit 0" >&2; return 1; }
+  bash "$ROOT/scripts/registry.sh" start >/dev/null || return 1
+  # Registry data is lost with the container, so the component is gone.
+  if "$OCM" get cv "$(_registry_ref)" -o json >/dev/null 2>&1 </dev/null; then
+    echo "  component should not survive stop and start" >&2
+    return 1
+  fi
+}
+
+test_registry_push_idempotent() {
+  local tmp="$1" tags sigs out
+  _registry_fresh "$tmp" || return $?
+  bash "$ROOT/scripts/registry.sh" build >/dev/null 2>&1 || return 1
+  bash "$ROOT/scripts/registry.sh" push >/dev/null 2>&1 || return 1
+  bash "$ROOT/scripts/registry.sh" push >/dev/null 2>&1 || return 1
+  tags="$(curl -fsS "http://127.0.0.1:5056/v2/ocm/component-descriptors/github.com/lioramilbaum/registry-demo/tags/list" | jq -c '.tags')" || return 1
+  assert_eq "$tags" '["0.1.0"]' "one tag after two pushes" || return 1
+
+  bash "$ROOT/scripts/registry.sh" sign >/dev/null 2>&1 || return 1
+  bash "$ROOT/scripts/registry.sh" push >/dev/null 2>&1 || return 1
+  # OCM 0.19.1: re-pushing from the unsigned CTF drops the registry signature.
+  sigs="$("$OCM" get cv "$(_registry_ref)" -o json 2>/dev/null | jq -r '(.[0].signatures // []) | length')" || return 1
+  assert_eq "$sigs" "0" "re-push drops signature" || return 1
+
+  if out="$(bash "$ROOT/scripts/registry.sh" verify 2>&1)"; then
+    echo "  verify should fail after re-push" >&2
+    return 1
+  fi
+}
+
+test_registry_transfer_preserves_resources() {
+  local tmp="$1" jq_digest jq_sig ctf_digest reg_digest pulled_digest reg_sig pulled_sig
+  _registry_fresh "$tmp" || return $?
+  bash "$ROOT/scripts/registry.sh" build >/dev/null 2>&1 || return 1
+  bash "$ROOT/scripts/registry.sh" push >/dev/null 2>&1 || return 1
+  bash "$ROOT/scripts/registry.sh" sign >/dev/null 2>&1 || return 1
+  bash "$ROOT/scripts/registry.sh" pull >/dev/null 2>&1 || return 1
+
+  jq_digest='.[0].component.resources[] | select(.name=="release-notes") | .digest.value'
+  ctf_digest="$("$OCM" get cv "$(_registry_ctf_ref)" -o json 2>/dev/null | jq -r "$jq_digest")" || return 1
+  reg_digest="$("$OCM" get cv "$(_registry_ref)" -o json 2>/dev/null | jq -r "$jq_digest")" || return 1
+  pulled_digest="$("$OCM" get cv "$(_registry_pulled_ref)" -o json 2>/dev/null | jq -r "$jq_digest")" || return 1
+  assert_eq "$reg_digest" "$ctf_digest" "registry resource digest" || return 1
+  assert_eq "$pulled_digest" "$ctf_digest" "pulled resource digest" || return 1
+
+  jq_sig='.[0].signatures[] | select(.name=="default") | .digest.value'
+  reg_sig="$("$OCM" get cv "$(_registry_ref)" -o json 2>/dev/null | jq -r "$jq_sig")" || return 1
+  pulled_sig="$("$OCM" get cv "$(_registry_pulled_ref)" -o json 2>/dev/null | jq -r "$jq_sig")" || return 1
+  assert_eq "$pulled_sig" "$reg_sig" "pulled signature digest"
+}
+
+test_registry_unsigned_verify_fails() {
+  local tmp="$1" out
+  _registry_fresh "$tmp" || return $?
+  bash "$ROOT/scripts/registry.sh" build >/dev/null 2>&1 || return 1
+  bash "$ROOT/scripts/registry.sh" push >/dev/null 2>&1 || return 1
+
+  if out="$(bash "$ROOT/scripts/registry.sh" verify 2>&1)"; then
+    echo "  verify should fail on an unsigned component" >&2
+    return 1
+  fi
+  assert_contains "$out" "no signatures found" || return 1
+
+  if bash "$ROOT/scripts/registry.sh" pull >/dev/null 2>&1; then
+    echo "  pull should fail on an unsigned component" >&2
+    return 1
+  fi
+  if [[ -e "$REGISTRY_DEMO_OUT/download" ]]; then
+    echo "  no download should be left after a failed pull" >&2
+    return 1
+  fi
+}
+
+test_registry_oci_url_format() {
+  local tmp="$1" out
+  _registry_fresh "$tmp" || return $?
+  out="$(bash "$ROOT/scripts/registry.sh" start 2>/dev/null)" || return 1
+  assert_eq "$out" "oci::http://127.0.0.1:5056/ocm" "start prints repository" || return 1
+  bash "$ROOT/scripts/registry.sh" build >/dev/null 2>&1 || return 1
+  bash "$ROOT/scripts/registry.sh" push >/dev/null 2>&1 || return 1
+
+  # Without http:// OCM assumes HTTPS and fails.
+  if out="$("$OCM" get cv "oci::127.0.0.1:5056/ocm//github.com/lioramilbaum/registry-demo:${VERSION:-0.1.0}" -o json 2>&1 </dev/null)"; then
+    echo "  scheme-less oci:: URL should fail" >&2
+    return 1
+  fi
+  assert_contains "$out" "https://" "scheme-less URL falls back to https" || return 1
+
+  # The http:// scheme alone is enough without the oci:: prefix.
+  "$OCM" get cv "http://127.0.0.1:5056/ocm//github.com/lioramilbaum/registry-demo:${VERSION:-0.1.0}" -o json >/dev/null 2>&1 </dev/null || \
+    { echo "  http:// URL without oci:: should succeed" >&2; return 1; }
+
+  # Another path is another, empty repository.
+  if "$OCM" get cv "oci::http://127.0.0.1:5056/other//github.com/lioramilbaum/registry-demo:${VERSION:-0.1.0}" -o json >/dev/null 2>&1 </dev/null; then
+    echo "  component under another path should not exist" >&2
+    return 1
+  fi
+}
+
+test_make_registry_target() {
+  local dry_run help_out
+  dry_run="$(make -s --dry-run -C "$ROOT" registry 2>/dev/null)" || return 1
+  assert_contains "$dry_run" "scripts/registry.sh" "dry-run includes registry.sh" || return 1
+  help_out="$(make -s -C "$ROOT" help 2>/dev/null)" || return 1
+  assert_contains "$help_out" "registry" "make help lists registry" || return 1
+  assert_contains "$help_out" "Docker" "make help mentions Docker"
+}
+
+test_readme_documents_local_oci_registry() {
+  local readme="$ROOT/README.md" section check readme_yaml constructor_yaml
+
+  grep -qxF '## Local OCI registry' "$readme" || \
+    { echo "  README missing '## Local OCI registry' heading" >&2; return 1; }
+  section="$(awk '/^## Local OCI registry/{f=1;next} /^## /{f=0} f' "$readme")"
+
+  local checks=(
+    "oci::http://127.0.0.1:5055/ocm"
+    "component-descriptors"
+    "ocm transfer cv"
+    "ocm sign cv"
+    "ocm verify cv"
+    "ocm get cv"
+    "ocm download resource"
+    "registry:2@sha256:"
+    "make registry"
+    "scripts/registry.sh stop"
+    "already exists"
+    "(#credential-system)"
+  )
+  for check in "${checks[@]}"; do
+    assert_contains "$section" "$check" "README section contains: $check" || return 1
+  done
+
+  # Drift guard: the first yaml block must match the constructor written by scripts/registry.sh.
+  readme_yaml="$(awk '/^```yaml/{n++; f=(n==1); next} /^```/{f=0} f' <<<"$section")"
+  constructor_yaml="$(sed -n "/<<'REGISTRY_CONSTRUCTOR_EOF'/,/^REGISTRY_CONSTRUCTOR_EOF\$/p" "$ROOT/scripts/registry.sh" | sed '1d;$d')"
+  [[ "$readme_yaml" == "$constructor_yaml" ]] || {
+    echo "  README yaml block differs from the constructor in scripts/registry.sh" >&2
+    return 1
+  }
+}
+
 # ── Run all tests ─────────────────────────────────────────────────────────────
 
 run_test "build produces application tree" test_build_produces_application_tree
@@ -4999,7 +5308,21 @@ run_test "gpg own keys use supplied files" test_gpg_own_keys_use_supplied_files
 run_test "gpg show reports key" test_gpg_show_reports_key
 run_test "make gpg target" test_make_gpg_target
 run_test "readme documents gpg signing" test_readme_documents_gpg_signing
+run_test "registry docker available" test_registry_docker_available
+run_test "registry start creates container" test_registry_start_creates_container
+run_test "registry push component" test_registry_push_component_to_registry
+run_test "registry get cv from registry" test_registry_get_cv_from_registry
+run_test "registry sign in registry" test_registry_sign_in_registry
+run_test "registry verify signed component" test_registry_verify_signed_component
+run_test "registry pull downloads resource" test_registry_pull_downloads_resource
+run_test "registry stop removes container" test_registry_stop_removes_container
+run_test "registry push idempotent" test_registry_push_idempotent
+run_test "registry transfer preserves resources" test_registry_transfer_preserves_resources
+run_test "registry unsigned verify fails" test_registry_unsigned_verify_fails
+run_test "registry oci url format" test_registry_oci_url_format
+run_test "make registry target" test_make_registry_target
+run_test "readme documents local oci registry" test_readme_documents_local_oci_registry
 
 echo ""
-echo "Results: $PASS passed, $FAIL failed"
+echo "Results: $PASS passed, $FAIL failed, $SKIP skipped"
 [[ $FAIL -eq 0 ]]
