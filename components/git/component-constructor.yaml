@@ -1,4 +1,4 @@
-# Three ways to record a Git repository (see README "Git repositories"):
+# Three ways to record a Git repository (see docs/git-repositories.md "Git repositories"):
 #   hello-world-source           source, Git/v1 access: URL and commit, no digest
 #   hello-world-source-tracked   resource, Git/v1 access: ref pinned to a commit at build time, digest
 #   hello-world-source-snapshot  resource, Git/v1 input: files stored in the component, commit in a signed label
