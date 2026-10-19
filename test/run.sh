@@ -15,6 +15,8 @@ WGET_OCM="${WGET_OCM:-$OCM}"
 # OCM >= 0.19.0 is needed for Git/v1 input and access.
 GIT_OCM="${GIT_OCM:-$OCM}"
 GPG_OCM="${GPG_OCM:-$OCM}"
+# OCM >= 0.19.0 is needed for --plugin-directory and external plugins.
+PLUGIN_OCM="${PLUGIN_OCM:-$OCM}"
 
 PASS=0
 FAIL=0
@@ -4800,6 +4802,188 @@ test_readme_documents_gpg_signing() {
   assert_contains "$sv" "(#gpg-signing)" "Trust models link to GPG signing"
 }
 
+# ── Plugin demo ──────────────────────────────────────────────────────────────
+
+# _plugin_env <tmp>
+_plugin_env() {
+  export PLUGIN_DEMO_CTF="$1/plugin-ctf" \
+         PLUGIN_DEMO_OUT="$1/plugin" \
+         PLUGIN_DIR="$1/plugins" \
+         OCM="$PLUGIN_OCM"
+}
+
+# _plugin_ref <ctf>
+_plugin_ref() {
+  echo "ctf::${1}//github.com/lioramilbaum/plugin-demo:${VERSION}"
+}
+
+test_plugin_capabilities_returns_access_type() {
+  local tmp="$1" caps t required
+  _plugin_env "$tmp"
+  caps="$(python3 -I -S "$ROOT/components/plugin/demo-store/demo-store-plugin" capabilities)" || return 1
+  for t in resourceRepository digestProcessorRepository; do
+    jq -e --arg t "$t" \
+      '.capabilities[] | select(.type==$t) | .supportedAccessTypes[] | select(.type=="demo-store/v1alpha1")' \
+      <<<"$caps" >/dev/null || { echo "  $t does not serve demo-store/v1alpha1" >&2; return 1; }
+  done
+  required="$(jq -r '.capabilities[0].supportedAccessTypes[0].jsonSchema' <<<"$caps" | base64 -d \
+    | jq -r '.required | join(",")')" || return 1
+  assert_contains "$required" "storeId" || return 1
+  assert_contains "$required" "blobId"
+}
+
+test_plugin_healthz_responds() {
+  local tmp="$1" out
+  _plugin_env "$tmp"
+  bash "$ROOT/scripts/plugin.sh" install >/dev/null || return 1
+  out="$(bash "$ROOT/scripts/plugin.sh" probe)" || return 1
+  assert_contains "$out" $'healthz\t200' || return 1
+  assert_contains "$out" $'location\thttp+unix://'
+}
+
+test_plugin_build_registers_access_type() {
+  local tmp="$1" cv r digest
+  _plugin_env "$tmp"
+  bash "$ROOT/scripts/plugin.sh" build >/dev/null || return 1
+  cv="$("$OCM" --plugin-directory "$PLUGIN_DIR" get cv "$(_plugin_ref "$PLUGIN_DEMO_CTF")" -o json)" || return 1
+  r="$(jq -c '.[0].component.resources[] | select(.name=="demo-blob")' <<<"$cv")"
+  assert_eq "$(jq -r .access.type <<<"$r")" "demo-store/v1alpha1" "access type" || return 1
+  assert_eq "$(jq -r .relation <<<"$r")" "external" "relation" || return 1
+  assert_eq "$(jq -r .digest.normalisationAlgorithm <<<"$r")" "genericBlobDigest/v1" "normalisation" || return 1
+  digest="$(jq -r .digest.value <<<"$r")"
+  [[ "$digest" =~ ^[0-9a-f]{64}$ ]] || { echo "  demo-blob has no sha256 digest: '$digest'" >&2; return 1; }
+}
+
+test_plugin_download_returns_blob() {
+  local tmp="$1" path i
+  _plugin_env "$tmp"
+  bash "$ROOT/scripts/plugin.sh" build >/dev/null || return 1
+  path="$(bash "$ROOT/scripts/plugin.sh" download)" || return 1
+  printf 'hello from demo-store\n' | cmp -s - "$path" || { echo "  downloaded blob differs" >&2; return 1; }
+  # The plugin exits once its parent (ocm) is gone; poll for that instead of sleeping.
+  # shellcheck disable=SC2034
+  for i in $(seq 1 30); do
+    pgrep -f "$PLUGIN_DIR/demo-store-plugin" >/dev/null || return 0
+    sleep 0.1
+  done
+  echo "  demo-store plugin still running 3s after download" >&2
+  return 1
+}
+
+test_plugin_identity_endpoint() {
+  local tmp="$1" out identity
+  _plugin_env "$tmp"
+  bash "$ROOT/scripts/plugin.sh" install >/dev/null || return 1
+  out="$(bash "$ROOT/scripts/plugin.sh" probe)" || return 1
+  identity="$(awk -F'\t' '$1=="identity"{print $2}' <<<"$out")"
+  assert_eq "$(jq -Sc . <<<"$identity")" \
+    "$(jq -Sc . <<<'{"identity":{"storeId":"my-store","type":"demo-store/v1alpha1"}}')" "identity row" || return 1
+  out="$(bash "$ROOT/scripts/plugin.sh" scenarios no-credentials)" || return 1
+  assert_contains "$out" "unauthorized"
+}
+
+test_plugin_missing_plugin_fails_gracefully() {
+  local tmp="$1" out
+  _plugin_env "$tmp"
+  bash "$ROOT/scripts/plugin.sh" build >/dev/null || return 1
+  mkdir -p "$tmp/empty"
+  if out="$(PLUGIN_DIR="$tmp/empty" bash "$ROOT/scripts/plugin.sh" download 2>&1)"; then
+    echo "  download without the plugin should fail" >&2
+    return 1
+  fi
+  assert_contains "$out" "failed to get plugin for typ" || return 1
+  [[ ! -e "$tmp/plugin/download" ]] || { echo "  download directory left behind" >&2; return 1; }
+  # build installs the plugin into PLUGIN_DIR itself, so it registers even from an empty directory
+  PLUGIN_DIR="$tmp/empty" bash "$ROOT/scripts/plugin.sh" build >/dev/null || return 1
+  [[ -x "$tmp/empty/demo-store-plugin" ]] || { echo "  build did not install the plugin" >&2; return 1; }
+}
+
+test_plugin_show_lists_capabilities() {
+  local tmp="$1" out
+  _plugin_env "$tmp"
+  bash "$ROOT/scripts/plugin.sh" build >/dev/null || return 1
+  out="$(bash "$ROOT/scripts/plugin.sh" show)" || return 1
+  assert_contains "$out" $'capability\tresourceRepository\tdemo-store/v1alpha1' || return 1
+  assert_contains "$out" $'capability\tdigestProcessorRepository\tdemo-store/v1alpha1' || return 1
+  assert_contains "$out" $'registered\tdemo-store-plugin\t' || return 1
+  assert_contains "$out" $'resource\tdemo-blob\tdemo-store/v1alpha1'
+}
+
+test_plugin_scenarios_correct_response() {
+  local tmp="$1" out expected
+  _plugin_env "$tmp"
+  out="$(bash "$ROOT/scripts/plugin.sh" scenarios correct missing-plugin config-locations \
+    unknown-blob invalid-spec no-credentials)" || return 1
+  expected="$(printf '%s\n' \
+    $'correct\tok\tok\t-' \
+    $'missing-plugin\tfail\t-\tno-plugin' \
+    $'config-locations\tfail\t-\tno-plugin' \
+    $'unknown-blob\tfail\t-\tnot-found' \
+    $'invalid-spec\tfail\t-\tinvalid-spec' \
+    $'no-credentials\tfail\t-\tunauthorized')"
+  assert_eq "$out" "$expected" "scenario rows"
+}
+
+test_plugin_scenarios_malformed_response() {
+  local tmp="$1" out expected
+  _plugin_env "$tmp"
+  out="$(bash "$ROOT/scripts/plugin.sh" scenarios malformed-capabilities malformed-response \
+    plugin-error unsupported-location tampered-content)" || return 1
+  expected="$(printf '%s\n' \
+    $'malformed-capabilities\tfail\t-\tbad-capabilities' \
+    $'malformed-response\tfail\t-\tmalformed-response' \
+    $'plugin-error\tfail\t-\tplugin-error' \
+    $'unsupported-location\tfail\t-\tunsupported-location' \
+    $'tampered-content\tok\tfail\tdigest-mismatch')"
+  assert_eq "$out" "$expected" "scenario rows"
+}
+
+test_plugin_loglevel_debug_shows_registration() {
+  local tmp="$1" err
+  _plugin_env "$tmp"
+  bash "$ROOT/scripts/plugin.sh" build >/dev/null || return 1
+  err="$("$OCM" --plugin-directory "$PLUGIN_DIR" --loglevel debug get cv "$(_plugin_ref "$PLUGIN_DEMO_CTF")" \
+    2>&1 >/dev/null)" || return 1
+  assert_contains "$err" 'msg="discovered plugin" id=demo-store-plugin' || return 1
+  assert_contains "$err" 'msg="adding resource repository plugin"' || return 1
+  assert_contains "$err" 'msg="adding digest processor plugin"'
+}
+
+test_make_plugin_target() {
+  local dry_run help_out
+  dry_run="$(make -s --dry-run -C "$ROOT" plugin 2>/dev/null)"
+  assert_contains "$dry_run" "scripts/plugin.sh" "dry-run includes plugin.sh" || return 1
+  help_out="$(make -s -C "$ROOT" help 2>/dev/null)"
+  assert_contains "$help_out" "plugin" "make help lists plugin"
+}
+
+test_readme_documents_plugin_demo() {
+  local readme="$ROOT/README.md" section block expected check
+  section="$(awk '/^## Plugin system/{f=1;next} /^## /{f=0} f' "$readme")"
+  [[ -n "$section" ]] || { echo "  README missing '## Plugin system' section" >&2; return 1; }
+
+  local checks=(
+    "/healthz"
+    "/identity"
+    "/resource/get"
+    "/resource/digest/process"
+    "http+unix://"
+    "supportedAccessTypes"
+    "jsonSchema"
+    "Authorization"
+    "make plugin"
+    "components/plugin/demo-store/demo-store-plugin"
+  )
+  for check in "${checks[@]}"; do
+    assert_contains "$section" "$check" || return 1
+  done
+
+  # The first YAML block in the section is the demo constructor, without its comment line.
+  block="$(awk '/^```yaml/{f=1;next} /^```/{if (f) exit} f' <<<"$section")"
+  expected="$(grep -v '^#' "$ROOT/components/plugin/component-constructor.yaml")"
+  assert_eq "$block" "$expected" "demo component YAML block"
+}
+
 # ── Run all tests ─────────────────────────────────────────────────────────────
 
 run_test "build produces application tree" test_build_produces_application_tree
@@ -4999,6 +5183,18 @@ run_test "gpg own keys use supplied files" test_gpg_own_keys_use_supplied_files
 run_test "gpg show reports key" test_gpg_show_reports_key
 run_test "make gpg target" test_make_gpg_target
 run_test "readme documents gpg signing" test_readme_documents_gpg_signing
+run_test "plugin capabilities returns access type" test_plugin_capabilities_returns_access_type
+run_test "plugin healthz responds" test_plugin_healthz_responds
+run_test "plugin build registers access type" test_plugin_build_registers_access_type
+run_test "plugin download returns blob" test_plugin_download_returns_blob
+run_test "plugin identity endpoint" test_plugin_identity_endpoint
+run_test "plugin missing plugin fails gracefully" test_plugin_missing_plugin_fails_gracefully
+run_test "plugin show lists capabilities" test_plugin_show_lists_capabilities
+run_test "plugin scenarios correct response" test_plugin_scenarios_correct_response
+run_test "plugin scenarios malformed response" test_plugin_scenarios_malformed_response
+run_test "plugin loglevel debug shows registration" test_plugin_loglevel_debug_shows_registration
+run_test "make plugin target" test_make_plugin_target
+run_test "readme documents plugin demo" test_readme_documents_plugin_demo
 
 echo ""
 echo "Results: $PASS passed, $FAIL failed"

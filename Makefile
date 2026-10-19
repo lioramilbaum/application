@@ -3,7 +3,7 @@ OCM            ?= ocm
 
 export VERSION OCM
 
-.PHONY: help build sign verify resolvers manifests deploy publish transfer-plan ownership sbom product versions helm wget pki git gpg lint test e2e cluster-up cluster-down e2e-run clean
+.PHONY: help build sign verify resolvers manifests deploy publish transfer-plan ownership sbom product versions helm wget pki git gpg plugin lint test e2e cluster-up cluster-down e2e-run clean
 
 help: ## Show this help
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | \
@@ -59,6 +59,9 @@ git: ## Create a demo Git repository, build, sign, verify and audit the Git sour
 
 gpg: ## Create throwaway GPG keys, build, sign (OpenPGP), verify and download the GPG signing demo (GPG/v1alpha1 signature); offline (requires gpg 2.2 or newer, jq)
 	@bash scripts/gpg.sh
+
+plugin: ## Install the demo-store Python plugin, build the plugin demo (demo-store/v1alpha1 access type served by an external plugin), download through it and show its capabilities; offline (requires python3, curl)
+	@bash scripts/plugin.sh
 
 lint: ## Lint shell scripts (if shellcheck is available)
 	@if command -v shellcheck >/dev/null 2>&1; then \
