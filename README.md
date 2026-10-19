@@ -183,6 +183,102 @@ To keep credentials permanently, add the same consumer block to `~/.ocmconfig` u
 
 Note: `--config -` (stdin) requires OCM CLI ≥ 0.19.1. With an older CLI, put the consumer block in `~/.ocmconfig` and omit the environment variables.
 
+### Consumer identities
+
+Each identity type carries its own attributes, and each one selects a credential type. The table lists the types of OCM 0.19.1 that this repository's operations use:
+
+| Identity type | Attributes | Credential type |
+|---|---|---|
+| `OCIRegistry` | `hostname`, `scheme`, `port`, `path` | `OCICredentials/v1` |
+| `Wget` (aliases `HTTP`, `Wget/v1`) | `hostname`, `scheme`, `port`, `path` | `WgetCredentials/v1` |
+| `HelmChartRepository` | `hostname`, `scheme`, `port`, `path` | `HelmHTTPCredentials/v1` |
+| `GitHubRepository` | `hostname`, `scheme`, `port`, `path` | `GitHubCredentials/v1` |
+| `Git` | `hostname`, `scheme`, `port`, `path` | `GitCredentials/v1` |
+| `S3` | `hostname`, `scheme`, `port`, `path` | `S3Credentials/v1` |
+| `RSA/v1alpha1` | `algorithm`, `signature` | `RSACredentials/v1` |
+| `GPG/v1alpha1` | `signature` | `GPGCredentials/v1alpha1` |
+
+A generic `Credentials/v1` entry with `properties:` also works for any identity. A typed credential beats it for the same identity.
+
+### Matching
+
+An exact match wins in any position of the file. Otherwise, every entry that matches is a candidate, and OCM picks one of them:
+
+- `path` uses `path.Match`, so `*` stays within one segment (`team-a/*` matches `team-a/report.txt` but not `team-a/nested/report.txt`).
+- An entry without `path` matches every path.
+- `hostname` must be equal. There are no hostname wildcards.
+- `scheme` is compared only when both the entry and the request set it.
+- `port` defaults to 80 or 443 from the scheme when it is not set.
+- Type aliases: `HTTP` = `Wget/v1` = `Wget`.
+
+### Wget identity
+
+A `Wget` identity has four attributes: `hostname`, `port` (a string, so quote it), `scheme`, and `path` (the URL path without the leading `/`). This entry supplies credentials for `http://127.0.0.1:18441/team-a/report.txt`:
+
+```yaml
+type: generic.config.ocm.software/v1
+configurations:
+  - type: credentials.config.ocm.software
+    consumers:
+      - identity:
+          type: Wget
+          hostname: 127.0.0.1
+          port: '18441'
+          scheme: http
+          path: 'team-a/*'
+        credentials:
+          - type: WgetCredentials/v1
+            username: team-a-user
+            password: demo-password
+```
+
+### Chaining configs
+
+Repeat `--config` to merge several files. They are merged in order, and the last entry wins for a duplicate identity. A flat generic config holds several `credentials.config.ocm.software` entries. OCM ignores nested generic configurations and prints a warning for each one. `ocm get config --config <file> ...` shows the merged result, and it prints the secrets in clear.
+
+### Demo
+
+`components/credentials/component-constructor.yaml` is the component that the demo builds. It wraps the OCI layout from `components/oci`:
+
+```yaml
+# Demo component for credential system demo.
+# scripts/credentials.sh copies this file next to components/oci/hello-oci-multiarch.oci.tar
+# before building, because file inputs cannot escape the constructor directory.
+name: github.com/lioramilbaum/credentials-demo
+version: ${VERSION}
+provider:
+  name: github.com/lioramilbaum
+resources:
+  - name: hello-image
+    type: ociImage
+    version: ${VERSION}
+    input:
+      type: file
+      path: ./hello-oci-multiarch.oci.tar
+      mediaType: application/vnd.ocm.software.oci.layout.v1+tar
+```
+
+```bash
+make credentials   # build the CTF, list identity types, match rules, chains and scenarios
+```
+
+`scripts/credentials.sh` starts a local recording server (`scripts/upstream-server.py --auth-log`) on `127.0.0.1:18441`, which you can change with `CREDENTIALS_DEMO_PORT`. The server logs each request with the username it saw, so the demo reports the credential that OCM selected. The subcommands are:
+
+- `build`: builds the component into `build/credentials-ctf`.
+- `show`: prints one row per identity type and the parsed examples in `build/credentials/examples/`.
+- `match`: runs one probe per matching rule (exact versus wildcard, `path`, Wget attributes, type aliases).
+- `chain`: merges several config files, checks which one wins, and checks generic and nested configs.
+- `scenarios`: runs the OCI and type-mismatch cases, duplicate identities, typed versus generic credentials, and overlapping wildcards.
+
+Each row prints the selected credential as `none` when no entry matched, or `error` when the probe did not reach the server.
+
+### Limitations
+
+- When more than one non-exact entry matches, OCM picks one at random. In the demo's `overlap-wildcards` scenario the choice was skewed, so do not rely on which one wins.
+- A credential type name that is not registered, such as `OCIRegistryCredentials`, made OCM 0.19.1 hang while it waited for an OIDC callback. Use the registered names from the table above.
+- A Wget request sends its credentials with the first request. An OCI request sends them only after the 401 challenge.
+- There are no hostname wildcards.
+
 ## Resolvers
 
 A component reference does not carry a repository address. The repository on the command line locates the root component only. Resolvers map component name patterns to repositories, so `get cv --recursive`, `transfer cv --recursive`, and `add cv` can find the components that a component references. An explicit repository in a `componentReferences` entry always wins for that component. See the [OCM resolvers](https://ocm.software/docs/concepts/resolvers/) documentation for the full model.
@@ -1643,7 +1739,7 @@ Image references are localized at three levels:
 - `shellcheck` (for linting)
 - `jq`
 - `openssl` (`make pki` uses `openssl ca` to issue demo certificates; tested with OpenSSL 3.0 and 4.0 and LibreSSL 3.3)
-- `python3` and `curl` (for `make wget`: the local upstream server and its readiness check)
+- `python3` and `curl` (for `make wget` and `make credentials`: the local upstream and recording servers and their readiness checks)
 - `git` 2.32 or newer (for `make git`: creates the demo repository and reads it back)
 - `gpg` (GnuPG 2.2 or newer, for `make gpg`)
 - `python3` and `tar` (for `make oci`: `components/oci/layout.py` writes the layout tars, and `tar` reads the layers back)
@@ -1675,6 +1771,7 @@ make ownership       # build the ownership demo component and trace the owner of
 make sbom            # regenerate the CycloneDX SBOM (build/sbom/hello-world.cdx.json); also run by make build
 make product         # build, sign and verify the product component that references the application
 make versions  # build the versions demo and show constraint/--latest/scheme selection
+make credentials  # build and show credential matching; offline
 make helm      # build, sign, verify and download the Helm chart demo (helm/v1 input, --transformer helm); offline
 make wget      # build, sign, verify and download the HTTP resources demo (Wget/v1 input and access); offline, requires OCM >= 0.19.0
 make pki        # create a demo CA, build, sign with a PEM certificate-chain signature and verify against the root CA; offline
@@ -1827,6 +1924,7 @@ Tests include:
 - Git repositories: `git resource metadata`, `git ref pinned at build time`, `git upstream is deterministic`, `git snapshot matches commit tree`, `git digest covers tree not commit`, `git signature binds commit label`, `git audit matches snapshot`, `git audit rejects wrong commit label`, `git audit requires signature`, `git scenarios`, `git transfer carries snapshot only`, `git uploader cannot copy git access`, `git own repo requires both vars`, `git own repo uses supplied repository`, `git rejects sha256 repository`, `git requires ocm 0.19`, `git show reports provenance`, `make git target`, `readme documents git repositories`
 - OCI images: `oci layout is reproducible`, `oci image resource metadata`, `oci resource digest is manifest digest`, `oci download yields oci layout`, `oci multiarch index references variants`, `oci download requires signature`, `oci signature covers image digest`, `oci transfer plan copy-resources leaves local images`, `oci transfer plan uploader rewrites references`, `oci transfer to ctf keeps digests`, `oci inspect reports architectures`, `localization relocate rewrites access keeps digest`, `localization readme documents three levels`, `make oci target`, `readme documents oci images`
 - Version selection: `versions lists newest first`, `versions constraint filters`, `versions latest includes prereleases by default`, `versions scheme orders build numbers`, `versions without scheme misorders`, `versions reference requires semver`, `versions requires ocm 0.19`, `versions show reports selection`, `make versions target`, `readme documents version selection`
+- Credential system: `credentials build creates ctf`, `credentials show lists consumer types`, `credentials match exact wins over wildcard`, `credentials match wildcard catches subpath`, `credentials match path star does not cross slash`, `credentials chain combines configs`, `credentials wget identity hostname required`, `credentials wget identity port attribute`, `credentials generic config wraps multiple`, `credentials scenarios matrix output`, `make credentials target`, `readme documents credential system`
 
 ## CI
 

@@ -16,6 +16,7 @@ WGET_OCM="${WGET_OCM:-$OCM}"
 GIT_OCM="${GIT_OCM:-$OCM}"
 GPG_OCM="${GPG_OCM:-$OCM}"
 OCI_OCM="${OCI_OCM:-$OCM}"
+CREDENTIALS_OCM="${CREDENTIALS_OCM:-$OCM}"
 
 PASS=0
 FAIL=0
@@ -5021,6 +5022,175 @@ test_readme_documents_oci_images() {
   assert_contains "$res_section" "(#oci-images)" "Resource repositories links to OCI images"
 }
 
+# _credentials_env <tmp>
+_credentials_env() {
+  export CREDENTIALS_DEMO_CTF="$1/credentials-ctf" \
+         CREDENTIALS_DEMO_OUT="$1/credentials" \
+         OCM="$CREDENTIALS_OCM"
+}
+
+test_credentials_build_creates_ctf() {
+  local tmp="$1"
+  _credentials_env "$tmp"
+  bash "$ROOT/scripts/credentials.sh" build >/dev/null || return 1
+
+  local cv_json name res_names access digest
+  cv_json="$("$OCM" get cv "ctf::$CREDENTIALS_DEMO_CTF//github.com/lioramilbaum/credentials-demo:$VERSION" -o json)" || return 1
+  name="$(jq -r '.[0].component.name' <<<"$cv_json")"
+  assert_eq "$name" "github.com/lioramilbaum/credentials-demo" "component name" || return 1
+  res_names="$(jq -r '[.[0].component.resources[].name] | join(",")' <<<"$cv_json")"
+  assert_eq "$res_names" "hello-image" "resource names" || return 1
+  access="$(jq -r '.[0].component.resources[0].access.type' <<<"$cv_json")"
+  assert_eq "$access" "LocalBlob/v1" "access type" || return 1
+  digest="$(jq -r '.[0].component.resources[0].digest.value' <<<"$cv_json")"
+  [[ -n "$digest" && "$digest" != "null" ]] || { echo "  digest missing" >&2; return 1; }
+}
+
+test_credentials_show_lists_consumer_types() {
+  local tmp="$1" out
+  _credentials_env "$tmp"
+  out="$(bash "$ROOT/scripts/credentials.sh" show)" || return 1
+  assert_contains "$out" $'identity\tOCIRegistry' || return 1
+  assert_contains "$out" $'identity\tWget' || return 1
+  assert_contains "$out" $'identity\tHelmChartRepository' || return 1
+  assert_not_contains "$out" "OCIRegistryCredentials" || return 1
+  assert_not_contains "$out" "GitHubAccessToken"
+}
+
+test_credentials_match_exact_wins_over_wildcard() {
+  local tmp="$1" out
+  _credentials_env "$tmp"
+  out="$(bash "$ROOT/scripts/credentials.sh" match)" || return 1
+  assert_contains "$out" $'exact-over-wildcard\tWget\tteam-a/report.txt\texact' || return 1
+  assert_contains "$out" $'exact-over-wildcard-reversed\tWget\tteam-a/report.txt\texact'
+}
+
+test_credentials_match_wildcard_catches_subpath() {
+  local tmp="$1" out
+  _credentials_env "$tmp"
+  out="$(bash "$ROOT/scripts/credentials.sh" match)" || return 1
+  assert_contains "$out" $'wildcard-subpath\tWget\tteam-a/report.txt\tteam-a-wild' || return 1
+  assert_contains "$out" $'type-alias\tWget\tteam-a/report.txt\thttp-alias'
+}
+
+test_credentials_match_path_star_does_not_cross_slash() {
+  local tmp="$1" out
+  _credentials_env "$tmp"
+  out="$(bash "$ROOT/scripts/credentials.sh" match)" || return 1
+  assert_contains "$out" $'star-not-across-slash\tWget\tteam-a/nested/report.txt\tnone' || return 1
+  assert_contains "$out" $'star-per-segment\tWget\tteam-a/nested/report.txt\tteam-a-nested'
+}
+
+test_credentials_chain_combines_configs() {
+  local tmp="$1" out
+  _credentials_env "$tmp"
+  out="$(bash "$ROOT/scripts/credentials.sh" chain)" || return 1
+  assert_contains "$out" $'two-files/team-a\tteam-a/report.txt\tfile-a' || return 1
+  assert_contains "$out" $'two-files/team-b\tteam-b/report.txt\tfile-b' || return 1
+  assert_contains "$out" $'later-file-wins/forward\tteam-a/report.txt\tfile-b-override' || return 1
+  assert_contains "$out" $'later-file-wins/reversed\tteam-a/report.txt\tfile-a' || return 1
+  assert_contains "$out" $'stdin\tteam-b/report.txt\tfile-b'
+}
+
+test_credentials_wget_identity_hostname_required() {
+  local tmp="$1" out
+  _credentials_env "$tmp"
+  out="$(bash "$ROOT/scripts/credentials.sh" match)" || return 1
+  assert_contains "$out" $'hostname-missing\tWget\tteam-a/report.txt\tnone' || return 1
+  assert_contains "$out" $'hostname-not-resolved\tWget\tteam-a/report.txt\tnone' || return 1
+  assert_contains "$out" $'no-path-matches-all\tWget\tteam-a/nested/report.txt\thost'
+}
+
+test_credentials_wget_identity_port_attribute() {
+  local tmp="$1" out
+  _credentials_env "$tmp"
+  out="$(bash "$ROOT/scripts/credentials.sh" match)" || return 1
+  assert_contains "$out" $'port-omitted\tWget\tteam-a/report.txt\tnone' || return 1
+  assert_contains "$out" $'port-mismatch\tWget\tteam-a/report.txt\tnone' || return 1
+  assert_contains "$out" $'scheme-omitted\tWget\tteam-a/report.txt\tno-scheme' || return 1
+  assert_contains "$out" $'scheme-mismatch\tWget\tteam-a/report.txt\tnone'
+}
+
+test_credentials_generic_config_wraps_multiple() {
+  local tmp="$1" out
+  _credentials_env "$tmp"
+  out="$(bash "$ROOT/scripts/credentials.sh" chain)" || return 1
+  assert_contains "$out" $'generic-flat/team-a\tteam-a\tflat-a' || return 1
+  assert_contains "$out" $'generic-flat/team-b\tteam-b\tflat-b' || return 1
+  assert_contains "$out" $'generic-nested/result\tresult\tnone' || return 1
+  assert_contains "$(cat "$tmp/credentials/chain/generic-nested/stderr")" "nested generic"
+}
+
+test_credentials_scenarios_matrix_output() {
+  local tmp="$1" out row overlap_rows bad
+  _credentials_env "$tmp"
+  bash "$ROOT/scripts/credentials.sh" build >/dev/null || return 1
+  out="$(bash "$ROOT/scripts/credentials.sh" scenarios)" || return 1
+
+  local want=(
+    $'oci-host\tOCIRegistry\tteam-a\thost\thost'
+    $'oci-path-exact\tOCIRegistry\tteam-a\texact\texact'
+    $'oci-path-glob\tOCIRegistry\tteam-a\tglob\tglob'
+    $'oci-path-other\tOCIRegistry\tteam-a\tother\tnone'
+    $'oci-star-not-across-slash\tOCIRegistry\tteam-a/nested\tstar\tnone'
+    $'oci-exact-over-glob\tOCIRegistry\tteam-a\texact|glob\texact'
+    $'type-mismatch-wget\tOCIRegistry\tteam-a\twget-user\tnone'
+    $'type-mismatch-oci\tWget\tteam-a/report.txt\toci-user\tnone'
+    $'duplicate-identity\tOCIRegistry\tteam-a\tfirst|second\tsecond'
+    $'typed-over-generic\tWget\tteam-a/report.txt\ttyped|direct\ttyped'
+    $'generic-credentials\tWget\tteam-a/report.txt\tgeneric\tgeneric'
+  )
+  for row in "${want[@]}"; do
+    assert_contains "$out" "$row" || return 1
+  done
+
+  # Overlapping wildcards pick randomly, so only check that each probe picked a candidate.
+  overlap_rows="$(awk -F'\t' '$1=="overlap-wildcards"' <<<"$out")"
+  assert_eq "$(wc -l <<<"$overlap_rows" | tr -d ' ')" "10" "overlap probe count" || return 1
+  bad="$(awk -F'\t' '$1=="overlap-wildcards" && $5!="host" && $5!="team-a-wild"' <<<"$out")"
+  assert_eq "$bad" "" "overlap selections are candidates"
+}
+
+test_make_credentials_target() {
+  local tmp="$1" dry_run help_out
+  dry_run="$(make -s --dry-run -C "$ROOT" credentials 2>/dev/null)"
+  assert_contains "$dry_run" "scripts/credentials.sh" "dry-run includes credentials.sh" || return 1
+
+  help_out="$(make -s -C "$ROOT" help 2>/dev/null)"
+  assert_contains "$help_out" "credentials" "make help lists credentials"
+}
+
+test_readme_documents_credential_system() {
+  local readme="$ROOT/README.md"
+  local section
+  section="$(awk '/^## Credential system/{f=1;next} /^## /{f=0} f' "$readme")"
+  [[ -n "$section" ]] || \
+    { echo "  README missing '## Credential system' section" >&2; return 1; }
+
+  local checks=(
+    "### Consumer identities"
+    "### Matching"
+    "WgetCredentials/v1"
+    "OCICredentials/v1"
+    "path.Match"
+    "nested generic configurations"
+  )
+  local check
+  for check in "${checks[@]}"; do
+    assert_contains "$section" "$check" "README section contains: $check" || return 1
+  done
+
+  # Drift guard: the first yaml block under ### Demo must be the constructor, byte for byte.
+  local demo demo_yaml constructor_yaml
+  demo="$(awk '/^### Demo/{f=1;next} /^### |^## /{f=0} f' <<<"$section")"
+  demo_yaml="$(awk '/^```yaml/{n++; f=(n==1); next} /^```/{f=0} f' <<<"$demo")"
+  constructor_yaml="$(cat "$ROOT/components/credentials/component-constructor.yaml")"
+  [[ "$demo_yaml" == "$constructor_yaml" ]] || {
+    echo "  README yaml block under ### Demo differs from components/credentials/component-constructor.yaml" >&2
+    return 1
+  }
+}
+
 # ── Run all tests ─────────────────────────────────────────────────────────────
 
 run_test "build produces application tree" test_build_produces_application_tree
@@ -5235,6 +5405,18 @@ run_test "gpg own keys use supplied files" test_gpg_own_keys_use_supplied_files
 run_test "gpg show reports key" test_gpg_show_reports_key
 run_test "make gpg target" test_make_gpg_target
 run_test "readme documents gpg signing" test_readme_documents_gpg_signing
+run_test "credentials build creates ctf" test_credentials_build_creates_ctf
+run_test "credentials show lists consumer types" test_credentials_show_lists_consumer_types
+run_test "credentials match exact wins over wildcard" test_credentials_match_exact_wins_over_wildcard
+run_test "credentials match wildcard catches subpath" test_credentials_match_wildcard_catches_subpath
+run_test "credentials match path star does not cross slash" test_credentials_match_path_star_does_not_cross_slash
+run_test "credentials chain combines configs" test_credentials_chain_combines_configs
+run_test "credentials wget identity hostname required" test_credentials_wget_identity_hostname_required
+run_test "credentials wget identity port attribute" test_credentials_wget_identity_port_attribute
+run_test "credentials generic config wraps multiple" test_credentials_generic_config_wraps_multiple
+run_test "credentials scenarios matrix output" test_credentials_scenarios_matrix_output
+run_test "make credentials target" test_make_credentials_target
+run_test "readme documents credential system" test_readme_documents_credential_system
 
 echo ""
 echo "Results: $PASS passed, $FAIL failed"
