@@ -3,7 +3,7 @@ OCM            ?= ocm
 
 export VERSION OCM
 
-.PHONY: help build sign verify resolvers manifests deploy publish transfer-plan ownership sbom product versions helm wget pki git gpg lint test e2e cluster-up cluster-down e2e-run clean
+.PHONY: help build sign verify resolvers manifests deploy publish transfer-plan ownership sbom product versions helm wget pki git gpg oci lint test e2e cluster-up cluster-down e2e-run clean
 
 help: ## Show this help
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | \
@@ -59,6 +59,9 @@ git: ## Create a demo Git repository, build, sign, verify and audit the Git sour
 
 gpg: ## Create throwaway GPG keys, build, sign (OpenPGP), verify and download the GPG signing demo (GPG/v1alpha1 signature); offline (requires gpg 2.2 or newer, jq)
 	@bash scripts/gpg.sh
+
+oci: ## Build, sign, verify and download the OCI image demo (ociImage from local OCI layout, multi-arch index); offline
+	@bash scripts/oci.sh
 
 lint: ## Lint shell scripts (if shellcheck is available)
 	@if command -v shellcheck >/dev/null 2>&1; then \

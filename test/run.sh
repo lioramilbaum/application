@@ -15,6 +15,7 @@ WGET_OCM="${WGET_OCM:-$OCM}"
 # OCM >= 0.19.0 is needed for Git/v1 input and access.
 GIT_OCM="${GIT_OCM:-$OCM}"
 GPG_OCM="${GPG_OCM:-$OCM}"
+OCI_OCM="${OCI_OCM:-$OCM}"
 
 PASS=0
 FAIL=0
@@ -1999,6 +2000,12 @@ _tamper_descriptor() {
   cp -R "$src" "$out"
   local idx="$out/artifact-index.json"
   local mdigest; mdigest="$(jq -r --arg t "$ver" '.artifacts[] | select(.tag==$t) | .digest' "$idx")"
+  # Some components are tagged with an image index that wraps the descriptor manifest.
+  local wrapper=""
+  if [[ "$(jq -r '.mediaType' "$out/blobs/${mdigest/:/.}")" == application/vnd.oci.image.index.v1+json ]]; then
+    wrapper="$out/blobs/${mdigest/:/.}"
+    mdigest="$(jq -r '.manifests[0].digest' "$wrapper")"
+  fi
   local mpath="$out/blobs/${mdigest/:/.}"
   local cfgdigest; cfgdigest="$(jq -r '.config.digest' "$mpath")"
   local cfgpath="$out/blobs/${cfgdigest/:/.}"
@@ -2020,6 +2027,13 @@ _tamper_descriptor() {
     "$mpath" > "$out/new"
   local md; md="sha256:$(sha256 "$out/new")"
   mv "$out/new" "$out/blobs/${md/:/.}"
+
+  if [[ -n "$wrapper" ]]; then
+    jq --arg md "$md" --argjson n "$(wc -c < "$out/blobs/${md/:/.}" | tr -d ' ')" \
+      '.manifests[0].digest=$md | .manifests[0].size=$n' "$wrapper" > "$out/new"
+    md="sha256:$(sha256 "$out/new")"
+    mv "$out/new" "$out/blobs/${md/:/.}"
+  fi
 
   jq --arg t "$ver" --arg md "$md" \
     '(.artifacts[] | select(.tag==$t) | .digest) = $md' "$idx" > "$out/new"
@@ -4800,6 +4814,213 @@ test_readme_documents_gpg_signing() {
   assert_contains "$sv" "(#gpg-signing)" "Trust models link to GPG signing"
 }
 
+_oci_env() {
+  local tmp="$1"
+  export OCI_DEMO_CTF="$tmp/oci-ctf" OCI_DEMO_OUT="$tmp/oci" OCM="$OCI_OCM"
+}
+
+_build_oci() {
+  bash "$ROOT/scripts/oci.sh" build 2>/dev/null
+}
+
+_oci_ref() {
+  echo "ctf::$OCI_DEMO_CTF//github.com/lioramilbaum/oci-demo:$VERSION"
+}
+
+test_oci_layout_is_reproducible() {
+  local tmp="$1" f
+  mkdir -p "$tmp/layouts"
+  python3 "$ROOT/components/oci/layout.py" "$tmp/layouts" || return 1
+  for f in hello-oci-amd64.oci.tar hello-oci-arm64.oci.tar hello-oci-multiarch.oci.tar; do
+    cmp -s "$tmp/layouts/$f" "$ROOT/components/oci/$f" \
+      || { echo "  $f differs from a fresh run of layout.py" >&2; return 1; }
+  done
+}
+
+test_oci_image_resource_metadata() {
+  local tmp="$1" rows
+  _oci_env "$tmp"
+  _build_oci || return 1
+  rows="$("$OCM" get cv "$(_oci_ref)" -o json </dev/null \
+    | jq -r '.[0].component.resources[] | [.name, .type, .relation, (.extraIdentity.architecture // "-")] | @tsv')"
+  assert_contains "$rows" $'hello-image\tociImage\tlocal\tamd64' "amd64 image" || return 1
+  assert_contains "$rows" $'hello-image\tociImage\tlocal\tarm64' "arm64 image" || return 1
+  assert_contains "$rows" $'hello-image-multiarch\tociImage\tlocal\t-' "multi-arch index" || return 1
+}
+
+test_oci_resource_digest_is_manifest_digest() {
+  local tmp="$1" digest
+  _oci_env "$tmp"
+  _build_oci || return 1
+  digest="$("$OCM" get cv "$(_oci_ref)" -o json </dev/null \
+    | jq -r '.[0].component.resources[] | select(.name=="hello-image" and .extraIdentity.architecture=="amd64") | .digest.value')"
+  mkdir -p "$tmp/src"
+  tar -xf "$ROOT/components/oci/hello-oci-amd64.oci.tar" -C "$tmp/src" || return 1
+  assert_eq "$(jq -r '.manifests[0].digest' "$tmp/src/index.json")" "sha256:$digest" "manifest digest" || return 1
+}
+
+test_oci_download_yields_oci_layout() {
+  local tmp="$1" dir
+  _oci_env "$tmp"
+  _build_oci || return 1
+  bash "$ROOT/scripts/oci.sh" sign >/dev/null 2>&1 || return 1
+  bash "$ROOT/scripts/oci.sh" download >/dev/null 2>&1 || return 1
+  dir="$tmp/oci/download/hello-image-amd64"
+  [[ -f "$dir/oci-layout" ]] || { echo "  missing oci-layout" >&2; return 1; }
+  [[ -f "$dir/index.json" ]] || { echo "  missing index.json" >&2; return 1; }
+  [[ -d "$dir/blobs/sha256" ]] || { echo "  missing blobs/sha256" >&2; return 1; }
+}
+
+test_oci_multiarch_index_references_variants() {
+  local tmp="$1" digest index
+  _oci_env "$tmp"
+  _build_oci || return 1
+  bash "$ROOT/scripts/oci.sh" sign >/dev/null 2>&1 || return 1
+  bash "$ROOT/scripts/oci.sh" download >/dev/null 2>&1 || return 1
+  digest="$("$OCM" get cv "$(_oci_ref)" -o json </dev/null \
+    | jq -r '.[0].component.resources[] | select(.name=="hello-image-multiarch") | .digest.value')"
+  # The downloaded root index is the one whose digest is the resource digest.
+  index="$tmp/oci/download/hello-image-multiarch/blobs/sha256/$digest"
+  assert_eq "$(jq '.manifests | length' "$index")" "2" "variants in index" || return 1
+  assert_eq "$(jq -r '[.manifests[].platform.architecture] | sort | join(",")' "$index")" "amd64,arm64" "platforms" || return 1
+}
+
+test_oci_download_requires_signature() {
+  local tmp="$1"
+  _oci_env "$tmp"
+  _build_oci || return 1
+  if bash "$ROOT/scripts/oci.sh" download >/dev/null 2>&1; then
+    echo "  download of an unsigned component succeeded" >&2
+    return 1
+  fi
+  [[ ! -e "$tmp/oci/download" ]] || { echo "  download left output behind" >&2; return 1; }
+}
+
+test_oci_signature_covers_image_digest() {
+  local tmp="$1" filter work err
+  _oci_env "$tmp"
+  _build_oci || return 1
+  bash "$ROOT/scripts/oci.sh" sign >/dev/null 2>&1 || return 1
+  filter='(.component.resources[] | select(.name=="hello-image" and .extraIdentity.architecture=="amd64") | .digest.value) = "0000000000000000000000000000000000000000000000000000000000000000"'
+  work="$tmp/tampered"
+  _tamper_descriptor "$OCI_DEMO_CTF" "$VERSION" "$filter" "$work" || return 1
+  assert_fails env OCI_DEMO_CTF="$work" bash "$ROOT/scripts/oci.sh" verify >/dev/null 2>"$tmp/verify.err" || return 1
+  err="$(cat "$tmp/verify.err")"
+  assert_contains "$err" "digest mismatch" "verify rejects tampered image digest" || return 1
+}
+
+test_oci_plan_copy_resources_leaves_local_images() {
+  local tmp="$1" plan row
+  _oci_env "$tmp"
+  _build_oci || return 1
+  plan="$(bash "$ROOT/scripts/oci.sh" plan 2>/dev/null)" || return 1
+  row="$(awk -F'\t' '$1=="copy-resources"{print $2}' <<<"$plan")"
+  assert_contains "$row" "OCIAddLocalResource/v1alpha1=3" "local images stay local" || return 1
+  assert_not_contains "$row" "AddOCIArtifact" || return 1
+}
+
+test_oci_plan_uploader_rewrites_references() {
+  local tmp="$1" plan row types refs
+  _oci_env "$tmp"
+  _build_oci || return 1
+  plan="$(bash "$ROOT/scripts/oci.sh" plan 2>/dev/null)" || return 1
+  row="$(awk -F'\t' '$1=="uploader"{print $2}' <<<"$plan")"
+  assert_contains "$row" "AddOCIArtifact/v1alpha1=3" "uploader uploads each image" || return 1
+  types="$(jq -r '.transformations[] | select(.type=="AddOCIArtifact/v1alpha1") | .spec.resource.access.type' "$tmp/oci/plan-uploader.json")"
+  assert_eq "$(sort -u <<<"$types")" "ociArtifact/v1" "access type" || return 1
+  refs="$(jq -r '.transformations[] | select(.type=="AddOCIArtifact/v1alpha1") | .spec.resource.access.imageReference' "$tmp/oci/plan-uploader.json")"
+  assert_contains "$refs" "/hello-image:" "image reference rewritten" || return 1
+}
+
+test_oci_transfer_to_ctf_keeps_digests() {
+  local tmp="$1" query src dst
+  _oci_env "$tmp"
+  _build_oci || return 1
+  query='.[0].component.resources[] | [.name, (.extraIdentity.architecture // "-"), .digest.value] | @tsv'
+  "$OCM" transfer cv "$(_oci_ref)" "ctf::$tmp/oci-copy-ctf" </dev/null >/dev/null 2>&1 || return 1
+  src="$("$OCM" get cv "$(_oci_ref)" -o json </dev/null | jq -r "$query")"
+  dst="$("$OCM" get cv "ctf::$tmp/oci-copy-ctf//github.com/lioramilbaum/oci-demo:$VERSION" -o json </dev/null | jq -r "$query")"
+  assert_eq "$dst" "$src" "digests after transfer" || return 1
+}
+
+test_oci_inspect_reports_architectures() {
+  local tmp="$1" out
+  _oci_env "$tmp"
+  _build_oci || return 1
+  bash "$ROOT/scripts/oci.sh" sign >/dev/null 2>&1 || return 1
+  out="$(bash "$ROOT/scripts/oci.sh" inspect 2>/dev/null)" || return 1
+  assert_contains "$out" $'image\thello-image\tamd64\t' "amd64 row" || return 1
+  assert_contains "$out" $'image\thello-image\tarm64\t' "arm64 row" || return 1
+  assert_contains "$out" $'image\thello-image-multiarch\tmultiarch\t' "multi-arch row" || return 1
+  assert_contains "$out" $'layer\thello-image\tarm64\t' "arm64 layer row" || return 1
+}
+
+test_localization_relocate_rewrites_access_keeps_digest() {
+  local tmp="$1" out
+  _oci_env "$tmp"
+  _build_oci || return 1
+  out="$(bash "$ROOT/scripts/oci.sh" relocate 2>/dev/null)" || return 1
+  assert_eq "$(awk -F'\t' '$1=="after" && $4=="ociArtifact/v1"' <<<"$out" | wc -l | tr -d ' ')" "3" "after rows" || return 1
+  assert_eq "$(awk -F'\t' '$1=="after" && $5==""' <<<"$out" | wc -l | tr -d ' ')" "0" "after rows with empty imageReference" || return 1
+  assert_eq "$(awk -F'\t' '$1=="after"{print $2, $3}' <<<"$out")" \
+    "$(awk -F'\t' '$1=="before"{print $2, $3}' <<<"$out")" "name and arch pairs after relocation" || return 1
+  assert_eq "$(awk -F'\t' '$1=="before"{b[++n]=$5} $1=="after"{a[++m]=$5} END{for(i=1;i<=m;i++) if(a[i]==b[i]) c++; print c+0}' <<<"$out")" \
+    "0" "imageReference rewritten for every resource" || return 1
+}
+
+test_localization_readme_documents_three_levels() {
+  local readme="$ROOT/README.md" check
+  for check in "Build time" "Transfer time" "Deploy time" "does NOT substitute"; do
+    assert_contains "$(cat "$readme")" "$check" "README documents: $check" || return 1
+  done
+}
+
+test_make_oci_target() {
+  local tmp="$1"
+
+  local dry_run
+  dry_run="$(make -s --dry-run -C "$ROOT" oci 2>/dev/null)"
+  assert_contains "$dry_run" "scripts/oci.sh" "dry-run includes oci.sh" || return 1
+
+  local help_out
+  help_out="$(make -s -C "$ROOT" help 2>/dev/null)"
+  assert_contains "$help_out" "oci" "make help lists oci"
+}
+
+test_readme_documents_oci_images() {
+  local readme="$ROOT/README.md"
+  local section
+  section="$(awk '/^## OCI images/{f=1;next} /^## /{f=0} f' "$readme")"
+  [[ -n "$section" ]] || \
+    { echo "  README missing '## OCI images' section" >&2; return 1; }
+
+  local checks=(
+    "ociImage"
+    "extraIdentity"
+    "hello-image-multiarch"
+    "relocate.ocmconfig"
+    "layout.py"
+    "(#transfer-and-transport)"
+    "make oci"
+  )
+  for check in "${checks[@]}"; do
+    assert_contains "$section" "$check" "README section contains: $check" || return 1
+  done
+
+  # Drift guard: first README yaml block (minus # lines) must match the constructor.
+  local readme_yaml constructor_yaml
+  readme_yaml="$(awk '/^```yaml/{n++; f=(n==1); next} /^```/{f=0} f' <<<"$section" | grep -v '^#')"
+  constructor_yaml="$(grep -v '^#' "$ROOT/components/oci/component-constructor.yaml")"
+  [[ "$readme_yaml" == "$constructor_yaml" ]] || {
+    echo "  README yaml block differs from components/oci/component-constructor.yaml" >&2
+    return 1
+  }
+
+  local res_section
+  res_section="$(awk '/^## Resource repositories/{f=1;next} /^## /{f=0} f' "$readme")"
+  assert_contains "$res_section" "(#oci-images)" "Resource repositories links to OCI images"
+}
+
 # ── Run all tests ─────────────────────────────────────────────────────────────
 
 run_test "build produces application tree" test_build_produces_application_tree
@@ -4978,6 +5199,21 @@ run_test "git requires ocm 0.19" test_git_requires_ocm_019
 run_test "git show reports provenance" test_git_show_reports_provenance
 run_test "make git target" test_make_git_target
 run_test "readme documents git repositories" test_readme_documents_git_repositories
+run_test "oci layout is reproducible" test_oci_layout_is_reproducible
+run_test "oci image resource metadata" test_oci_image_resource_metadata
+run_test "oci resource digest is manifest digest" test_oci_resource_digest_is_manifest_digest
+run_test "oci download yields oci layout" test_oci_download_yields_oci_layout
+run_test "oci multiarch index references variants" test_oci_multiarch_index_references_variants
+run_test "oci download requires signature" test_oci_download_requires_signature
+run_test "oci signature covers image digest" test_oci_signature_covers_image_digest
+run_test "oci transfer plan copy-resources leaves local images" test_oci_plan_copy_resources_leaves_local_images
+run_test "oci transfer plan uploader rewrites references" test_oci_plan_uploader_rewrites_references
+run_test "oci transfer to ctf keeps digests" test_oci_transfer_to_ctf_keeps_digests
+run_test "oci inspect reports architectures" test_oci_inspect_reports_architectures
+run_test "localization relocate rewrites access keeps digest" test_localization_relocate_rewrites_access_keeps_digest
+run_test "localization readme documents three levels" test_localization_readme_documents_three_levels
+run_test "make oci target" test_make_oci_target
+run_test "readme documents oci images" test_readme_documents_oci_images
 run_test "gpg signature is openpgp" test_gpg_signature_is_openpgp
 run_test "gpg configs pin signer key" test_gpg_configs_pin_signer_key
 run_test "gpg signs with subkey" test_gpg_signs_with_subkey
