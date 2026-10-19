@@ -1,0 +1,11 @@
+name: github.com/lioramilbaum/graph/platform
+version: ${VERSION}
+provider:
+  name: github.com/lioramilbaum
+componentReferences:
+  - name: frontend
+    componentName: github.com/lioramilbaum/graph/frontend
+    version: ${VERSION}
+  - name: backend
+    componentName: github.com/lioramilbaum/graph/backend
+    version: ${VERSION}

@@ -1,0 +1,5 @@
+{
+  "generator": "github.com/lioramilbaum/application",
+  "schema": "none-access-demo/v1",
+  "note": "This provenance file lives outside OCM. Its digest is bound via a signed label."
+}

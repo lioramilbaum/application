@@ -3,10 +3,10 @@ OCM            ?= ocm
 
 export VERSION OCM
 
-.PHONY: help build sign verify resolvers manifests deploy publish transfer-plan ownership sbom product versions helm wget pki git gpg lint test e2e cluster-up cluster-down e2e-run clean
+.PHONY: help build sign verify resolvers manifests deploy publish transfer-plan ownership sbom product versions helm wget pki git gpg oci credentials plugin registry graph github normalisation s3 none-access lint test e2e cluster-up cluster-down e2e-run clean
 
 help: ## Show this help
-	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | \
+	@grep -E '^[a-zA-Z0-9_-]+:.*?## .*$$' $(MAKEFILE_LIST) | \
 		awk 'BEGIN {FS = ":.*?## "}; {printf "  %-12s %s\n", $$1, $$2}'
 
 build: ## Build the OCM component archive (CTF)
@@ -59,6 +59,33 @@ git: ## Create a demo Git repository, build, sign, verify and audit the Git sour
 
 gpg: ## Create throwaway GPG keys, build, sign (OpenPGP), verify and download the GPG signing demo (GPG/v1alpha1 signature); offline (requires gpg 2.2 or newer, jq)
 	@bash scripts/gpg.sh
+
+oci: ## Build, sign, verify and download the OCI image demo (ociImage from local OCI layout, multi-arch index); offline
+	@bash scripts/oci.sh
+
+credentials: ## Build the credentials demo and show consumer identity matching (exact vs wildcard, path, Wget attributes) against a local recording server; offline (requires python3, curl)
+	@bash scripts/credentials.sh
+
+plugin: ## Install the demo-store Python plugin, build the plugin demo (demo-store/v1alpha1 access type served by an external plugin), download through it and show its capabilities; offline (requires python3, curl)
+	@bash scripts/plugin.sh
+
+registry: ## Start a local registry:2 on 127.0.0.1:5055, push (ocm transfer cv), sign, verify, pull and show the registry demo; requires Docker (skips without it); stop with: bash scripts/registry.sh stop
+	@bash scripts/registry.sh
+
+graph: ## Build a three-level component graph across three CTFs (platform → frontend/backend → runtime), show get cv --recursive, resolver order, flat vs recursive transfer and transitive digest enforcement; offline
+	@bash scripts/graph.sh
+
+github: ## Build, sign, verify, download and transfer the GitHub/v1 access demo against a local GitHub REST API emulator; offline (requires python3, curl). GITHUB_DEMO_ONLINE=1 bash scripts/github.sh online uses github.com
+	@bash scripts/github.sh
+
+normalisation: build ## Print the jsonNormalisation/v4alpha1 form of the application descriptor, compare it against ocm sign --dry-run, and show resource/component digest changes across label and blob mutations; offline
+	@bash scripts/normalisation.sh
+
+s3: ## Start a local S3-compatible server (rustfs) on 127.0.0.1:19000, seed buckets, build, sign, verify and download the S3/v1 and S3/v2 access demo (version pinning, digest mismatch, input vs access, --copy-resources); requires Docker (skips without it) and curl >= 7.75; stop with: bash scripts/s3.sh stop
+	@bash scripts/s3.sh
+
+none-access: ## Build, sign and verify a component with a None-access resource, show that its digest is stripped before signing, that download fails gracefully, and bind the external bytes with a signed label instead; offline
+	@bash scripts/none-access.sh
 
 lint: ## Lint shell scripts (if shellcheck is available)
 	@if command -v shellcheck >/dev/null 2>&1; then \

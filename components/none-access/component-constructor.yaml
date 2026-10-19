@@ -1,0 +1,21 @@
+name: github.com/lioramilbaum/none-access-demo
+version: ${VERSION}
+provider:
+  name: github.com/lioramilbaum
+resources:
+  - name: release-notes
+    type: plainText
+    version: ${VERSION}
+    input:
+      type: UTF8/v1
+      text: "none-access-demo v${VERSION}"
+  - name: provenance
+    type: blob
+    version: ${VERSION}
+    relation: external
+    access:
+      type: None
+    labels:
+      - name: none-access.lioramilbaum.github.com/sha256
+        value: "c2b17a7d610d86431dea41e82908b0187166b17990244fcd5e12a759167eee4e"
+        signing: true

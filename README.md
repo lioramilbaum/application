@@ -183,6 +183,102 @@ To keep credentials permanently, add the same consumer block to `~/.ocmconfig` u
 
 Note: `--config -` (stdin) requires OCM CLI ≥ 0.19.1. With an older CLI, put the consumer block in `~/.ocmconfig` and omit the environment variables.
 
+### Consumer identities
+
+Each identity type carries its own attributes, and each one selects a credential type. The table lists the types of OCM 0.19.1 that this repository's operations use:
+
+| Identity type | Attributes | Credential type |
+|---|---|---|
+| `OCIRegistry` | `hostname`, `scheme`, `port`, `path` | `OCICredentials/v1` |
+| `Wget` (aliases `HTTP`, `Wget/v1`) | `hostname`, `scheme`, `port`, `path` | `WgetCredentials/v1` |
+| `HelmChartRepository` | `hostname`, `scheme`, `port`, `path` | `HelmHTTPCredentials/v1` |
+| `GitHubRepository` | `hostname`, `scheme`, `port`, `path` | `GitHubCredentials/v1` |
+| `Git` | `hostname`, `scheme`, `port`, `path` | `GitCredentials/v1` |
+| `S3` | `hostname`, `scheme`, `port`, `path` | `S3Credentials/v1` |
+| `RSA/v1alpha1` | `algorithm`, `signature` | `RSACredentials/v1` |
+| `GPG/v1alpha1` | `signature` | `GPGCredentials/v1alpha1` |
+
+A generic `Credentials/v1` entry with `properties:` also works for any identity. A typed credential beats it for the same identity.
+
+### Matching
+
+An exact match wins in any position of the file. Otherwise, every entry that matches is a candidate, and OCM picks one of them:
+
+- `path` uses `path.Match`, so `*` stays within one segment (`team-a/*` matches `team-a/report.txt` but not `team-a/nested/report.txt`).
+- An entry without `path` matches every path.
+- `hostname` must be equal. There are no hostname wildcards.
+- `scheme` is compared only when both the entry and the request set it.
+- `port` defaults to 80 or 443 from the scheme when it is not set.
+- Type aliases: `HTTP` = `Wget/v1` = `Wget`.
+
+### Wget identity
+
+A `Wget` identity has four attributes: `hostname`, `port` (a string, so quote it), `scheme`, and `path` (the URL path without the leading `/`). This entry supplies credentials for `http://127.0.0.1:18441/team-a/report.txt`:
+
+```yaml
+type: generic.config.ocm.software/v1
+configurations:
+  - type: credentials.config.ocm.software
+    consumers:
+      - identity:
+          type: Wget
+          hostname: 127.0.0.1
+          port: '18441'
+          scheme: http
+          path: 'team-a/*'
+        credentials:
+          - type: WgetCredentials/v1
+            username: team-a-user
+            password: demo-password
+```
+
+### Chaining configs
+
+Repeat `--config` to merge several files. They are merged in order, and the last entry wins for a duplicate identity. A flat generic config holds several `credentials.config.ocm.software` entries. OCM ignores nested generic configurations and prints a warning for each one. `ocm get config --config <file> ...` shows the merged result, and it prints the secrets in clear.
+
+### Demo
+
+`components/credentials/component-constructor.yaml` is the component that the demo builds. It wraps the OCI layout from `components/oci`:
+
+```yaml
+# Demo component for credential system demo.
+# scripts/credentials.sh copies this file next to components/oci/hello-oci-multiarch.oci.tar
+# before building, because file inputs cannot escape the constructor directory.
+name: github.com/lioramilbaum/credentials-demo
+version: ${VERSION}
+provider:
+  name: github.com/lioramilbaum
+resources:
+  - name: hello-image
+    type: ociImage
+    version: ${VERSION}
+    input:
+      type: file
+      path: ./hello-oci-multiarch.oci.tar
+      mediaType: application/vnd.ocm.software.oci.layout.v1+tar
+```
+
+```bash
+make credentials   # build the CTF, list identity types, match rules, chains and scenarios
+```
+
+`scripts/credentials.sh` starts a local recording server (`scripts/upstream-server.py --auth-log`) on `127.0.0.1:18441`, which you can change with `CREDENTIALS_DEMO_PORT`. The server logs each request with the username it saw, so the demo reports the credential that OCM selected. The subcommands are:
+
+- `build`: builds the component into `build/credentials-ctf`.
+- `show`: prints one row per identity type and the parsed examples in `build/credentials/examples/`.
+- `match`: runs one probe per matching rule (exact versus wildcard, `path`, Wget attributes, type aliases).
+- `chain`: merges several config files, checks which one wins, and checks generic and nested configs.
+- `scenarios`: runs the OCI and type-mismatch cases, duplicate identities, typed versus generic credentials, and overlapping wildcards.
+
+Each row prints the selected credential as `none` when no entry matched, or `error` when the probe did not reach the server.
+
+### Limitations
+
+- When more than one non-exact entry matches, OCM picks one at random. In the demo's `overlap-wildcards` scenario the choice was skewed, so do not rely on which one wins.
+- A credential type name that is not registered, such as `OCIRegistryCredentials`, made OCM 0.19.1 hang while it waited for an OIDC callback. Use the registered names from the table above.
+- A Wget request sends its credentials with the first request. An OCI request sends them only after the 401 challenge.
+- There are no hostname wildcards.
+
 ## Resolvers
 
 A component reference does not carry a repository address. The repository on the command line locates the root component only. Resolvers map component name patterns to repositories, so `get cv --recursive`, `transfer cv --recursive`, and `add cv` can find the components that a component references. An explicit repository in a `componentReferences` entry always wins for that component. See the [OCM resolvers](https://ocm.software/docs/concepts/resolvers/) documentation for the full model.
@@ -255,6 +351,8 @@ Helm charts (`helm/v1` input, `Helm/v1` access): see [Helm charts](#helm-charts)
 HTTP downloads (`Wget/v1` input and access): see [HTTP resources](#http-resources).
 
 Git repositories (`Git/v1` input, access and sources): see [Git repositories](#git-repositories).
+
+OCI image layouts: see [OCI images](#oci-images).
 
 **`input:` vs `access:`** in `component-constructor.yaml`: an `input:` block is read at build time and stored as a `LocalBlob/v1` in the component repository. An `access:` block points at an artifact already in an external resource repository; OCM records only the reference and its digest. The nginx image digest is already pinned in `component-constructor.yaml`; OCM records it as-is without re-resolving it from Docker Hub.
 
@@ -388,6 +486,10 @@ make publish OCM_REPO=oci::http://localhost:5001 TRANSFER_SPEC=build/transfer-pl
 
 After transfer, point consumers at the target with `OCM_COMPONENT_REPO`. See
 [Consuming the component](#consuming-the-component).
+
+## Localization
+
+Image references change at three steps between build and deploy: build time (`${VAR}` substitution in the constructor), transfer time (the `imageReference` of an uploader config, see [Uploader configs](#uploader-configs)), and deploy time (`localizationConfig` rules applied by `scripts/manifests.sh`, see [How it works](#how-it-works)). The transfer-time step is demonstrated with a real image in [OCI images](#oci-images).
 
 ## Kubernetes controller
 
@@ -526,7 +628,7 @@ forking it. A plugin is a standalone binary, usually built with the Go SDK in
 The `ocm` CLI scans one directory, `--plugin-directory` (default `$HOME/.config/ocm/plugins`),
 runs each binary with `capabilities` to learn which types it serves, and starts it only when a
 command needs one of them. Requests are HTTP + JSON over a Unix domain socket (or TCP in scratch containers), and the
-plugin exits after an idle timeout. Plugin settings go in `.ocmconfig` under the plugin's own `type`.
+plugin exits after an idle timeout. Plugin discovery settings go in `.ocmconfig` under `plugin.config.ocm.software/v2alpha1`: `idleTimeout` (default one hour) is honored, but `locations` is always overwritten by `--plugin-directory`, which has a default value (see Limitations below).
 
 Every type this component uses is served by a built-in plugin compiled into `ocm`, so build,
 sign, verify, and transfer need no plugin installed:
@@ -544,6 +646,101 @@ let `component-constructor.yaml` reference them with `access:` while `make build
 `ocm download resource`, and `make publish` stay unchanged. Plugins are shipped as OCM
 component versions, so `ocm download plugin` fetches a plugin binary from one into the plugin
 directory.
+
+### Demo component
+
+`components/plugin/component-constructor.yaml`:
+
+```yaml
+name: github.com/lioramilbaum/plugin-demo
+version: ${VERSION}
+provider:
+  name: github.com/lioramilbaum
+resources:
+  - name: demo-blob
+    type: blob
+    version: ${VERSION}
+    access:
+      type: demo-store/v1alpha1
+      storeId: my-store
+      blobId: blob-001
+```
+
+```sh
+make plugin   # install the plugin, build, download through it and show its capabilities; offline
+```
+
+The `demo-blob` resource has no `input:`. Its bytes live in a store that only the plugin can read, and OCM records the digest the plugin reports when the component is built. `make plugin` copies the plugin and its store into `build/plugins/`, writes the component archive to `build/plugin-ctf`, and downloads the blob to `build/plugin/download/demo-blob`:
+
+```text
+build/
+├── plugins/                    # --plugin-directory
+│   ├── demo-store-plugin       # the plugin executable
+│   └── demo-store.json         # the store it serves; ignored by OCM (no extensionless name)
+├── plugin-ctf/                 # the component archive
+└── plugin/
+    ├── credentials.ocmconfig   # Credentials/v1 for demo-store/v1alpha1, storeId my-store
+    └── download/demo-blob      # the downloaded bytes
+```
+
+### Wire protocol
+
+The demo plugin (`components/plugin/demo-store/demo-store-plugin`) speaks the 0.19.1 protocol:
+
+- `demo-store-plugin capabilities` prints one JSON object. Its `capabilities` array has one entry per plugin type, `resourceRepository` and `digestProcessorRepository`. Each lists its `supportedAccessTypes`, and each access type has `type`, `aliases` and `jsonSchema`, a base64-encoded JSON Schema of the access spec. OCM runs `capabilities` on every plugin in the directory before every command.
+- `demo-store-plugin --config '{"id":"demo-store-plugin","type":"unix","idleTimeout":3600000000000}'` starts server mode. `idleTimeout` is in nanoseconds. The plugin creates a Unix socket and prints `http+unix://<path>` to stdout with `flush=True`. That line must be the only thing written to stdout.
+- Endpoints, all with JSON bodies except `/healthz`:
+  - `GET /healthz` returns `{"status":"ok"}`.
+  - `POST /identity` takes `{"type": <access spec>}` and returns `{"identity":{"type":"demo-store/v1alpha1","storeId":"my-store"}}`. OCM matches credential consumers against this identity.
+  - `POST /resource/get` takes `{"resource": {...}}` and returns a location, for example `{"location":{"type":"localFile","value":"<path>","mediaType":"text/plain"}}`. OCM reads the file at `value`.
+  - `POST /resource/digest/process` takes `{"resource": {...}}` and returns the same resource with a `digest` (`hashAlgorithm`, `normalisationAlgorithm`, `value`).
+- Credentials for `/resource/get` and `/resource/digest/process` arrive in the `Authorization` header as the JSON of the resolved credential object, for example `{"type":"Credentials/v1","properties":{"token":"demo-token"}}`. The demo also accepts `Bearer` and `Basic` headers.
+- Anything the plugin writes to stderr is forwarded into OCM's log. The demo writes JSON lines, which appear with `--loglevel debug`.
+- SIGINT or SIGTERM shuts the server down. The plugin also exits when its parent (OCM) exits, or after its idle timeout with no requests.
+
+### Registering a plugin
+
+Pass the directory with `--plugin-directory <dir>`. The default is `$HOME/.config/ocm/plugins`.
+
+- Every extensionless file in the directory is a plugin. A non-executable one fails with `fork/exec` on every command. Files with an extension, such as `demo-store.json`, are ignored.
+- A symlink to a directory is discovered and exec'd, which fails with `permission denied`. Put the plugin binaries directly in the directory.
+- `capabilities` runs for every plugin on every `ocm` command, including `ocm version`. One plugin whose `capabilities` output does not parse (`failed to unmarshal capabilities`) breaks every command, not only the ones that use its types.
+
+### Writing a plugin in Python
+
+The demo plugin is stdlib only and runs on Python 3.9. These points cost the most debugging time:
+
+- Flush the socket line. Stdout is block-buffered when it is a pipe, so `print(...)` without `flush=True` never reaches OCM.
+- Unix socket peers have no address: `client_address` is `''`. `BaseHTTPRequestHandler.address_string()` indexes into it and raises `IndexError`. Override `address_string`, and pass a placeholder address from `get_request`.
+- Keep the socket path short. Unix socket paths are limited to 104 bytes on macOS, and `TMPDIR` there is a long `/var/folders/...` path. Create the socket directory with `tempfile.mkdtemp(dir="/tmp")`.
+- Log to stderr at DEBUG as JSON lines. OCM forwards them and shows them with `--loglevel debug`.
+- Clean up on SIGINT and SIGTERM. Remove the socket directory and any blob files in a `finally`. Call `server.shutdown()` from another thread: it blocks until `serve_forever()` returns, so calling it on the serving thread, including from a signal handler, deadlocks.
+- Watch the parent. Poll `os.getppid()` and exit when it changes. Without this, a plugin whose OCM was killed stays alive until its idle timeout, one hour by default.
+
+### Scenarios
+
+`bash scripts/plugin.sh scenarios [name...]` runs the demo against the failure modes OCM reports. Each row is `<scenario> <ocm> <check> <reason>`: `ocm` is the `ocm download` or `ocm add cv` result, `check` is the script's own digest comparison of the downloaded file, and `reason` is the failure classified from OCM's stderr.
+
+| Scenario | Reason |
+|---|---|
+| `correct` | `-` |
+| `missing-plugin` | `no-plugin` |
+| `config-locations` | `no-plugin` |
+| `malformed-capabilities` | `bad-capabilities` |
+| `malformed-response` | `malformed-response` |
+| `plugin-error` | `plugin-error` |
+| `unsupported-location` | `unsupported-location` |
+| `unknown-blob` | `not-found` |
+| `invalid-spec` | `invalid-spec` |
+| `no-credentials` | `unauthorized` |
+| `tampered-content` | `digest-mismatch` |
+
+### Limitations
+
+- OCM 0.19.1 does not check the bytes served by `/resource/get` against the digest in the descriptor, so a plugin that serves tampered bytes downloads "successfully". `make plugin` catches this with its own comparison (`tampered-content`).
+- `ocm describe types access` lists only built-in access types, not plugin types.
+- There is no `ocm plugin list`. `ocm plugin` only has `registry` subcommands. To see what is registered, run with `--loglevel debug` and read the `discovered plugin` and `adding ... plugin` lines.
+- `locations` under `plugin.config.ocm.software` is always overwritten by `--plugin-directory`, which always has a value, so it never takes effect.
 
 ## Signing and verification
 
@@ -607,6 +804,58 @@ Key pinning is the simplest: rotate the key by deleting the existing key files a
 `scripts/keys.sh`, then re-signing. Sigstore keyless signing records the certificate in a Rekor transparency log, so
 verification does not require a long-lived key: `SIGNING_METHOD=sigstore make sign` uses the
 OIDC token from the CI environment.
+
+## Signing normalisation
+
+`ocm sign cv` does not hash the descriptor as stored. It first normalises it with `jsonNormalisation/v4alpha1` and signs the SHA-256 of the result. The normalised form keeps the fields that are meant to be signed and drops the rest:
+
+- Kept: component `name`, `version`, `provider`, and labels with `signing: true`; for each resource its `name`, `version`, `type`, `relation` and `digest`; for each source and component reference the same kind of fields.
+- Dropped: `meta`, `signatures`, `nestedDigests`, `repositoryContexts`, every `access` block, `srcRefs`, and every label without `signing: true`.
+- The keys are sorted and the JSON is compact before hashing.
+
+The demo component changes one thing per variant so that the effect of each rule is visible in the digests:
+
+```yaml
+name: github.com/lioramilbaum/normalisation-demo
+version: ${VERSION}
+provider:
+  name: github.com/lioramilbaum
+labels:
+  - name: normalisation.lioramilbaum.github.com/note
+    value: "${NORM_NOTE}"
+  - name: normalisation.lioramilbaum.github.com/channel
+    value: "${NORM_CHANNEL}"
+    signing: true
+resources:
+  - name: payload
+    type: plainText
+    version: ${VERSION}
+    input:
+      type: UTF8/v1
+      text: "${NORM_PAYLOAD}"
+```
+
+`make normalisation` builds the application CTF, prints its normalised descriptor, and checks it against `ocm sign cv --dry-run`. It then builds four variants of the demo component and compares their digests:
+
+| Variant | Change | resource-changed | component-changed | Explanation |
+|---|---|---|---|---|
+| `base` | none | - | - | reference point |
+| `unsigned-label` | `note` label changed (no `signing`) | no | no | labels without `signing: true` are dropped from the normalised form |
+| `signed-label` | `channel` label changed (`signing: true`) | no | yes | a signed label is part of the component digest, but not of any resource digest |
+| `blob` | `payload` text changed | yes | yes | the resource digest changes, and the component digest follows it |
+
+The reimplementation in `components/normalisation/jsonNormalisation-v4alpha1.jq` reproduces the OCM digest for every variant: the `jq-matches-ocm` column is `yes` on each row. The jq filter is a reading aid, not a second source of truth. When OCM changes the rules, the `make normalisation` check fails.
+
+Inspect the digest OCM computes without signing:
+
+```bash
+ocm sign cv --config build/sign.ocmconfig --dry-run -o json \
+  ctf::./build/ctf//github.com/lioramilbaum/application:0.1.0 | jq -r '.digest.value'
+```
+
+Only `jsonNormalisation/v4alpha1` is available in this OCM CLI. The older `jsonNormalisation/v1` is rejected: `ocm sign cv --normalisation jsonNormalisation/v1` fails with `unknown normalisation algorithm`. A signature made with that algorithm cannot be produced or verified here.
+
+The rules are described in [Signing and verification](#signing-and-verification): unsigned labels, access and `srcRefs` are outside the signature, and so is anything the signature table there lists as "no".
 
 ## Ownership
 
@@ -839,6 +1088,97 @@ ocm transfer cv \
 The transfer produces a canonical repository containing both components. `make verify` and `bash scripts/product.sh verify` both succeed against it without a resolver config.
 
 Related: [Resolvers](#resolvers) · [Canonical component repositories](#canonical-component-repositories) · [Signing and verification](#signing-and-verification) · [Transfer and transport](#transfer-and-transport)
+
+## Component graphs
+
+A component graph is a set of component versions linked by `componentReferences`. This demo builds a diamond: `github.com/lioramilbaum/graph/platform` references `frontend` and `backend`, and both of those reference the same `runtime` component. The runtime is reachable along two paths, so `ocm get cv --recursive` lists it twice. Each level is built into its own CTF (`build/graph/`), so every reference must be found through a resolver rather than in the same repository. The reference model is described in [Component references](#component-references).
+
+The three constructors: `components/graph/runtime.yaml`, `components/graph/apps.yaml` (frontend and backend in one file) and `components/graph/platform.yaml`:
+
+```yaml
+name: github.com/lioramilbaum/graph/runtime
+version: ${VERSION}
+provider:
+  name: github.com/lioramilbaum
+resources:
+  - name: runtime-notes
+    type: plainText
+    version: ${VERSION}
+    input:
+      type: UTF8/v1
+      text: "${GRAPH_RUNTIME_TEXT}"
+```
+
+```yaml
+components:
+  - name: github.com/lioramilbaum/graph/frontend
+    version: ${VERSION}
+    provider:
+      name: github.com/lioramilbaum
+    componentReferences:
+      - name: runtime
+        componentName: github.com/lioramilbaum/graph/runtime
+        version: ${VERSION}
+    resources:
+      - name: frontend-notes
+        type: plainText
+        version: ${VERSION}
+        input:
+          type: UTF8/v1
+          text: "frontend v${VERSION}"
+  - name: github.com/lioramilbaum/graph/backend
+    version: ${VERSION}
+    provider:
+      name: github.com/lioramilbaum
+    componentReferences:
+      - name: runtime
+        componentName: github.com/lioramilbaum/graph/runtime
+        version: ${VERSION}
+    resources:
+      - name: backend-notes
+        type: plainText
+        version: ${VERSION}
+        input:
+          type: UTF8/v1
+          text: "backend v${VERSION}"
+```
+
+```yaml
+name: github.com/lioramilbaum/graph/platform
+version: ${VERSION}
+provider:
+  name: github.com/lioramilbaum
+componentReferences:
+  - name: frontend
+    componentName: github.com/lioramilbaum/graph/frontend
+    version: ${VERSION}
+  - name: backend
+    componentName: github.com/lioramilbaum/graph/backend
+    version: ${VERSION}
+```
+
+```sh
+make graph   # build the three CTFs, then show the tree, edges, resolver order, transfers and the tamper check; offline
+```
+
+### Resolver order
+
+`scripts/graph.sh` writes `build/graph/resolvers.ocmconfig` with two entries: `github.com/lioramilbaum/graph/runtime` maps to the base CTF, and `github.com/lioramilbaum/graph/*` maps to the apps CTF. A resolver is tried in list order and **first match wins**, with no fallback to later entries. The specific runtime pattern must therefore come before the wildcard. If the wildcard comes first, it matches runtime, the apps CTF does not contain it, and `ocm get cv --recursive` fails. Resolvers are described in [Resolvers](#resolvers).
+
+### Flat and recursive transfer
+
+`make graph` transfers the platform twice, once without and once with `--recursive`, and then checks each result with no resolver config:
+
+| Transfer | Command | Repositories in target | `get cv --recursive` on target, no resolver |
+|---|---|---|---|
+| flat | `ocm transfer cv <platform> ctf::build/graph/flat-ctf` | 1 (platform only) | fails |
+| recursive | `ocm transfer cv <platform> ctf::build/graph/release-ctf --recursive` | 4 (platform, frontend, backend, runtime) | succeeds |
+
+The flat copy is not self-contained: its references point at components the target does not hold. The recursive copy walks the graph and writes all four components, so it works offline. Transfers are described in [Transfer and transport](#transfer-and-transport).
+
+### Transitive digests
+
+Each `componentReferences` entry stores the digest of the referenced descriptor. `ocm transfer cv --recursive` walks the graph and recomputes each digest, so a transitive component that changed after its parent recorded it fails the transfer with `digest mismatch`. `make graph` demonstrates this by replacing the runtime in a copy of the base CTF and transferring the platform again. The flat transfer does not walk references and does not detect the change. The digests use the same normalisation as the signature in [Signing and verification](#signing-and-verification).
 
 ## Version selection
 
@@ -1367,6 +1707,71 @@ The snapshot is a `LocalBlob/v1` in the component, so it downloads in every row.
 
 Related: [Source provenance](#source-provenance) · [Signing and verification](#signing-and-verification) · [Transfer and transport](#transfer-and-transport) · [Credential system](#credential-system)
 
+## GitHub access
+
+`GitHub/v1` is an OCM access type that records a commit of a GitHub repository and downloads that commit's archive through the GitHub REST API. The access stores `repoUrl` and `ref`; the ref is resolved to a `commit` when the component is built, and the download fetches the tarball of that commit. The downloaded bytes must match the digest in the descriptor. `GitHub/v1` is for commit archives, not release assets: a file attached to a GitHub release is a plain HTTP download and uses `Wget/v1` (see [HTTP resources](#http-resources)).
+
+`GitHub/v1` is deprecated in favour of `Git/v1`, which records a repository and a commit in the same way and reads the repository directly instead of the REST API. See [Git repositories](#git-repositories). This demo keeps `GitHub/v1` because its access and digest check are still in use.
+
+### Demo component
+
+`components/github/component-constructor.yaml`:
+
+```yaml
+name: github.com/lioramilbaum/github-demo
+version: ${VERSION}
+provider:
+  name: github.com/lioramilbaum
+resources:
+  - name: hello-world-repo-archive
+    type: blob
+    version: ${VERSION}
+    relation: external
+    access:
+      type: GitHub/v1
+      repoUrl: "${GITHUB_DEMO_REPO_URL}"
+      ref: refs/heads/main
+```
+
+```sh
+make github   # build, sign, verify, download and transfer the GitHub/v1 demo; offline
+```
+
+OCM treats a `repoUrl` whose host is not `github.com` as GitHub Enterprise and sends its requests to `{host}/api/v3/`. `make github` starts `scripts/github-api-server.py` on `127.0.0.1:18451` and serves the endpoints OCM calls:
+
+| Endpoint | Response |
+|---|---|
+| `GET /api/v3/repos/{owner}/{repo}/commits/{ref}` | The commit SHA as plain text with `Accept: application/vnd.github.v3.sha`, `{"sha": ...}` otherwise; `404` for an unknown ref |
+| `GET /api/v3/repos/{owner}/{repo}/tarball/{sha}` | `302` to `/_codeload/{owner}/{repo}/{sha}.tar.gz` |
+| `GET /_codeload/{owner}/{repo}/{sha}.tar.gz` | The archive of the commit |
+| `GET /-/ready`, `GET /-/log` | Readiness, and the requests received so far |
+
+The archive is built in memory with fixed modification times, owner and group, and sorted entries, under a top directory named `{owner}-{repo}-{sha[:7]}/`. The same tree therefore always gives the same digest. The tree is `components/github/upstream/`.
+
+Running `bash scripts/github.sh scenarios` prints one row per scenario, `<scenario> <result> <detail>`:
+
+| Scenario | What changes | Result |
+|---|---|---|
+| `pinned` | nothing | `ok`, with the digest of the archive |
+| `branch-moved` | `refs/heads/main` points at another commit | `pinned-commit-kept`: the download requests the commit recorded at build time |
+| `archive-rewritten` | the emulator adds an entry to the archive of the pinned commit, as if GitHub had regenerated it | `digest-mismatch`: the download is rejected |
+| `api-down` | the emulator is stopped | `connection-refused`: the access needs the API when it is consumed |
+| `copied` | `ocm transfer cv` with `components/github/transfer.ocmconfig` | `LocalBlob/v1`: the archive is inlined and no longer needs the API |
+
+The access keeps the commit from build time, so moving the branch does not change what is downloaded. The digest is checked against the bytes, not the commit, so a rewritten archive for the same commit fails. A rejected download leaves the file at `--output`; `scripts/github.sh` deletes it after the check.
+
+### Online mode
+
+`GITHUB_DEMO_ONLINE=1 bash scripts/github.sh online` builds `build/github/online-ctf` from `components/github/online-constructor.yaml`. The constructor has two resources: the `open-component-model/ocm-examples` repository at a fixed commit (`GitHub/v1`), and the `chart-0.19.1.tgz` release asset of `open-component-model` (`Wget/v1`, see [HTTP resources](#http-resources)). The script downloads both from github.com, prints the top directory of the archive, and checks that the chart starts with the gzip magic bytes. It needs network access. Without `GITHUB_DEMO_ONLINE=1` it prints `skip:` and exits 0.
+
+### Limitations
+
+- S3/v1 and S3/v2 access is covered in [S3 resources](#s3-resources).
+- The emulator serves only the `GitHub/v1` endpoints listed above. Authentication with `GitHubCredentials/v1` is not exercised offline.
+- `make github` needs `python3` and `curl`. The emulator binds `127.0.0.1` only.
+
+Related: [Git repositories](#git-repositories) · [HTTP resources](#http-resources) · [Credential system](#credential-system)
+
 ## GPG signing
 
 OCM can sign a component with an OpenPGP key. The signature is a detached OpenPGP signature over the same normalized descriptor digest that the RSA signature covers. It is stored under the name `gpg` and selected with the consumer identity `GPG/v1alpha1` and the credential type `GPGCredentials/v1alpha1`. The [OCM GPG tutorial](https://ocm.software/docs/tutorials/signing/gpg/) describes the model; this demo runs it offline with keys generated for the run.
@@ -1528,6 +1933,411 @@ The signature is stored in the descriptor, so `ocm transfer cv` carries it to th
 
 Related: [Signing and verification](#signing-and-verification) · [Certificate-chain signing](#certificate-chain-signing) · [Transfer and transport](#transfer-and-transport) · [Credential system](#credential-system)
 
+## OCI images
+
+`ociImage` is the OCM resource type for a container image. OCM stores the image in the component repository as a `LocalBlob/v1` access, so the image is signed, transferred and downloaded with the component instead of being pulled from a registry when the component is consumed.
+
+OCM 0.19.1 has no `ociImage` input type: a constructor with `input: type: ociImage` fails with `no input method resolvable for input specification of type ociImage`. The demo therefore builds each image from a local OCI image layout tar, using the `file` input type with media type `application/vnd.ocm.software.oci.layout.v1+tar`. The demo runs offline.
+
+### Demo component
+
+```yaml
+# Demo component for OCI image resources (ociImage from local OCI layout tars).
+name: github.com/lioramilbaum/oci-demo
+version: ${VERSION}
+provider:
+  name: github.com/lioramilbaum
+resources:
+  - name: hello-image
+    type: ociImage
+    version: ${VERSION}
+    extraIdentity:
+      architecture: amd64
+    input:
+      type: file
+      path: ./hello-oci-amd64.oci.tar
+      mediaType: application/vnd.ocm.software.oci.layout.v1+tar
+  - name: hello-image
+    type: ociImage
+    version: ${VERSION}
+    extraIdentity:
+      architecture: arm64
+    input:
+      type: file
+      path: ./hello-oci-arm64.oci.tar
+      mediaType: application/vnd.ocm.software.oci.layout.v1+tar
+  - name: hello-image-multiarch
+    type: ociImage
+    version: ${VERSION}
+    input:
+      type: file
+      path: ./hello-oci-multiarch.oci.tar
+      mediaType: application/vnd.ocm.software.oci.layout.v1+tar
+```
+
+```bash
+make oci   # build, sign, verify and download the OCI image demo; offline (requires python3, tar)
+```
+
+`hello-image` appears twice, once per architecture, with `extraIdentity.architecture` set to `amd64` and `arm64`. `hello-image-multiarch` is an OCI image index that refers to both single-architecture images. `make oci` builds, signs, verifies and downloads all three resources, then prints one `resource` row for each.
+
+### Layouts
+
+`components/oci/layout.py` writes the three tars that the constructor references, and the tars are committed. The generator is deterministic: USTAR format, `mtime` 0, uid and gid 0, sorted entries and canonical JSON. The test suite checks that a fresh run reproduces the committed tars byte for byte.
+
+An OCI image layout holds `oci-layout`, `index.json` and `blobs/sha256/<hex>`, where every blob is named by its own digest:
+
+- A single-architecture image: `index.json` lists one manifest. The manifest points to a config (`architecture`, `os`, `rootfs.diff_ids`) and to one layer, a tar that holds `hello.txt` with the content `hello from <arch>`.
+- The multi-architecture image: `index.json` lists one image index, and that index lists the two single-architecture manifests, each with a `platform` entry (`architecture`, `os`).
+
+### Inside the resource
+
+The descriptor records each image as `access: LocalBlob/v1`, with the blob digest as `localReference` and the manifest (or index) media type as `mediaType`. The resource digest is that same digest: the manifest digest for an architecture and the index digest for `hello-image-multiarch`.
+
+`ocm download resource` writes the layout back out with its own `index.json` annotations, so the verifier checks each blob against its file name rather than comparing `index.json` byte for byte. `scripts/oci.sh inspect` prints the verified content as `image` and `layer` rows (fields are tab-separated):
+
+```text
+image  hello-image  amd64  application/vnd.oci.image.manifest.v1+json  sha256:<manifest digest>
+layer  hello-image  amd64  sha256:<layer digest>  hello from amd64
+```
+
+`download` and `inspect` verify the signature first, so they fail on an unsigned component.
+
+### Multi-arch
+
+Each single-architecture resource carries `extraIdentity.architecture`, so it can be selected by identity, for example `ocm download resource --identity name=hello-image,architecture=arm64`. The index `hello-image-multiarch` has no extra identity. A consumer that needs every platform downloads the index, and the `platform` entries of its manifests say which variant is which.
+
+### Transfer
+
+`scripts/oci.sh plan` dry-runs `ocm transfer cv` to `oci::http://registry.example.invalid/mirror` in three modes and prints the transformation count for each type. The plan, review and replay workflow is described in [Transfer and transport](#transfer-and-transport):
+
+| Mode | Flags | Result with OCM 0.19.1 |
+|---|---|---|
+| `plain` | none | three `OCIAddLocalResource/v1alpha1`: the images stay `LocalBlob/v1` |
+| `copy-resources` | `--copy-resources` | same as `plain`: the images are local blobs, not external resources, so nothing is copied |
+| `uploader` | `--config components/oci/relocate.ocmconfig` | three `AddOCIArtifact/v1alpha1`: each image is pushed as its own `ociArtifact/v1` |
+
+### Localization
+
+Image references are localized at three levels:
+
+- **Build time**: `${VAR}` substitution in the constructor (`ocm add cv` expands `${VERSION}` here). This works for any string in the constructor.
+- **Transfer time**: `components/oci/relocate.ocmconfig` holds `oci.uploader.transfer.config.ocm.software/v1alpha1` entries. Their `imageReference` is a CEL expression over the target, so each image is pushed as `<target>/mirror/hello-image:<version>-<arch>` (the index as `<version>`). The descriptor keeps the same digests, so the signature survives. `scripts/oci.sh relocate` is a dry run: it prints each access and the expression that OCM evaluates when the plan is replayed. A replay against a registry rewrites the accesses to `ociArtifact/v1`, keeps the digests, and `ocm verify` still passes on the target. The `relocate` rows show the expression, not the pushed references, because the references exist only after a push.
+- **Deploy time**: `localizationConfig` rules map image resources to container fields, and `scripts/manifests.sh` renders them, as in the `hello-world` component (see [How it works](#how-it-works)).
+
+`ocm add cv --config` does NOT substitute image references. Its file is OCM configuration (credentials, signing, and so on). The uploader entries in `relocate.ocmconfig` apply to `ocm transfer cv`.
+
+### Limitations
+
+- OCM 0.19.1 has no `ociImage` input type, so images come from layout tars.
+- A local image reaches a registry only through an uploader entry with an explicit `imageReference`. `--copy-resources` does not move local images.
+- The `imageReference` expressions use `target.baseUrl`, so they work for `oci::` targets only. A CTF target fails with `no such key: baseUrl`.
+- `download` and `inspect` require a valid signature.
+
+## Local OCI registry
+
+This demo runs a plain-HTTP OCI registry on your machine, pushes a demo component to it, signs and verifies it there, and pulls it back. The registry is a `registry:2` container on `127.0.0.1`, so it needs Docker. `build` does not.
+
+### Demo component
+
+`scripts/registry.sh` writes this constructor to `build/registry/component-constructor.yaml`:
+
+```yaml
+# Demo component for local OCI registry demo.
+name: github.com/lioramilbaum/registry-demo
+version: ${VERSION}
+provider:
+  name: github.com/lioramilbaum
+resources:
+  - name: release-notes
+    type: blob
+    version: ${VERSION}
+    input:
+      type: UTF8/v1
+      text: "github.com/lioramilbaum/registry-demo ${VERSION}"
+```
+
+```bash
+make registry                   # start the registry, then build, push, sign, verify, pull and show
+bash scripts/registry.sh stop   # remove the container and its data
+```
+
+### Start a registry
+
+`scripts/registry.sh start` runs `registry:2@sha256:a3d8…` (pinned by digest) as container `ocm-demo-registry`, published on `127.0.0.1:5055`. It is idempotent: when the container already runs, it waits until the registry answers and prints the repository. Override the defaults with `REGISTRY_NAME`, `REGISTRY_HOST`, `REGISTRY_PORT` and `REGISTRY_PATH`.
+
+### Push
+
+`scripts/registry.sh build` writes the component to `build/registry-ctf` with `ocm add cv`. `scripts/registry.sh push` copies it into the registry with `ocm transfer cv`:
+
+```bash
+ocm transfer cv ctf::build/registry-ctf//github.com/lioramilbaum/registry-demo:0.1.0 oci::http://127.0.0.1:5055/ocm
+```
+
+The registry has no authentication, so no credentials are needed. Authenticated registries need a consumer configuration; see [Credential system](#credential-system).
+
+### Repository identity
+
+The registry address for the component is `oci::http://127.0.0.1:5055/ocm//github.com/lioramilbaum/registry-demo:0.1.0`:
+
+- `oci::` is the optional repository type prefix.
+- `http://` selects plain HTTP. Without it OCM uses HTTPS, which fails against this registry.
+- `127.0.0.1:5055` is the registry host and port.
+- `/ocm` is the base path. It is part of the repository identity.
+- `//` separates the repository from the component name.
+- `:0.1.0` is the component version. OCI stores it as the tag `0.1.0` of `ocm/component-descriptors/github.com/lioramilbaum/registry-demo`.
+
+The registry catalog lists that repository:
+
+```bash
+curl http://127.0.0.1:5055/v2/_catalog
+# {"repositories":["ocm/component-descriptors/github.com/lioramilbaum/registry-demo"]}
+```
+
+`scripts/registry.sh show` prints the catalog, the component from `ocm get cv`, its resources and its signatures.
+
+### Sign and verify
+
+`scripts/registry.sh sign` runs `ocm sign cv` against the registry copy and stores the signature `default` in its descriptor. `scripts/registry.sh verify` runs `ocm verify cv` with `build/verify.ocmconfig`. The source CTF stays unsigned.
+
+Signing the registry copy again fails with `signature "default" already exists`.
+
+### Re-push overwrites signatures
+
+A second `ocm transfer cv` from the unsigned CTF replaces the registry descriptor and drops the registry signature (OCM 0.19.1). Sign again after each push. See [Transfer and transport](#transfer-and-transport) for how transfers carry signatures.
+
+### Pull
+
+`scripts/registry.sh pull` verifies the signature, then runs `ocm download resource` for `release-notes` and checks its sha256 against the descriptor digest. It transfers the component back into a CTF with `ocm transfer cv`:
+
+```text
+build/registry/download/release-notes
+ctf::build/registry/pulled-ctf
+```
+
+### Cleanup
+
+`bash scripts/registry.sh stop` removes the container and the registry data. The next `start` begins with an empty registry.
+
+### Limitations
+
+- Plain HTTP only, with no authentication and no TLS. Use it on `127.0.0.1` for demos, not for shared registries.
+- Registry data is lost on `stop`.
+- `start`, `stop` and `make registry` require a running Docker daemon. `build` works without Docker. `push`, `sign`, `verify`, `pull` and `show` need the registry to be running.
+
+## S3 resources
+
+`S3/v1` and `S3/v2` are OCM access types for objects in an S3-compatible bucket. The access records where the object lives, and OCM downloads it with the credentials of a matching consumer identity. `S3/v1` names the object with `bucket` and `key`. `S3/v2` names it with `bucketName` and `objectKey`, and can pin the object to a version with `version`.
+
+This demo runs `rustfs/rustfs`, an S3-compatible server; MinIO was replaced because its community Docker images were removed in October 2025. The image is pinned by digest in `scripts/s3.sh`. The demo needs Docker and `curl` 7.75 or newer, because it signs its requests with `--aws-sigv4`. Without a Docker daemon the script prints `skip:` and exits 0.
+
+The AWS SDK falls back to the default credential chain (environment variables, `~/.aws`, instance metadata) when no consumer identity matches. `scripts/s3.sh` points `AWS_SHARED_CREDENTIALS_FILE` and `AWS_CONFIG_FILE` at `/dev/null`, unsets the `AWS_*` variables and disables the metadata endpoint. Without that, a missing consumer entry would silently use your own AWS account.
+
+### Demo component
+
+`components/s3/component-constructor.yaml`:
+
+```yaml
+name: github.com/lioramilbaum/s3-demo
+version: ${VERSION}
+provider:
+  name: github.com/lioramilbaum
+resources:
+  - name: notes-v1
+    type: plainText
+    version: ${VERSION}
+    relation: external
+    access:
+      type: S3/v1
+      bucket: ocm-demo
+      key: releases/notes.txt
+      region: us-east-1
+      endpoint: "${S3_DEMO_ENDPOINT}"
+      usePathStyle: true
+    mediaType: text/plain
+  - name: notes
+    type: plainText
+    version: ${VERSION}
+    relation: external
+    access:
+      type: S3/v2
+      bucketName: ocm-demo
+      objectKey: releases/notes.txt
+      region: us-east-1
+      endpoint: "${S3_DEMO_ENDPOINT}"
+      usePathStyle: true
+    mediaType: text/plain
+  - name: notes-pinned
+    type: plainText
+    version: ${VERSION}
+    relation: external
+    access:
+      type: S3/v2
+      bucketName: ocm-demo-versioned
+      objectKey: releases/notes.txt
+      region: us-east-1
+      endpoint: "${S3_DEMO_ENDPOINT}"
+      usePathStyle: true
+    mediaType: text/plain
+  - name: notes-input
+    type: plainText
+    version: ${VERSION}
+    input:
+      type: S3/v2
+      bucketName: ocm-demo
+      objectKey: releases/notes.txt
+      region: us-east-1
+      endpoint: "${S3_DEMO_ENDPOINT}"
+      usePathStyle: true
+      mediaType: text/plain
+```
+
+```sh
+make s3   # start the server, seed the buckets, build, sign, verify, download and run the scenarios; offline except for the local server
+bash scripts/s3.sh stop   # remove the container
+```
+
+`notes`, `notes-v1` and `notes-pinned` are `relation: external`: the bytes stay in the bucket and the component records only the access. `notes-input` is an `input`: `ocm add cv` reads the object once and stores it as a `LocalBlob/v1`.
+
+### Credentials
+
+The consumer identity of an S3 access is `bucketName/objectKey` (for `S3/v1`, `bucket/key`) on the endpoint host. The credential entry must match it:
+
+| Field | Value in this demo | Meaning |
+|---|---|---|
+| `type` | `S3` | Identity type; the credential type is `S3Credentials/v1` |
+| `scheme` | `http` | Compared only when the entry sets it |
+| `hostname` | `127.0.0.1` | Must be equal; there are no hostname wildcards |
+| `port` | `"19000"` | Quoted string |
+| `path` | optional, for example `ocm-demo/releases/*` | `path.Match` pattern on `bucket/key`; `*` stays within one segment |
+
+Credentials are the top-level fields `accessKeyId` and `secretAccessKey` of `S3Credentials/v1`. `path: ocm-demo/**` does not match in OCM 0.19.1, because `**` is not supported until 0.21.0. Use one `*` per segment instead.
+
+### Object versioning
+
+An S3 object has no digest in its descriptor unless OCM computes one at build time. The bucket decides what the access can pin:
+
+- In an unversioned bucket (`ocm-demo`), `ocm add cv` warns that the object `carries no version`. A later overwrite of the object changes what the access resolves to, and the digest check then fails.
+- In a versioned bucket (`ocm-demo-versioned`), the build records the `x-amz-version-id` of the object in the access (`version`). Overwrites create new versions, and the pinned version keeps its bytes.
+
+### Input vs access
+
+`notes-input` embeds the bytes at build time, so the component carries them as a `LocalBlob/v1`. The other three resources depend on the server at consume time. Changing the object afterwards does not affect `notes-input`, and the signed digest covers the bytes that were read at build time.
+
+### Scenarios
+
+`bash scripts/s3.sh scenarios` prints one row per scenario, `<scenario> <resource> <result>`:
+
+| Scenario | What changes | Result |
+|---|---|---|
+| `pinned` | nothing | `ok` for `notes` and `notes-v1` |
+| `overwritten` | the object in `ocm-demo` is replaced | `digest-mismatch` for `notes` and `notes-v1` |
+| `overwritten-versioned` | the object in `ocm-demo-versioned` is replaced | `ok` for `notes-pinned`: the pinned version keeps its bytes |
+| `overwritten-input` | the object in `ocm-demo` is replaced | `ok` for `notes-input`: the embedded bytes are not fetched |
+| `no-credentials` | the config has no consumer entry | `credentials-missing` |
+| `glob-star` | consumer `path: ocm-demo/releases/*` | `ok` |
+| `glob-doublestar` | consumer `path: ocm-demo/**` | `credentials-missing` |
+| `copied-v2` | `ocm transfer cv --copy-resources` | `LocalBlob/v1` for `notes` |
+| `copied-v1` | the same transfer | `S3/v1` for `notes-v1` (the transfer leaves it as it is) |
+| `server-down` | the container is stopped | `connection-refused` for `notes`; `ok` for `notes-input` |
+
+### Transfer
+
+`ocm transfer cv --copy-resources` downloads the `S3/v2` resources and stores them as `LocalBlob/v1`, so the target no longer needs the bucket. In OCM 0.19.1 the `S3/v1` access is kept as it is, so `notes-v1` still needs the bucket after the transfer.
+
+### Limitations
+
+- `make s3` needs Docker, and the container's data is lost on `stop`.
+- `make s3` needs `curl` 7.75 or newer for `--aws-sigv4`.
+- The demo does not exercise STS or temporary credentials.
+
+Related: [Credential system](#credential-system) · [Resource repositories](#resource-repositories) · [Local OCI registry](#local-oci-registry)
+
+## Resources without access (None)
+
+A resource with `access: type: None` is listed in the component, but OCM has no access to fetch its bytes. It records that an artifact exists and where it belongs: provenance records, attestations and artifacts that live outside OCM.
+
+**`None` resources are not signed.** Before hashing, `jsonNormalisation/v4alpha1` drops the `digest` of every resource whose access type is `None` (see [Signing normalisation](#signing-normalisation)). A digest written for a `None` resource therefore changes neither the component digest nor the signature. OCM also warns that it cannot use that digest. To bind the external bytes to the signature, put their sha256 in a label with `signing: true` (see [Binding external bytes](#binding-external-bytes)).
+
+### Demo component
+
+`components/none-access/component-constructor.yaml`:
+
+```yaml
+name: github.com/lioramilbaum/none-access-demo
+version: ${VERSION}
+provider:
+  name: github.com/lioramilbaum
+resources:
+  - name: release-notes
+    type: plainText
+    version: ${VERSION}
+    input:
+      type: UTF8/v1
+      text: "none-access-demo v${VERSION}"
+  - name: provenance
+    type: blob
+    version: ${VERSION}
+    relation: external
+    access:
+      type: None
+    labels:
+      - name: none-access.lioramilbaum.github.com/sha256
+        value: "c2b17a7d610d86431dea41e82908b0187166b17990244fcd5e12a759167eee4e"
+        signing: true
+```
+
+`release-notes` is an ordinary local input and downloads as usual. `provenance` is the `None` resource. Its bytes are `components/none-access/provenance.json`, which lives outside OCM. The `none-access.lioramilbaum.github.com/sha256` label carries the sha256 of that file.
+
+```sh
+make none-access   # build, sign and verify; show the descriptor, download, audit, variants and transfer; offline
+```
+
+### Variants
+
+`scripts/none-access.sh variants` builds seven variants of the constructor and reports the access type, whether the resource has a digest, whether the component digest is the same as the base, and the warning from `ocm sign cv --dry-run`:
+
+| Variant | Change | Has digest | Component digest same as base | Sign warning |
+|---|---|---|---|---|
+| `base` | plain `None`, no digest | no | - | none |
+| `digest-a` | `None` with an explicit digest | yes | yes | `digest for resource with empty access not allowed` |
+| `digest-b` | `None` with a different explicit digest | yes | yes | `digest for resource with empty access not allowed` |
+| `lowercase` | `type: none` | no | yes | `missing digest in resource` |
+| `versioned-type` | `None/v1` with a digest | yes | no | none |
+| `renamed` | resource named `attestation` | no | no | none |
+| `label-changed` | signed label value changed | no | no | none |
+
+The first three rows show that the digest of a `None` resource is not signed: `digest-a` and `digest-b` carry different digests and produce the same component digest as the base. OCM warns about the digest when signing, but the signature does not cover it. The last three rows show what is signed: a digest on a `None/v1` resource, the resource name and the signed label each change the component digest.
+
+### The `None/v1` trap
+
+`None/v1` is not the `None` access type. OCM 0.19.1 treats it as an unknown access type, so normalisation keeps its digest. The `versioned-type` variant has a digest and therefore changes the component digest, and the signature covers it. Write `None` exactly, without a version, to get the behaviour described above.
+
+### `None` and `none`
+
+Normalisation accepts both `None` and the lowercase `none` and drops the digest in both cases. The signing step does not treat them the same way: the lowercase form with no digest reports `missing digest in resource`, while `None` with no digest reports nothing. Write `None` exactly.
+
+### Binding external bytes
+
+The `signing: true` label on `provenance` is part of the signed component. Changing the label, or the file it names, fails `make verify` or the audit. The audit checks the file against the label:
+
+```sh
+bash scripts/none-access.sh audit   # verify the signature, then compare provenance.json with the signed label
+```
+
+The audit prints `audit passed` and the sha256 when the file matches the label. When the file has been changed, it exits with `audit failed`. The label binds the file only if the file is distributed with the component and checked by the audit; a copy of the component without the file cannot be audited.
+
+### Transfer
+
+`ocm transfer cv` keeps `provenance` as `None`, and so does `--copy-resources`, because there are no bytes to copy. Both transfers verify with the original signature.
+
+### Limitations
+
+- `ocm download resource` fails for `provenance` with `failed to get plugin for typ "None"`. The script reports this as `no-access`.
+- The audit only proves that the file matches the label. It does not check where the file came from.
+
+Related: [Signing normalisation](#signing-normalisation) · [Signing and verification](#signing-and-verification) · [Transfer and transport](#transfer-and-transport)
+
 ## Prerequisites
 
 - OCM CLI v2 ≥ 0.17.0 (publishing with `OCM_REGISTRY_USERNAME`/`OCM_REGISTRY_PASSWORD` requires ≥ 0.19.1); `make versions`, `make wget` and `make git` require ≥ 0.19.0
@@ -1536,12 +2346,13 @@ Related: [Signing and verification](#signing-and-verification) · [Certificate-c
 - `shellcheck` (for linting)
 - `jq`
 - `openssl` (`make pki` uses `openssl ca` to issue demo certificates; tested with OpenSSL 3.0 and 4.0 and LibreSSL 3.3)
-- `python3` and `curl` (for `make wget`: the local upstream server and its readiness check)
+- `python3` and `curl` (for `make wget`, `make credentials`, and `make plugin`: the local upstream and recording servers, the demo-store plugin (Python 3.9+ stdlib only), and their readiness/probe checks)
 - `git` 2.32 or newer (for `make git`: creates the demo repository and reads it back)
 - `gpg` (GnuPG 2.2 or newer, for `make gpg`)
+- `python3` and `tar` (for `make oci`: `components/oci/layout.py` writes the layout tars, and `tar` reads the layers back)
 - `kubectl` (for deploying and for `make manifests`, which uses `kubectl kustomize`)
 - `helm` is optional, only for rendering the downloaded chart with `helm template`
-- `docker` (for `make e2e` or `make e2e-run` only)
+- `docker` (for `make e2e` or `make e2e-run` only, and for `make registry`)
 - Docker Hub access for `make build` and `make test` (to resolve `nginx:1.31-alpine`)
 
 OCM CLI and kind are provided by the devcontainer image. Outside the devcontainer, put `ocm` and `kind` on your PATH.
@@ -1567,11 +2378,20 @@ make ownership       # build the ownership demo component and trace the owner of
 make sbom            # regenerate the CycloneDX SBOM (build/sbom/hello-world.cdx.json); also run by make build
 make product         # build, sign and verify the product component that references the application
 make versions  # build the versions demo and show constraint/--latest/scheme selection
+make credentials  # build and show credential matching; offline
 make helm      # build, sign, verify and download the Helm chart demo (helm/v1 input, --transformer helm); offline
 make wget      # build, sign, verify and download the HTTP resources demo (Wget/v1 input and access); offline, requires OCM >= 0.19.0
 make pki        # create a demo CA, build, sign with a PEM certificate-chain signature and verify against the root CA; offline
 make git        # build, sign, verify and audit the Git source demo (Git/v1 source, access and input); offline, requires OCM >= 0.19.0
 make gpg        # build, sign, verify and download the GPG (OpenPGP) signing demo; offline
+make oci        # build, sign, verify and download the OCI image demo (ociImage from local OCI layout, multi-arch index); offline, requires python3 and tar
+make plugin     # install the demo-store plugin, build, download through it and show its capabilities; offline (requires python3, curl)
+make registry   # start a local registry, push, sign, verify, pull and show the demo component; requires Docker
+make graph      # build a three-level component graph (platform, frontend and backend, runtime) across three CTFs; show get cv --recursive, resolver order, flat vs recursive transfer and tamper detection; offline
+make github     # build, sign, verify, download and transfer the GitHub/v1 demo against a local GitHub REST API emulator; offline, requires python3 and curl
+make normalisation   # show the jsonNormalisation/v4alpha1 form of the application descriptor, compare it with ocm sign --dry-run, and show digest changes for label and blob variants; offline
+make s3          # start a local S3-compatible server, build, sign, verify and download the S3/v1 and S3/v2 demo; requires Docker (stop with: bash scripts/s3.sh stop)
+make none-access # build, sign and verify a component with a None-access resource; show that its digest is not signed, that download fails gracefully and how the signed label binds the external bytes; offline
 ```
 
 ## Consuming the component
@@ -1707,7 +2527,7 @@ Tests include:
 - Canonical component repositories (CTF): `ctf layout is canonical`, `ctf archive is portable and signed`, `readme documents canonical component repositories`
 - Kubernetes controller: `readme documents kubernetes controller`
 - Kubernetes deployer: `readme documents kubernetes deployer`
-- Plugin system: `builtin plugins serve component types`, `readme documents plugin system`
+- Plugin system: `builtin plugins serve component types`, `readme documents plugin system`, demo plugin: `plugin capabilities returns access type`, `plugin healthz responds`, `plugin build registers access type`, `plugin download returns blob`, `plugin identity endpoint`, `plugin missing plugin fails gracefully`, `plugin show lists capabilities`, `plugin scenarios correct response`, `plugin scenarios malformed response`, `plugin loglevel debug shows registration`, `make plugin target`, `readme documents plugin demo`
 - Signing and verification: `signature covers normalized descriptor`, `readme documents signing and verification`
 - Component identity: `component identity selects artifacts`, `component identity rules enforced`, `readme documents component identity`
 - Kubernetes component discovery: `discovery selects image variants`, `readme documents kubernetes component discovery`
@@ -1716,7 +2536,15 @@ Tests include:
 - HTTP resources: `wget resource metadata`, `wget pinned digest matches upstream file`, `wget pinned digest rejects mismatch`, `wget input embeds bytes at build time`, `wget access needs server at consume time`, `wget download rejects changed upstream`, `wget download requires signature`, `wget checksum require rejects unadvertised`, `wget checksum matrix`, `wget rejects invalid checksum mode`, `wget credentials resolved by url identity`, `wget transfer reference vs copy`, `wget transfer copy enforces digest`, `wget requires ocm 0.19`, `wget server port in use`, `wget show reports resources`, `make wget target`, `readme documents http resources`
 - Certificate-chain signing: `pki signature is pem encoded`, `pki verifier pins only root`, `pki scenarios`, `pki rotation keeps verifier config`, `pki certs are reused`, `pki reissues expiring leaf`, `pki signature covers descriptor`, `pki signature survives transfer`, `pki verify requires signature`, `pki own pki requires all vars`, `pki own pki uses supplied files`, `pki show reports chain`, `make pki target`, `readme documents certificate-chain signing`
 - Git repositories: `git resource metadata`, `git ref pinned at build time`, `git upstream is deterministic`, `git snapshot matches commit tree`, `git digest covers tree not commit`, `git signature binds commit label`, `git audit matches snapshot`, `git audit rejects wrong commit label`, `git audit requires signature`, `git scenarios`, `git transfer carries snapshot only`, `git uploader cannot copy git access`, `git own repo requires both vars`, `git own repo uses supplied repository`, `git rejects sha256 repository`, `git requires ocm 0.19`, `git show reports provenance`, `make git target`, `readme documents git repositories`
+- OCI images: `oci layout is reproducible`, `oci image resource metadata`, `oci resource digest is manifest digest`, `oci download yields oci layout`, `oci multiarch index references variants`, `oci download requires signature`, `oci signature covers image digest`, `oci transfer plan copy-resources leaves local images`, `oci transfer plan uploader rewrites references`, `oci transfer to ctf keeps digests`, `oci inspect reports architectures`, `localization relocate rewrites access keeps digest`, `localization readme documents three levels`, `make oci target`, `readme documents oci images`
 - Version selection: `versions lists newest first`, `versions constraint filters`, `versions latest includes prereleases by default`, `versions scheme orders build numbers`, `versions without scheme misorders`, `versions reference requires semver`, `versions requires ocm 0.19`, `versions show reports selection`, `make versions target`, `readme documents version selection`
+- Credential system: `credentials build creates ctf`, `credentials show lists consumer types`, `credentials match exact wins over wildcard`, `credentials match wildcard catches subpath`, `credentials match path star does not cross slash`, `credentials chain combines configs`, `credentials wget identity hostname required`, `credentials wget identity port attribute`, `credentials generic config wraps multiple`, `credentials scenarios matrix output`, `make credentials target`, `readme documents credential system`
+- Local OCI registry: `registry start creates container`, `registry push component`, `registry get cv from registry`, `registry sign in registry`, `registry verify signed component`, `registry pull downloads resource`, `registry stop removes container`, `registry push idempotent`, `registry transfer preserves resources`, `registry unsigned verify fails`, `registry oci url format` (these report SKIP without Docker); `registry docker available`, `make registry target` and `readme documents local oci registry` always run
+- Component graphs: `graph references span three repositories`, `graph recursive get walks all levels`, `graph resolver order first match wins`, `graph recursive transfer collects graph`, `graph flat transfer is not self contained`, `graph plan uploads shared reference once`, `graph transfer detects changed transitive reference`, `make graph target`, `readme documents component graphs`
+- GitHub access: `github archive is deterministic`, `github access pinned at build time`, `github download matches digest`, `github ref moved keeps pinned commit`, `github download rejects rewritten archive`, `github access needs api at consume time`, `github transfer copy inlines archive`, `github server port in use`, `github online is opt in`, `github online release asset` (SKIP unless `OCM_ONLINE_TESTS=1`), `make github target`, `readme documents github access`
+- Signing normalisation: `normalisation matches ocm digest`, `normalisation excludes unsigned fields`, `normalisation label vs blob digests`, `normalisation reimplementation matches each variant`, `normalisation rejects legacy v1`, `make normalisation target`, `readme documents signing normalisation`
+- S3 resources: `s3 image pinned by digest`, `s3 docker skip without docker`, `s3 seed uploads object`, `s3 access records endpoint`, `s3 access v1 uses bucket key fields`, `s3 access v2 uses bucket name fields`, `s3 unversioned build warns no pin`, `s3 versioned bucket pins version`, `s3 input becomes local blob`, `s3 download v1 and v2`, `s3 download rejects overwritten object`, `s3 pinned version survives overwrite`, `s3 input works offline`, `s3 credentials required`, `s3 glob star matches`, `s3 doublestar not matched`, `s3 transfer copies v2 only`, `s3 stop removes container`, `make s3 target`, `readme documents s3 resources` (these report SKIP without Docker, except the static checks)
+- Resources without access (None): `none-access sha256 matches constructor label`, `none-access resource has no digest in descriptor`, `none-access build warns no digest processor`, `none-access control resource downloads`, `none-access download fails gracefully`, `none-access sign and verify`, `none-access digest not signed`, `none-access digest triggers warning`, `none-access lowercase warns missing digest`, `none-access versioned type is not none`, `none-access identity is signed`, `none-access label is signed`, `none-access audit passes`, `none-access audit detects tamper`, `none-access transfer keeps none`, `none-access copy resources keeps none`, `make none-access target`, `readme documents none access`
 
 ## CI
 

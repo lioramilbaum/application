@@ -1,0 +1,8 @@
+type: generic.config.ocm.software/v1
+configurations:
+  - type: oci.uploader.transfer.config.ocm.software/v1alpha1
+    match: resource.name == "hello-image"
+    imageReference: '${target.baseUrl + (target.subPath == "" ? "" : "/" + target.subPath) + "/hello-image:" + resource.version + "-" + resource.extraIdentity.architecture}'
+  - type: oci.uploader.transfer.config.ocm.software/v1alpha1
+    match: resource.name == "hello-image-multiarch"
+    imageReference: '${target.baseUrl + (target.subPath == "" ? "" : "/" + target.subPath) + "/hello-image:" + resource.version}'

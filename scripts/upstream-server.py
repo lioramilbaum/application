@@ -3,16 +3,20 @@
 
 Serves --root and, per request, adds a Content-Digest header (RFC 9530) whose
 mode is read from --digest-file: none, sha-256, sha-512 or wrong. With
---auth-file, every path except /-/ready requires Basic auth.
+--auth-file, every path except /-/ready requires Basic auth. With --auth-log,
+every request is appended to FILE as method, path and Basic username; without
+--auth-file, requests that carry no credentials get a 401 challenge.
 """
 
 import argparse
 import base64
+import binascii
 import functools
 import hashlib
 import http.server
 import os
 import sys
+import threading
 
 
 class UpstreamHandler(http.server.SimpleHTTPRequestHandler):
@@ -38,14 +42,35 @@ class UpstreamHandler(http.server.SimpleHTTPRequestHandler):
         if path == "/-/ready":
             self._empty(204)
             return False
+        if self.server.auth_log:
+            with self.server.auth_log_lock, open(self.server.auth_log, "a", encoding="utf-8") as f:
+                f.write(f"{self.command}\t{self.path}\t{self._basic_user()}\n")
         if self.server.auth is not None and self.headers.get("Authorization") != "Basic " + self.server.auth:
-            self.send_response(401)
-            self.send_header("WWW-Authenticate", 'Basic realm="upstream"')
-            self.send_header("Content-Length", "0")
-            self.end_headers()
+            self._unauthorized("upstream")
+            return False
+        if self.server.auth is None and self.server.auth_log and self._basic_user() == "-":
+            self._unauthorized("demo")
             return False
         self.content_digest = self._digest_header(path)
         return True
+
+    def _basic_user(self):
+        header = self.headers.get("Authorization")
+        if header is None:
+            return "-"
+        if not header.startswith("Basic "):
+            return "?"
+        try:
+            creds = base64.b64decode(header[len("Basic "):], validate=True).decode("utf-8")
+        except (binascii.Error, UnicodeDecodeError):
+            return "?"
+        return creds.split(":", 1)[0]
+
+    def _unauthorized(self, realm):
+        self.send_response(401)
+        self.send_header("WWW-Authenticate", f'Basic realm="{realm}"')
+        self.send_header("Content-Length", "0")
+        self.end_headers()
 
     def _empty(self, status):
         self.send_response(status)
@@ -83,6 +108,7 @@ def main(argv=None):
     parser.add_argument("--port", type=int, required=True)
     parser.add_argument("--digest-file", required=True)
     parser.add_argument("--auth-file")
+    parser.add_argument("--auth-log")
     args = parser.parse_args(argv)
 
     try:
@@ -100,6 +126,8 @@ def main(argv=None):
 
     server.digest_file = args.digest_file
     server.auth = auth
+    server.auth_log = args.auth_log
+    server.auth_log_lock = threading.Lock()
     try:
         server.serve_forever()
     except KeyboardInterrupt:

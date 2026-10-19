@@ -1,0 +1,31 @@
+components:
+  - name: github.com/lioramilbaum/graph/frontend
+    version: ${VERSION}
+    provider:
+      name: github.com/lioramilbaum
+    componentReferences:
+      - name: runtime
+        componentName: github.com/lioramilbaum/graph/runtime
+        version: ${VERSION}
+    resources:
+      - name: frontend-notes
+        type: plainText
+        version: ${VERSION}
+        input:
+          type: UTF8/v1
+          text: "frontend v${VERSION}"
+  - name: github.com/lioramilbaum/graph/backend
+    version: ${VERSION}
+    provider:
+      name: github.com/lioramilbaum
+    componentReferences:
+      - name: runtime
+        componentName: github.com/lioramilbaum/graph/runtime
+        version: ${VERSION}
+    resources:
+      - name: backend-notes
+        type: plainText
+        version: ${VERSION}
+        input:
+          type: UTF8/v1
+          text: "backend v${VERSION}"

@@ -15,20 +15,36 @@ WGET_OCM="${WGET_OCM:-$OCM}"
 # OCM >= 0.19.0 is needed for Git/v1 input and access.
 GIT_OCM="${GIT_OCM:-$OCM}"
 GPG_OCM="${GPG_OCM:-$OCM}"
+OCI_OCM="${OCI_OCM:-$OCM}"
+CREDENTIALS_OCM="${CREDENTIALS_OCM:-$OCM}"
+# OCM >= 0.19.0 is needed for --plugin-directory and external plugins.
+PLUGIN_OCM="${PLUGIN_OCM:-$OCM}"
+REGISTRY_OCM="${REGISTRY_OCM:-$OCM}"
+GRAPH_OCM="${GRAPH_OCM:-$OCM}"
+GITHUB_OCM="${GITHUB_OCM:-$OCM}"
+NORM_OCM="${NORM_OCM:-$OCM}"
+S3_OCM="${S3_OCM:-$OCM}"
+NONE_OCM="${NONE_OCM:-$OCM}"
 
 PASS=0
 FAIL=0
+SKIP=0
 
+# A test exits 77 to report SKIP (for example when Docker is unavailable).
 run_test() {
-  local name="$1"
+  local name="$1" rc=0
   local tmp
   tmp=$(mktemp -d)
   # shellcheck disable=SC2064
   trap "rm -rf '$tmp'" EXIT
   # shellcheck disable=SC2030
-  if (set -euo pipefail; export BUILD_DIR="$tmp" CTF="$tmp/ctf" DEPLOY_DIR="$tmp/deploy"; "$2" "$tmp"); then
+  (set -euo pipefail; export BUILD_DIR="$tmp" CTF="$tmp/ctf" DEPLOY_DIR="$tmp/deploy"; "$2" "$tmp") || rc=$?
+  if [[ $rc -eq 0 ]]; then
     echo "PASS: $name"
     PASS=$((PASS + 1))
+  elif [[ $rc -eq 77 ]]; then
+    echo "  SKIP: $name"
+    SKIP=$((SKIP + 1))
   else
     echo "FAIL: $name"
     FAIL=$((FAIL + 1))
@@ -1999,6 +2015,12 @@ _tamper_descriptor() {
   cp -R "$src" "$out"
   local idx="$out/artifact-index.json"
   local mdigest; mdigest="$(jq -r --arg t "$ver" '.artifacts[] | select(.tag==$t) | .digest' "$idx")"
+  # Some components are tagged with an image index that wraps the descriptor manifest.
+  local wrapper=""
+  if [[ "$(jq -r '.mediaType' "$out/blobs/${mdigest/:/.}")" == application/vnd.oci.image.index.v1+json ]]; then
+    wrapper="$out/blobs/${mdigest/:/.}"
+    mdigest="$(jq -r '.manifests[0].digest' "$wrapper")"
+  fi
   local mpath="$out/blobs/${mdigest/:/.}"
   local cfgdigest; cfgdigest="$(jq -r '.config.digest' "$mpath")"
   local cfgpath="$out/blobs/${cfgdigest/:/.}"
@@ -2020,6 +2042,13 @@ _tamper_descriptor() {
     "$mpath" > "$out/new"
   local md; md="sha256:$(sha256 "$out/new")"
   mv "$out/new" "$out/blobs/${md/:/.}"
+
+  if [[ -n "$wrapper" ]]; then
+    jq --arg md "$md" --argjson n "$(wc -c < "$out/blobs/${md/:/.}" | tr -d ' ')" \
+      '.manifests[0].digest=$md | .manifests[0].size=$n' "$wrapper" > "$out/new"
+    md="sha256:$(sha256 "$out/new")"
+    mv "$out/new" "$out/blobs/${md/:/.}"
+  fi
 
   jq --arg t "$ver" --arg md "$md" \
     '(.artifacts[] | select(.tag==$t) | .digest) = $md' "$idx" > "$out/new"
@@ -4800,6 +4829,1724 @@ test_readme_documents_gpg_signing() {
   assert_contains "$sv" "(#gpg-signing)" "Trust models link to GPG signing"
 }
 
+_oci_env() {
+  local tmp="$1"
+  export OCI_DEMO_CTF="$tmp/oci-ctf" OCI_DEMO_OUT="$tmp/oci" OCM="$OCI_OCM"
+}
+
+_build_oci() {
+  bash "$ROOT/scripts/oci.sh" build 2>/dev/null
+}
+
+_oci_ref() {
+  echo "ctf::$OCI_DEMO_CTF//github.com/lioramilbaum/oci-demo:$VERSION"
+}
+
+test_oci_layout_is_reproducible() {
+  local tmp="$1" f
+  mkdir -p "$tmp/layouts"
+  python3 "$ROOT/components/oci/layout.py" "$tmp/layouts" || return 1
+  for f in hello-oci-amd64.oci.tar hello-oci-arm64.oci.tar hello-oci-multiarch.oci.tar; do
+    cmp -s "$tmp/layouts/$f" "$ROOT/components/oci/$f" \
+      || { echo "  $f differs from a fresh run of layout.py" >&2; return 1; }
+  done
+}
+
+test_oci_image_resource_metadata() {
+  local tmp="$1" rows
+  _oci_env "$tmp"
+  _build_oci || return 1
+  rows="$("$OCM" get cv "$(_oci_ref)" -o json </dev/null \
+    | jq -r '.[0].component.resources[] | [.name, .type, .relation, (.extraIdentity.architecture // "-")] | @tsv')"
+  assert_contains "$rows" $'hello-image\tociImage\tlocal\tamd64' "amd64 image" || return 1
+  assert_contains "$rows" $'hello-image\tociImage\tlocal\tarm64' "arm64 image" || return 1
+  assert_contains "$rows" $'hello-image-multiarch\tociImage\tlocal\t-' "multi-arch index" || return 1
+}
+
+test_oci_resource_digest_is_manifest_digest() {
+  local tmp="$1" digest
+  _oci_env "$tmp"
+  _build_oci || return 1
+  digest="$("$OCM" get cv "$(_oci_ref)" -o json </dev/null \
+    | jq -r '.[0].component.resources[] | select(.name=="hello-image" and .extraIdentity.architecture=="amd64") | .digest.value')"
+  mkdir -p "$tmp/src"
+  tar -xf "$ROOT/components/oci/hello-oci-amd64.oci.tar" -C "$tmp/src" || return 1
+  assert_eq "$(jq -r '.manifests[0].digest' "$tmp/src/index.json")" "sha256:$digest" "manifest digest" || return 1
+}
+
+test_oci_download_yields_oci_layout() {
+  local tmp="$1" dir
+  _oci_env "$tmp"
+  _build_oci || return 1
+  bash "$ROOT/scripts/oci.sh" sign >/dev/null 2>&1 || return 1
+  bash "$ROOT/scripts/oci.sh" download >/dev/null 2>&1 || return 1
+  dir="$tmp/oci/download/hello-image-amd64"
+  [[ -f "$dir/oci-layout" ]] || { echo "  missing oci-layout" >&2; return 1; }
+  [[ -f "$dir/index.json" ]] || { echo "  missing index.json" >&2; return 1; }
+  [[ -d "$dir/blobs/sha256" ]] || { echo "  missing blobs/sha256" >&2; return 1; }
+}
+
+test_oci_multiarch_index_references_variants() {
+  local tmp="$1" digest index
+  _oci_env "$tmp"
+  _build_oci || return 1
+  bash "$ROOT/scripts/oci.sh" sign >/dev/null 2>&1 || return 1
+  bash "$ROOT/scripts/oci.sh" download >/dev/null 2>&1 || return 1
+  digest="$("$OCM" get cv "$(_oci_ref)" -o json </dev/null \
+    | jq -r '.[0].component.resources[] | select(.name=="hello-image-multiarch") | .digest.value')"
+  # The downloaded root index is the one whose digest is the resource digest.
+  index="$tmp/oci/download/hello-image-multiarch/blobs/sha256/$digest"
+  assert_eq "$(jq '.manifests | length' "$index")" "2" "variants in index" || return 1
+  assert_eq "$(jq -r '[.manifests[].platform.architecture] | sort | join(",")' "$index")" "amd64,arm64" "platforms" || return 1
+}
+
+test_oci_download_requires_signature() {
+  local tmp="$1"
+  _oci_env "$tmp"
+  _build_oci || return 1
+  if bash "$ROOT/scripts/oci.sh" download >/dev/null 2>&1; then
+    echo "  download of an unsigned component succeeded" >&2
+    return 1
+  fi
+  [[ ! -e "$tmp/oci/download" ]] || { echo "  download left output behind" >&2; return 1; }
+}
+
+test_oci_signature_covers_image_digest() {
+  local tmp="$1" filter work err
+  _oci_env "$tmp"
+  _build_oci || return 1
+  bash "$ROOT/scripts/oci.sh" sign >/dev/null 2>&1 || return 1
+  filter='(.component.resources[] | select(.name=="hello-image" and .extraIdentity.architecture=="amd64") | .digest.value) = "0000000000000000000000000000000000000000000000000000000000000000"'
+  work="$tmp/tampered"
+  _tamper_descriptor "$OCI_DEMO_CTF" "$VERSION" "$filter" "$work" || return 1
+  assert_fails env OCI_DEMO_CTF="$work" bash "$ROOT/scripts/oci.sh" verify >/dev/null 2>"$tmp/verify.err" || return 1
+  err="$(cat "$tmp/verify.err")"
+  assert_contains "$err" "digest mismatch" "verify rejects tampered image digest" || return 1
+}
+
+test_oci_plan_copy_resources_leaves_local_images() {
+  local tmp="$1" plan row
+  _oci_env "$tmp"
+  _build_oci || return 1
+  plan="$(bash "$ROOT/scripts/oci.sh" plan 2>/dev/null)" || return 1
+  row="$(awk -F'\t' '$1=="copy-resources"{print $2}' <<<"$plan")"
+  assert_contains "$row" "OCIAddLocalResource/v1alpha1=3" "local images stay local" || return 1
+  assert_not_contains "$row" "AddOCIArtifact" || return 1
+}
+
+test_oci_plan_uploader_rewrites_references() {
+  local tmp="$1" plan row types refs
+  _oci_env "$tmp"
+  _build_oci || return 1
+  plan="$(bash "$ROOT/scripts/oci.sh" plan 2>/dev/null)" || return 1
+  row="$(awk -F'\t' '$1=="uploader"{print $2}' <<<"$plan")"
+  assert_contains "$row" "AddOCIArtifact/v1alpha1=3" "uploader uploads each image" || return 1
+  types="$(jq -r '.transformations[] | select(.type=="AddOCIArtifact/v1alpha1") | .spec.resource.access.type' "$tmp/oci/plan-uploader.json")"
+  assert_eq "$(sort -u <<<"$types")" "ociArtifact/v1" "access type" || return 1
+  refs="$(jq -r '.transformations[] | select(.type=="AddOCIArtifact/v1alpha1") | .spec.resource.access.imageReference' "$tmp/oci/plan-uploader.json")"
+  assert_contains "$refs" "/hello-image:" "image reference rewritten" || return 1
+}
+
+test_oci_transfer_to_ctf_keeps_digests() {
+  local tmp="$1" query src dst
+  _oci_env "$tmp"
+  _build_oci || return 1
+  query='.[0].component.resources[] | [.name, (.extraIdentity.architecture // "-"), .digest.value] | @tsv'
+  "$OCM" transfer cv "$(_oci_ref)" "ctf::$tmp/oci-copy-ctf" </dev/null >/dev/null 2>&1 || return 1
+  src="$("$OCM" get cv "$(_oci_ref)" -o json </dev/null | jq -r "$query")"
+  dst="$("$OCM" get cv "ctf::$tmp/oci-copy-ctf//github.com/lioramilbaum/oci-demo:$VERSION" -o json </dev/null | jq -r "$query")"
+  assert_eq "$dst" "$src" "digests after transfer" || return 1
+}
+
+test_oci_inspect_reports_architectures() {
+  local tmp="$1" out
+  _oci_env "$tmp"
+  _build_oci || return 1
+  bash "$ROOT/scripts/oci.sh" sign >/dev/null 2>&1 || return 1
+  out="$(bash "$ROOT/scripts/oci.sh" inspect 2>/dev/null)" || return 1
+  assert_contains "$out" $'image\thello-image\tamd64\t' "amd64 row" || return 1
+  assert_contains "$out" $'image\thello-image\tarm64\t' "arm64 row" || return 1
+  assert_contains "$out" $'image\thello-image-multiarch\tmultiarch\t' "multi-arch row" || return 1
+  assert_contains "$out" $'layer\thello-image\tarm64\t' "arm64 layer row" || return 1
+}
+
+test_localization_relocate_rewrites_access_keeps_digest() {
+  local tmp="$1" out
+  _oci_env "$tmp"
+  _build_oci || return 1
+  out="$(bash "$ROOT/scripts/oci.sh" relocate 2>/dev/null)" || return 1
+  assert_eq "$(awk -F'\t' '$1=="after" && $4=="ociArtifact/v1"' <<<"$out" | wc -l | tr -d ' ')" "3" "after rows" || return 1
+  assert_eq "$(awk -F'\t' '$1=="after" && $5==""' <<<"$out" | wc -l | tr -d ' ')" "0" "after rows with empty imageReference" || return 1
+  assert_eq "$(awk -F'\t' '$1=="after"{print $2, $3}' <<<"$out")" \
+    "$(awk -F'\t' '$1=="before"{print $2, $3}' <<<"$out")" "name and arch pairs after relocation" || return 1
+  assert_eq "$(awk -F'\t' '$1=="before"{b[++n]=$5} $1=="after"{a[++m]=$5} END{for(i=1;i<=m;i++) if(a[i]==b[i]) c++; print c+0}' <<<"$out")" \
+    "0" "imageReference rewritten for every resource" || return 1
+}
+
+test_localization_readme_documents_three_levels() {
+  local readme="$ROOT/README.md" check
+  for check in "Build time" "Transfer time" "Deploy time" "does NOT substitute"; do
+    assert_contains "$(cat "$readme")" "$check" "README documents: $check" || return 1
+  done
+}
+
+test_make_oci_target() {
+  local tmp="$1"
+
+  local dry_run
+  dry_run="$(make -s --dry-run -C "$ROOT" oci 2>/dev/null)"
+  assert_contains "$dry_run" "scripts/oci.sh" "dry-run includes oci.sh" || return 1
+
+  local help_out
+  help_out="$(make -s -C "$ROOT" help 2>/dev/null)"
+  assert_contains "$help_out" "oci" "make help lists oci"
+}
+
+test_readme_documents_oci_images() {
+  local readme="$ROOT/README.md"
+  local section
+  section="$(awk '/^## OCI images/{f=1;next} /^## /{f=0} f' "$readme")"
+  [[ -n "$section" ]] || \
+    { echo "  README missing '## OCI images' section" >&2; return 1; }
+
+  local checks=(
+    "ociImage"
+    "extraIdentity"
+    "hello-image-multiarch"
+    "relocate.ocmconfig"
+    "layout.py"
+    "(#transfer-and-transport)"
+    "make oci"
+  )
+  for check in "${checks[@]}"; do
+    assert_contains "$section" "$check" "README section contains: $check" || return 1
+  done
+
+  # Drift guard: first README yaml block (minus # lines) must match the constructor.
+  local readme_yaml constructor_yaml
+  readme_yaml="$(awk '/^```yaml/{n++; f=(n==1); next} /^```/{f=0} f' <<<"$section" | grep -v '^#')"
+  constructor_yaml="$(grep -v '^#' "$ROOT/components/oci/component-constructor.yaml")"
+  [[ "$readme_yaml" == "$constructor_yaml" ]] || {
+    echo "  README yaml block differs from components/oci/component-constructor.yaml" >&2
+    return 1
+  }
+
+  local res_section
+  res_section="$(awk '/^## Resource repositories/{f=1;next} /^## /{f=0} f' "$readme")"
+  assert_contains "$res_section" "(#oci-images)" "Resource repositories links to OCI images"
+}
+
+# _credentials_env <tmp>
+_credentials_env() {
+  export CREDENTIALS_DEMO_CTF="$1/credentials-ctf" \
+         CREDENTIALS_DEMO_OUT="$1/credentials" \
+         OCM="$CREDENTIALS_OCM"
+}
+
+test_credentials_build_creates_ctf() {
+  local tmp="$1"
+  _credentials_env "$tmp"
+  bash "$ROOT/scripts/credentials.sh" build >/dev/null || return 1
+
+  local cv_json name res_names access digest
+  cv_json="$("$OCM" get cv "ctf::$CREDENTIALS_DEMO_CTF//github.com/lioramilbaum/credentials-demo:$VERSION" -o json)" || return 1
+  name="$(jq -r '.[0].component.name' <<<"$cv_json")"
+  assert_eq "$name" "github.com/lioramilbaum/credentials-demo" "component name" || return 1
+  res_names="$(jq -r '[.[0].component.resources[].name] | join(",")' <<<"$cv_json")"
+  assert_eq "$res_names" "hello-image" "resource names" || return 1
+  access="$(jq -r '.[0].component.resources[0].access.type' <<<"$cv_json")"
+  assert_eq "$access" "LocalBlob/v1" "access type" || return 1
+  digest="$(jq -r '.[0].component.resources[0].digest.value' <<<"$cv_json")"
+  [[ -n "$digest" && "$digest" != "null" ]] || { echo "  digest missing" >&2; return 1; }
+}
+
+test_credentials_show_lists_consumer_types() {
+  local tmp="$1" out
+  _credentials_env "$tmp"
+  out="$(bash "$ROOT/scripts/credentials.sh" show)" || return 1
+  assert_contains "$out" $'identity\tOCIRegistry' || return 1
+  assert_contains "$out" $'identity\tWget' || return 1
+  assert_contains "$out" $'identity\tHelmChartRepository' || return 1
+  assert_not_contains "$out" "OCIRegistryCredentials" || return 1
+  assert_not_contains "$out" "GitHubAccessToken"
+}
+
+test_credentials_match_exact_wins_over_wildcard() {
+  local tmp="$1" out
+  _credentials_env "$tmp"
+  out="$(bash "$ROOT/scripts/credentials.sh" match)" || return 1
+  assert_contains "$out" $'exact-over-wildcard\tWget\tteam-a/report.txt\texact' || return 1
+  assert_contains "$out" $'exact-over-wildcard-reversed\tWget\tteam-a/report.txt\texact'
+}
+
+test_credentials_match_wildcard_catches_subpath() {
+  local tmp="$1" out
+  _credentials_env "$tmp"
+  out="$(bash "$ROOT/scripts/credentials.sh" match)" || return 1
+  assert_contains "$out" $'wildcard-subpath\tWget\tteam-a/report.txt\tteam-a-wild' || return 1
+  assert_contains "$out" $'type-alias\tWget\tteam-a/report.txt\thttp-alias'
+}
+
+test_credentials_match_path_star_does_not_cross_slash() {
+  local tmp="$1" out
+  _credentials_env "$tmp"
+  out="$(bash "$ROOT/scripts/credentials.sh" match)" || return 1
+  assert_contains "$out" $'star-not-across-slash\tWget\tteam-a/nested/report.txt\tnone' || return 1
+  assert_contains "$out" $'star-per-segment\tWget\tteam-a/nested/report.txt\tteam-a-nested'
+}
+
+test_credentials_chain_combines_configs() {
+  local tmp="$1" out
+  _credentials_env "$tmp"
+  out="$(bash "$ROOT/scripts/credentials.sh" chain)" || return 1
+  assert_contains "$out" $'two-files/team-a\tteam-a/report.txt\tfile-a' || return 1
+  assert_contains "$out" $'two-files/team-b\tteam-b/report.txt\tfile-b' || return 1
+  assert_contains "$out" $'later-file-wins/forward\tteam-a/report.txt\tfile-b-override' || return 1
+  assert_contains "$out" $'later-file-wins/reversed\tteam-a/report.txt\tfile-a' || return 1
+  assert_contains "$out" $'stdin\tteam-b/report.txt\tfile-b'
+}
+
+test_credentials_wget_identity_hostname_required() {
+  local tmp="$1" out
+  _credentials_env "$tmp"
+  out="$(bash "$ROOT/scripts/credentials.sh" match)" || return 1
+  assert_contains "$out" $'hostname-missing\tWget\tteam-a/report.txt\tnone' || return 1
+  assert_contains "$out" $'hostname-not-resolved\tWget\tteam-a/report.txt\tnone' || return 1
+  assert_contains "$out" $'no-path-matches-all\tWget\tteam-a/nested/report.txt\thost'
+}
+
+test_credentials_wget_identity_port_attribute() {
+  local tmp="$1" out
+  _credentials_env "$tmp"
+  out="$(bash "$ROOT/scripts/credentials.sh" match)" || return 1
+  assert_contains "$out" $'port-omitted\tWget\tteam-a/report.txt\tnone' || return 1
+  assert_contains "$out" $'port-mismatch\tWget\tteam-a/report.txt\tnone' || return 1
+  assert_contains "$out" $'scheme-omitted\tWget\tteam-a/report.txt\tno-scheme' || return 1
+  assert_contains "$out" $'scheme-mismatch\tWget\tteam-a/report.txt\tnone'
+}
+
+test_credentials_generic_config_wraps_multiple() {
+  local tmp="$1" out
+  _credentials_env "$tmp"
+  out="$(bash "$ROOT/scripts/credentials.sh" chain)" || return 1
+  assert_contains "$out" $'generic-flat/team-a\tteam-a\tflat-a' || return 1
+  assert_contains "$out" $'generic-flat/team-b\tteam-b\tflat-b' || return 1
+  assert_contains "$out" $'generic-nested/result\tresult\tnone' || return 1
+  assert_contains "$(cat "$tmp/credentials/chain/generic-nested/stderr")" "nested generic"
+}
+
+test_credentials_scenarios_matrix_output() {
+  local tmp="$1" out row overlap_rows bad
+  _credentials_env "$tmp"
+  bash "$ROOT/scripts/credentials.sh" build >/dev/null || return 1
+  out="$(bash "$ROOT/scripts/credentials.sh" scenarios)" || return 1
+
+  local want=(
+    $'oci-host\tOCIRegistry\tteam-a\thost\thost'
+    $'oci-path-exact\tOCIRegistry\tteam-a\texact\texact'
+    $'oci-path-glob\tOCIRegistry\tteam-a\tglob\tglob'
+    $'oci-path-other\tOCIRegistry\tteam-a\tother\tnone'
+    $'oci-star-not-across-slash\tOCIRegistry\tteam-a/nested\tstar\tnone'
+    $'oci-exact-over-glob\tOCIRegistry\tteam-a\texact|glob\texact'
+    $'type-mismatch-wget\tOCIRegistry\tteam-a\twget-user\tnone'
+    $'type-mismatch-oci\tWget\tteam-a/report.txt\toci-user\tnone'
+    $'duplicate-identity\tOCIRegistry\tteam-a\tfirst|second\tsecond'
+    $'typed-over-generic\tWget\tteam-a/report.txt\ttyped|direct\ttyped'
+    $'generic-credentials\tWget\tteam-a/report.txt\tgeneric\tgeneric'
+  )
+  for row in "${want[@]}"; do
+    assert_contains "$out" "$row" || return 1
+  done
+
+  # Overlapping wildcards pick randomly, so only check that each probe picked a candidate.
+  overlap_rows="$(awk -F'\t' '$1=="overlap-wildcards"' <<<"$out")"
+  assert_eq "$(wc -l <<<"$overlap_rows" | tr -d ' ')" "10" "overlap probe count" || return 1
+  bad="$(awk -F'\t' '$1=="overlap-wildcards" && $5!="host" && $5!="team-a-wild"' <<<"$out")"
+  assert_eq "$bad" "" "overlap selections are candidates"
+}
+
+test_make_credentials_target() {
+  local tmp="$1" dry_run help_out
+  dry_run="$(make -s --dry-run -C "$ROOT" credentials 2>/dev/null)"
+  assert_contains "$dry_run" "scripts/credentials.sh" "dry-run includes credentials.sh" || return 1
+
+  help_out="$(make -s -C "$ROOT" help 2>/dev/null)"
+  assert_contains "$help_out" "credentials" "make help lists credentials"
+}
+
+test_readme_documents_credential_system() {
+  local readme="$ROOT/README.md"
+  local section
+  section="$(awk '/^## Credential system/{f=1;next} /^## /{f=0} f' "$readme")"
+  [[ -n "$section" ]] || \
+    { echo "  README missing '## Credential system' section" >&2; return 1; }
+
+  local checks=(
+    "### Consumer identities"
+    "### Matching"
+    "WgetCredentials/v1"
+    "OCICredentials/v1"
+    "path.Match"
+    "nested generic configurations"
+  )
+  local check
+  for check in "${checks[@]}"; do
+    assert_contains "$section" "$check" "README section contains: $check" || return 1
+  done
+
+  # Drift guard: the first yaml block under ### Demo must be the constructor, byte for byte.
+  local demo demo_yaml constructor_yaml
+  demo="$(awk '/^### Demo/{f=1;next} /^### |^## /{f=0} f' <<<"$section")"
+  demo_yaml="$(awk '/^```yaml/{n++; f=(n==1); next} /^```/{f=0} f' <<<"$demo")"
+  constructor_yaml="$(cat "$ROOT/components/credentials/component-constructor.yaml")"
+  [[ "$demo_yaml" == "$constructor_yaml" ]] || {
+    echo "  README yaml block under ### Demo differs from components/credentials/component-constructor.yaml" >&2
+    return 1
+  }
+}
+
+# ── Plugin demo ──────────────────────────────────────────────────────────────
+
+# _plugin_env <tmp>
+_plugin_env() {
+  export PLUGIN_DEMO_CTF="$1/plugin-ctf" \
+         PLUGIN_DEMO_OUT="$1/plugin" \
+         PLUGIN_DIR="$1/plugins" \
+         OCM="$PLUGIN_OCM"
+}
+
+# _plugin_ref <ctf>
+_plugin_ref() {
+  echo "ctf::${1}//github.com/lioramilbaum/plugin-demo:${VERSION}"
+}
+
+test_plugin_capabilities_returns_access_type() {
+  local tmp="$1" caps t required
+  _plugin_env "$tmp"
+  caps="$(python3 -I -S "$ROOT/components/plugin/demo-store/demo-store-plugin" capabilities)" || return 1
+  for t in resourceRepository digestProcessorRepository; do
+    jq -e --arg t "$t" \
+      '.capabilities[] | select(.type==$t) | .supportedAccessTypes[] | select(.type=="demo-store/v1alpha1")' \
+      <<<"$caps" >/dev/null || { echo "  $t does not serve demo-store/v1alpha1" >&2; return 1; }
+  done
+  required="$(jq -r '.capabilities[0].supportedAccessTypes[0].jsonSchema' <<<"$caps" | base64 -d \
+    | jq -r '.required | join(",")')" || return 1
+  assert_contains "$required" "storeId" || return 1
+  assert_contains "$required" "blobId"
+}
+
+test_plugin_healthz_responds() {
+  local tmp="$1" out
+  _plugin_env "$tmp"
+  bash "$ROOT/scripts/plugin.sh" install >/dev/null || return 1
+  out="$(bash "$ROOT/scripts/plugin.sh" probe)" || return 1
+  assert_contains "$out" $'healthz\t200' || return 1
+  assert_contains "$out" $'location\thttp+unix://'
+}
+
+test_plugin_build_registers_access_type() {
+  local tmp="$1" cv r digest
+  _plugin_env "$tmp"
+  bash "$ROOT/scripts/plugin.sh" build >/dev/null || return 1
+  cv="$("$OCM" --plugin-directory "$PLUGIN_DIR" get cv "$(_plugin_ref "$PLUGIN_DEMO_CTF")" -o json)" || return 1
+  r="$(jq -c '.[0].component.resources[] | select(.name=="demo-blob")' <<<"$cv")"
+  assert_eq "$(jq -r .access.type <<<"$r")" "demo-store/v1alpha1" "access type" || return 1
+  assert_eq "$(jq -r .relation <<<"$r")" "external" "relation" || return 1
+  assert_eq "$(jq -r .digest.normalisationAlgorithm <<<"$r")" "genericBlobDigest/v1" "normalisation" || return 1
+  digest="$(jq -r .digest.value <<<"$r")"
+  [[ "$digest" =~ ^[0-9a-f]{64}$ ]] || { echo "  demo-blob has no sha256 digest: '$digest'" >&2; return 1; }
+}
+
+test_plugin_download_returns_blob() {
+  local tmp="$1" path i
+  _plugin_env "$tmp"
+  bash "$ROOT/scripts/plugin.sh" build >/dev/null || return 1
+  path="$(bash "$ROOT/scripts/plugin.sh" download)" || return 1
+  printf 'hello from demo-store\n' | cmp -s - "$path" || { echo "  downloaded blob differs" >&2; return 1; }
+  # The plugin exits once its parent (ocm) is gone; poll for that instead of sleeping.
+  # shellcheck disable=SC2034
+  for i in $(seq 1 30); do
+    pgrep -f "$PLUGIN_DIR/demo-store-plugin" >/dev/null || return 0
+    sleep 0.1
+  done
+  echo "  demo-store plugin still running 3s after download" >&2
+  return 1
+}
+
+test_plugin_identity_endpoint() {
+  local tmp="$1" out identity
+  _plugin_env "$tmp"
+  bash "$ROOT/scripts/plugin.sh" install >/dev/null || return 1
+  out="$(bash "$ROOT/scripts/plugin.sh" probe)" || return 1
+  identity="$(awk -F'\t' '$1=="identity"{print $2}' <<<"$out")"
+  assert_eq "$(jq -Sc . <<<"$identity")" \
+    "$(jq -Sc . <<<'{"identity":{"storeId":"my-store","type":"demo-store/v1alpha1"}}')" "identity row" || return 1
+  out="$(bash "$ROOT/scripts/plugin.sh" scenarios no-credentials)" || return 1
+  assert_contains "$out" "unauthorized"
+}
+
+test_plugin_missing_plugin_fails_gracefully() {
+  local tmp="$1" out
+  _plugin_env "$tmp"
+  bash "$ROOT/scripts/plugin.sh" build >/dev/null || return 1
+  mkdir -p "$tmp/empty"
+  if out="$(PLUGIN_DIR="$tmp/empty" bash "$ROOT/scripts/plugin.sh" download 2>&1)"; then
+    echo "  download without the plugin should fail" >&2
+    return 1
+  fi
+  assert_contains "$out" "failed to get plugin for typ" || return 1
+  [[ ! -e "$tmp/plugin/download" ]] || { echo "  download directory left behind" >&2; return 1; }
+  # build installs the plugin into PLUGIN_DIR itself, so it registers even from an empty directory
+  PLUGIN_DIR="$tmp/empty" bash "$ROOT/scripts/plugin.sh" build >/dev/null || return 1
+  [[ -x "$tmp/empty/demo-store-plugin" ]] || { echo "  build did not install the plugin" >&2; return 1; }
+}
+
+test_plugin_show_lists_capabilities() {
+  local tmp="$1" out
+  _plugin_env "$tmp"
+  bash "$ROOT/scripts/plugin.sh" build >/dev/null || return 1
+  out="$(bash "$ROOT/scripts/plugin.sh" show)" || return 1
+  assert_contains "$out" $'capability\tresourceRepository\tdemo-store/v1alpha1' || return 1
+  assert_contains "$out" $'capability\tdigestProcessorRepository\tdemo-store/v1alpha1' || return 1
+  assert_contains "$out" $'registered\tdemo-store-plugin\t' || return 1
+  assert_contains "$out" $'resource\tdemo-blob\tdemo-store/v1alpha1'
+}
+
+test_plugin_scenarios_correct_response() {
+  local tmp="$1" out expected
+  _plugin_env "$tmp"
+  out="$(bash "$ROOT/scripts/plugin.sh" scenarios correct missing-plugin config-locations \
+    unknown-blob invalid-spec no-credentials)" || return 1
+  expected="$(printf '%s\n' \
+    $'correct\tok\tok\t-' \
+    $'missing-plugin\tfail\t-\tno-plugin' \
+    $'config-locations\tfail\t-\tno-plugin' \
+    $'unknown-blob\tfail\t-\tnot-found' \
+    $'invalid-spec\tfail\t-\tinvalid-spec' \
+    $'no-credentials\tfail\t-\tunauthorized')"
+  assert_eq "$out" "$expected" "scenario rows"
+}
+
+test_plugin_scenarios_malformed_response() {
+  local tmp="$1" out expected
+  _plugin_env "$tmp"
+  out="$(bash "$ROOT/scripts/plugin.sh" scenarios malformed-capabilities malformed-response \
+    plugin-error unsupported-location tampered-content)" || return 1
+  expected="$(printf '%s\n' \
+    $'malformed-capabilities\tfail\t-\tbad-capabilities' \
+    $'malformed-response\tfail\t-\tmalformed-response' \
+    $'plugin-error\tfail\t-\tplugin-error' \
+    $'unsupported-location\tfail\t-\tunsupported-location' \
+    $'tampered-content\tok\tfail\tdigest-mismatch')"
+  assert_eq "$out" "$expected" "scenario rows"
+}
+
+test_plugin_loglevel_debug_shows_registration() {
+  local tmp="$1" err
+  _plugin_env "$tmp"
+  bash "$ROOT/scripts/plugin.sh" build >/dev/null || return 1
+  err="$("$OCM" --plugin-directory "$PLUGIN_DIR" --loglevel debug get cv "$(_plugin_ref "$PLUGIN_DEMO_CTF")" \
+    2>&1 >/dev/null)" || return 1
+  assert_contains "$err" 'msg="discovered plugin" id=demo-store-plugin' || return 1
+  assert_contains "$err" 'msg="adding resource repository plugin"' || return 1
+  assert_contains "$err" 'msg="adding digest processor plugin"'
+}
+
+test_make_plugin_target() {
+  local dry_run help_out
+  dry_run="$(make -s --dry-run -C "$ROOT" plugin 2>/dev/null)"
+  assert_contains "$dry_run" "scripts/plugin.sh" "dry-run includes plugin.sh" || return 1
+  help_out="$(make -s -C "$ROOT" help 2>/dev/null)"
+  assert_contains "$help_out" "plugin" "make help lists plugin"
+}
+
+test_readme_documents_plugin_demo() {
+  local readme="$ROOT/README.md" section block expected check
+  section="$(awk '/^## Plugin system/{f=1;next} /^## /{f=0} f' "$readme")"
+  [[ -n "$section" ]] || { echo "  README missing '## Plugin system' section" >&2; return 1; }
+
+  local checks=(
+    "/healthz"
+    "/identity"
+    "/resource/get"
+    "/resource/digest/process"
+    "http+unix://"
+    "supportedAccessTypes"
+    "jsonSchema"
+    "Authorization"
+    "make plugin"
+    "components/plugin/demo-store/demo-store-plugin"
+  )
+  for check in "${checks[@]}"; do
+    assert_contains "$section" "$check" || return 1
+  done
+
+  # The first YAML block in the section is the demo constructor, without its comment line.
+  block="$(awk '/^```yaml/{f=1;next} /^```/{if (f) exit} f' <<<"$section")"
+  expected="$(grep -v '^#' "$ROOT/components/plugin/component-constructor.yaml")"
+  assert_eq "$block" "$expected" "demo component YAML block"
+}
+
+# ── Local OCI registry ──────────────────────────────────────────────────────
+
+_docker_available() { command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; }
+
+_registry_env() {
+  export REGISTRY_DEMO_CTF="$1/registry-ctf" \
+         REGISTRY_DEMO_OUT="$1/registry" \
+         OCM="$REGISTRY_OCM" \
+         REGISTRY_NAME=ocm-demo-registry-test \
+         REGISTRY_HOST=127.0.0.1 \
+         REGISTRY_PORT="${REGISTRY_TEST_PORT:-5056}" \
+         REGISTRY_PATH=ocm
+}
+
+# Starts an empty registry on the test port; returns 77 (SKIP) without Docker.
+_registry_fresh() {
+  _docker_available || { echo "  skip: docker not available"; return 77; }
+  _registry_env "$1"
+  docker rm -f "$REGISTRY_NAME" >/dev/null 2>&1 || true
+  trap 'docker rm -f "$REGISTRY_NAME" >/dev/null 2>&1 || true' EXIT
+  bash "$ROOT/scripts/registry.sh" start >/dev/null
+}
+
+_registry_ref() {
+  echo "oci::http://${REGISTRY_HOST:-127.0.0.1}:${REGISTRY_PORT:-5056}/ocm//github.com/lioramilbaum/registry-demo:${VERSION:-0.1.0}"
+}
+
+_registry_ctf_ref() {
+  echo "ctf::${REGISTRY_DEMO_CTF}//github.com/lioramilbaum/registry-demo:${VERSION:-0.1.0}"
+}
+
+_registry_pulled_ref() {
+  echo "ctf::${REGISTRY_DEMO_OUT}/pulled-ctf//github.com/lioramilbaum/registry-demo:${VERSION:-0.1.0}"
+}
+
+test_registry_docker_available() {
+  local tmp="$1" stub err
+  grep -qE 'registry:2@sha256:[0-9a-f]{64}' "$ROOT/scripts/registry.sh" || \
+    { echo "  registry.sh does not pin registry:2 by digest" >&2; return 1; }
+
+  # A docker that cannot reach a daemon must make the demo skip with exit 0.
+  stub="$tmp/docker-stub"
+  mkdir -p "$stub"
+  printf '#!/bin/sh\nexit 1\n' > "$stub/docker"
+  chmod +x "$stub/docker"
+  err="$tmp/skip.err"
+  PATH="$stub:$PATH" bash "$ROOT/scripts/registry.sh" >/dev/null 2>"$err" || \
+    { echo "  registry.sh should exit 0 without Docker" >&2; return 1; }
+  assert_contains "$(cat "$err")" "skip: Docker is not available" || return 1
+  if docker inspect ocm-demo-registry >/dev/null 2>&1; then
+    echo "  container ocm-demo-registry should not exist" >&2
+    return 1
+  fi
+}
+
+test_registry_start_creates_container() {
+  local tmp="$1" id_before id_after
+  _registry_fresh "$tmp" || return $?
+  assert_eq "$(docker inspect -f '{{.State.Running}}' "$REGISTRY_NAME")" "true" "container running" || return 1
+  assert_contains "$(docker port "$REGISTRY_NAME" 5000/tcp)" ":5056" "port published" || return 1
+  curl -fsS "http://127.0.0.1:5056/v2/" >/dev/null || { echo "  registry not reachable" >&2; return 1; }
+  id_before="$(docker inspect -f '{{.Id}}' "$REGISTRY_NAME")"
+  bash "$ROOT/scripts/registry.sh" start >/dev/null || return 1
+  id_after="$(docker inspect -f '{{.Id}}' "$REGISTRY_NAME")"
+  assert_eq "$id_after" "$id_before" "second start keeps the container"
+}
+
+test_registry_push_component_to_registry() {
+  local tmp="$1" catalog tags
+  _registry_fresh "$tmp" || return $?
+  bash "$ROOT/scripts/registry.sh" build >/dev/null 2>&1 || return 1
+  bash "$ROOT/scripts/registry.sh" push >/dev/null 2>&1 || return 1
+  catalog="$(curl -fsS "http://127.0.0.1:5056/v2/_catalog")" || return 1
+  assert_contains "$catalog" "component-descriptors/github.com/lioramilbaum/registry-demo" "catalog lists component" || return 1
+  tags="$(curl -fsS "http://127.0.0.1:5056/v2/ocm/component-descriptors/github.com/lioramilbaum/registry-demo/tags/list")" || return 1
+  assert_contains "$tags" '"0.1.0"' "tag 0.1.0"
+}
+
+test_registry_get_cv_from_registry() {
+  local tmp="$1" cv show
+  _registry_fresh "$tmp" || return $?
+  bash "$ROOT/scripts/registry.sh" build >/dev/null 2>&1 || return 1
+  bash "$ROOT/scripts/registry.sh" push >/dev/null 2>&1 || return 1
+  cv="$("$OCM" get cv "$(_registry_ref)" -o json 2>/dev/null)" || return 1
+  assert_eq "$(jq -r '.[0].component.name' <<<"$cv")" "github.com/lioramilbaum/registry-demo" "name" || return 1
+  assert_eq "$(jq -r '.[0].component.version' <<<"$cv")" "${VERSION:-0.1.0}" "version" || return 1
+  assert_eq "$(jq -r '.[0].component.provider' <<<"$cv")" "github.com/lioramilbaum" "provider" || return 1
+  show="$(bash "$ROOT/scripts/registry.sh" show 2>/dev/null)" || return 1
+  assert_contains "$show" $'component\tgithub.com/lioramilbaum/registry-demo' "show component row" || return 1
+  assert_contains "$show" $'resource\trelease-notes' "show resource row"
+}
+
+test_registry_sign_in_registry() {
+  local tmp="$1" sigs ctf_sigs out
+  _registry_fresh "$tmp" || return $?
+  bash "$ROOT/scripts/registry.sh" build >/dev/null 2>&1 || return 1
+  bash "$ROOT/scripts/registry.sh" push >/dev/null 2>&1 || return 1
+  bash "$ROOT/scripts/registry.sh" sign >/dev/null 2>&1 || return 1
+
+  sigs="$("$OCM" get cv "$(_registry_ref)" -o json 2>/dev/null | jq -r '[.[0].signatures[]?.name] | join(",")')" || return 1
+  assert_eq "$sigs" "default" "registry descriptor signature" || return 1
+
+  ctf_sigs="$("$OCM" get cv "$(_registry_ctf_ref)" -o json 2>/dev/null | jq -r '(.[0].signatures // []) | length')" || return 1
+  assert_eq "$ctf_sigs" "0" "source CTF stays unsigned" || return 1
+
+  if out="$(bash "$ROOT/scripts/registry.sh" sign 2>&1)"; then
+    echo "  second sign should fail" >&2
+    return 1
+  fi
+  assert_contains "$out" "already exists" || return 1
+}
+
+test_registry_verify_signed_component() {
+  local tmp="$1" wrong out
+  _registry_fresh "$tmp" || return $?
+  bash "$ROOT/scripts/registry.sh" build >/dev/null 2>&1 || return 1
+  bash "$ROOT/scripts/registry.sh" push >/dev/null 2>&1 || return 1
+  bash "$ROOT/scripts/registry.sh" sign >/dev/null 2>&1 || return 1
+  bash "$ROOT/scripts/registry.sh" verify >/dev/null 2>&1 || { echo "  verify should pass" >&2; return 1; }
+
+  wrong="$(_wrong_verify_config "$tmp")"
+  if out="$(VERIFY_CONFIG="$wrong" bash "$ROOT/scripts/registry.sh" verify 2>&1)"; then
+    echo "  verify with wrong key should fail" >&2
+    return 1
+  fi
+  assert_contains "$out" "SIGNATURE VERIFICATION FAILED"
+}
+
+test_registry_pull_downloads_resource() {
+  local tmp="$1" desc actual
+  _registry_fresh "$tmp" || return $?
+  bash "$ROOT/scripts/registry.sh" build >/dev/null 2>&1 || return 1
+  bash "$ROOT/scripts/registry.sh" push >/dev/null 2>&1 || return 1
+  bash "$ROOT/scripts/registry.sh" sign >/dev/null 2>&1 || return 1
+  bash "$ROOT/scripts/registry.sh" pull >/dev/null 2>&1 || return 1
+
+  assert_eq "$(cat "$REGISTRY_DEMO_OUT/download/release-notes")" \
+    "github.com/lioramilbaum/registry-demo ${VERSION:-0.1.0}" "release notes content" || return 1
+  desc="$("$OCM" get cv "$(_registry_ref)" -o json 2>/dev/null | jq -r '.[0].component.resources[] | select(.name=="release-notes") | .digest.value')" || return 1
+  actual="$(shasum -a 256 "$REGISTRY_DEMO_OUT/download/release-notes" | cut -d' ' -f1)"
+  assert_eq "$actual" "$desc" "downloaded sha256 matches descriptor" || return 1
+
+  "$OCM" verify cv --config "$BUILD_DIR/verify.ocmconfig" --signature default \
+    "$(_registry_pulled_ref)" </dev/null >/dev/null 2>&1 || { echo "  pulled CTF should verify" >&2; return 1; }
+}
+
+test_registry_stop_removes_container() {
+  local tmp="$1"
+  _registry_fresh "$tmp" || return $?
+  bash "$ROOT/scripts/registry.sh" build >/dev/null 2>&1 || return 1
+  bash "$ROOT/scripts/registry.sh" push >/dev/null 2>&1 || return 1
+  bash "$ROOT/scripts/registry.sh" stop >/dev/null || return 1
+  if docker inspect "$REGISTRY_NAME" >/dev/null 2>&1; then
+    echo "  container should be removed by stop" >&2
+    return 1
+  fi
+  if curl -fsS "http://127.0.0.1:5056/v2/" >/dev/null 2>&1; then
+    echo "  registry should not answer after stop" >&2
+    return 1
+  fi
+  bash "$ROOT/scripts/registry.sh" stop >/dev/null || { echo "  second stop should exit 0" >&2; return 1; }
+  bash "$ROOT/scripts/registry.sh" start >/dev/null || return 1
+  # Registry data is lost with the container, so the component is gone.
+  if "$OCM" get cv "$(_registry_ref)" -o json >/dev/null 2>&1 </dev/null; then
+    echo "  component should not survive stop and start" >&2
+    return 1
+  fi
+}
+
+test_registry_push_idempotent() {
+  local tmp="$1" tags sigs out
+  _registry_fresh "$tmp" || return $?
+  bash "$ROOT/scripts/registry.sh" build >/dev/null 2>&1 || return 1
+  bash "$ROOT/scripts/registry.sh" push >/dev/null 2>&1 || return 1
+  bash "$ROOT/scripts/registry.sh" push >/dev/null 2>&1 || return 1
+  tags="$(curl -fsS "http://127.0.0.1:5056/v2/ocm/component-descriptors/github.com/lioramilbaum/registry-demo/tags/list" | jq -c '.tags')" || return 1
+  assert_eq "$tags" '["0.1.0"]' "one tag after two pushes" || return 1
+
+  bash "$ROOT/scripts/registry.sh" sign >/dev/null 2>&1 || return 1
+  bash "$ROOT/scripts/registry.sh" push >/dev/null 2>&1 || return 1
+  # OCM 0.19.1: re-pushing from the unsigned CTF drops the registry signature.
+  sigs="$("$OCM" get cv "$(_registry_ref)" -o json 2>/dev/null | jq -r '(.[0].signatures // []) | length')" || return 1
+  assert_eq "$sigs" "0" "re-push drops signature" || return 1
+
+  if out="$(bash "$ROOT/scripts/registry.sh" verify 2>&1)"; then
+    echo "  verify should fail after re-push" >&2
+    return 1
+  fi
+}
+
+test_registry_transfer_preserves_resources() {
+  local tmp="$1" jq_digest jq_sig ctf_digest reg_digest pulled_digest reg_sig pulled_sig
+  _registry_fresh "$tmp" || return $?
+  bash "$ROOT/scripts/registry.sh" build >/dev/null 2>&1 || return 1
+  bash "$ROOT/scripts/registry.sh" push >/dev/null 2>&1 || return 1
+  bash "$ROOT/scripts/registry.sh" sign >/dev/null 2>&1 || return 1
+  bash "$ROOT/scripts/registry.sh" pull >/dev/null 2>&1 || return 1
+
+  jq_digest='.[0].component.resources[] | select(.name=="release-notes") | .digest.value'
+  ctf_digest="$("$OCM" get cv "$(_registry_ctf_ref)" -o json 2>/dev/null | jq -r "$jq_digest")" || return 1
+  reg_digest="$("$OCM" get cv "$(_registry_ref)" -o json 2>/dev/null | jq -r "$jq_digest")" || return 1
+  pulled_digest="$("$OCM" get cv "$(_registry_pulled_ref)" -o json 2>/dev/null | jq -r "$jq_digest")" || return 1
+  assert_eq "$reg_digest" "$ctf_digest" "registry resource digest" || return 1
+  assert_eq "$pulled_digest" "$ctf_digest" "pulled resource digest" || return 1
+
+  jq_sig='.[0].signatures[] | select(.name=="default") | .digest.value'
+  reg_sig="$("$OCM" get cv "$(_registry_ref)" -o json 2>/dev/null | jq -r "$jq_sig")" || return 1
+  pulled_sig="$("$OCM" get cv "$(_registry_pulled_ref)" -o json 2>/dev/null | jq -r "$jq_sig")" || return 1
+  assert_eq "$pulled_sig" "$reg_sig" "pulled signature digest"
+}
+
+test_registry_unsigned_verify_fails() {
+  local tmp="$1" out
+  _registry_fresh "$tmp" || return $?
+  bash "$ROOT/scripts/registry.sh" build >/dev/null 2>&1 || return 1
+  bash "$ROOT/scripts/registry.sh" push >/dev/null 2>&1 || return 1
+
+  if out="$(bash "$ROOT/scripts/registry.sh" verify 2>&1)"; then
+    echo "  verify should fail on an unsigned component" >&2
+    return 1
+  fi
+  assert_contains "$out" "no signatures found" || return 1
+
+  if bash "$ROOT/scripts/registry.sh" pull >/dev/null 2>&1; then
+    echo "  pull should fail on an unsigned component" >&2
+    return 1
+  fi
+  if [[ -e "$REGISTRY_DEMO_OUT/download" ]]; then
+    echo "  no download should be left after a failed pull" >&2
+    return 1
+  fi
+}
+
+test_registry_oci_url_format() {
+  local tmp="$1" out
+  _registry_fresh "$tmp" || return $?
+  out="$(bash "$ROOT/scripts/registry.sh" start 2>/dev/null)" || return 1
+  assert_eq "$out" "oci::http://127.0.0.1:5056/ocm" "start prints repository" || return 1
+  bash "$ROOT/scripts/registry.sh" build >/dev/null 2>&1 || return 1
+  bash "$ROOT/scripts/registry.sh" push >/dev/null 2>&1 || return 1
+
+  # Without http:// OCM assumes HTTPS and fails.
+  if out="$("$OCM" get cv "oci::127.0.0.1:5056/ocm//github.com/lioramilbaum/registry-demo:${VERSION:-0.1.0}" -o json 2>&1 </dev/null)"; then
+    echo "  scheme-less oci:: URL should fail" >&2
+    return 1
+  fi
+  assert_contains "$out" "https://" "scheme-less URL falls back to https" || return 1
+
+  # The http:// scheme alone is enough without the oci:: prefix.
+  "$OCM" get cv "http://127.0.0.1:5056/ocm//github.com/lioramilbaum/registry-demo:${VERSION:-0.1.0}" -o json >/dev/null 2>&1 </dev/null || \
+    { echo "  http:// URL without oci:: should succeed" >&2; return 1; }
+
+  # Another path is another, empty repository.
+  if "$OCM" get cv "oci::http://127.0.0.1:5056/other//github.com/lioramilbaum/registry-demo:${VERSION:-0.1.0}" -o json >/dev/null 2>&1 </dev/null; then
+    echo "  component under another path should not exist" >&2
+    return 1
+  fi
+}
+
+test_make_registry_target() {
+  local dry_run help_out
+  dry_run="$(make -s --dry-run -C "$ROOT" registry 2>/dev/null)" || return 1
+  assert_contains "$dry_run" "scripts/registry.sh" "dry-run includes registry.sh" || return 1
+  help_out="$(make -s -C "$ROOT" help 2>/dev/null)" || return 1
+  assert_contains "$help_out" "registry" "make help lists registry" || return 1
+  assert_contains "$help_out" "Docker" "make help mentions Docker"
+}
+
+test_readme_documents_local_oci_registry() {
+  local readme="$ROOT/README.md" section check readme_yaml constructor_yaml
+
+  grep -qxF '## Local OCI registry' "$readme" || \
+    { echo "  README missing '## Local OCI registry' heading" >&2; return 1; }
+  section="$(awk '/^## Local OCI registry/{f=1;next} /^## /{f=0} f' "$readme")"
+
+  local checks=(
+    "oci::http://127.0.0.1:5055/ocm"
+    "component-descriptors"
+    "ocm transfer cv"
+    "ocm sign cv"
+    "ocm verify cv"
+    "ocm get cv"
+    "ocm download resource"
+    "registry:2@sha256:"
+    "make registry"
+    "scripts/registry.sh stop"
+    "already exists"
+    "(#credential-system)"
+  )
+  for check in "${checks[@]}"; do
+    assert_contains "$section" "$check" "README section contains: $check" || return 1
+  done
+
+  # Drift guard: the first yaml block must match the constructor written by scripts/registry.sh.
+  readme_yaml="$(awk '/^```yaml/{n++; f=(n==1); next} /^```/{f=0} f' <<<"$section")"
+  constructor_yaml="$(sed -n "/<<'REGISTRY_CONSTRUCTOR_EOF'/,/^REGISTRY_CONSTRUCTOR_EOF\$/p" "$ROOT/scripts/registry.sh" | sed '1d;$d')"
+  [[ "$readme_yaml" == "$constructor_yaml" ]] || {
+    echo "  README yaml block differs from the constructor in scripts/registry.sh" >&2
+    return 1
+  }
+}
+
+# ── Component graphs ─────────────────────────────────────────────────────────
+
+# _graph_env <tmp>
+_graph_env() {
+  export GRAPH_DEMO_OUT="$1/graph" OCM="$GRAPH_OCM"
+}
+
+# _graph_build <tmp>: builds the three CTFs; output goes to a log so failures are visible.
+_graph_build() {
+  _graph_env "$1"
+  bash "$ROOT/scripts/graph.sh" build </dev/null >"$1/graph-build.log" 2>&1 \
+    || { tail -n 20 "$1/graph-build.log" >&2; return 1; }
+}
+
+# A resolver config with no entries, so a probe cannot fall back to any repository.
+_graph_empty_config() {
+  printf 'type: generic.config.ocm.software/v1\nconfigurations: []\n' > "$1"
+}
+
+# _graph_transfer <tmp>: builds the CTFs, then writes the flat and recursive transfer targets.
+_graph_transfer() {
+  _graph_build "$1" || return 1
+  bash "$ROOT/scripts/graph.sh" transfer </dev/null >"$1/graph-transfer.log" 2>&1 \
+    || { tail -n 20 "$1/graph-transfer.log" >&2; return 1; }
+}
+
+_graph_platform_ref() {
+  echo "ctf::$GRAPH_DEMO_OUT/platform-ctf//github.com/lioramilbaum/graph/platform:$VERSION"
+}
+
+test_graph_references_span_three_repositories() {
+  local tmp="$1" refs
+  _graph_build "$tmp" || return 1
+  assert_eq "$(jq -r '[.artifacts[].repository] | unique | sort | join(",")' "$GRAPH_DEMO_OUT/base-ctf/artifact-index.json")" \
+    "component-descriptors/github.com/lioramilbaum/graph/runtime" "base CTF holds runtime only" || return 1
+  assert_eq "$(jq -r '[.artifacts[].repository] | unique | sort | join(",")' "$GRAPH_DEMO_OUT/apps-ctf/artifact-index.json")" \
+    "component-descriptors/github.com/lioramilbaum/graph/backend,component-descriptors/github.com/lioramilbaum/graph/frontend" \
+    "apps CTF holds frontend and backend only" || return 1
+  assert_eq "$(jq -r '[.artifacts[].repository] | unique | sort | join(",")' "$GRAPH_DEMO_OUT/platform-ctf/artifact-index.json")" \
+    "component-descriptors/github.com/lioramilbaum/graph/platform" "platform CTF holds platform only" || return 1
+  refs="$("$OCM" get cv "$(_graph_platform_ref)" -o json </dev/null \
+    | jq -r '[.[0].component.componentReferences[] | select((.digest.value // "") != "")] | length')"
+  assert_eq "$refs" "2" "platform has 2 references with a digest" || return 1
+}
+
+test_graph_recursive_get_walks_all_levels() {
+  local tmp="$1" names
+  _graph_build "$tmp" || return 1
+  names="$("$OCM" get cv "$(_graph_platform_ref)" --recursive \
+    --config "$GRAPH_DEMO_OUT/resolvers.ocmconfig" -o json </dev/null \
+    | jq -r '[.[].component.name | split("/") | last] | sort | join(" ")')"
+  # OCM does not deduplicate on multiple reference paths: the diamond reaches runtime
+  # twice, so it is listed twice by design.
+  assert_eq "$names" "backend frontend platform runtime runtime" "recursive get lists the diamond" || return 1
+}
+
+test_graph_resolver_order_first_match_wins() {
+  local tmp="$1" reversed="$1/graph/reversed-resolvers.ocmconfig"
+  _graph_build "$tmp" || return 1
+  cat > "$reversed" <<EOF
+type: generic.config.ocm.software/v1
+configurations:
+  - type: resolvers.config.ocm.software/v1alpha1
+    resolvers:
+      - repository:
+          type: CommonTransportFormat/v1
+          filePath: $GRAPH_DEMO_OUT/apps-ctf
+          accessMode: readonly
+        componentNamePattern: github.com/lioramilbaum/graph/*
+      - repository:
+          type: CommonTransportFormat/v1
+          filePath: $GRAPH_DEMO_OUT/base-ctf
+          accessMode: readonly
+        componentNamePattern: github.com/lioramilbaum/graph/runtime
+EOF
+  assert_fails "$OCM" get cv "$(_graph_platform_ref)" --recursive --config "$reversed" -o json \
+    </dev/null >/dev/null 2>&1 || return 1
+}
+
+test_graph_recursive_transfer_collects_graph() {
+  local tmp="$1" empty="$1/graph/empty.ocmconfig"
+  _graph_transfer "$tmp" || return 1
+  _graph_empty_config "$empty"
+  assert_eq "$(jq '[.artifacts[].repository] | unique | length' "$GRAPH_DEMO_OUT/release-ctf/artifact-index.json")" \
+    "4" "release CTF holds four repositories" || return 1
+  "$OCM" get cv "ctf::$GRAPH_DEMO_OUT/release-ctf//github.com/lioramilbaum/graph/platform:$VERSION" \
+    --recursive --config "$empty" -o json </dev/null >/dev/null 2>&1 \
+    || { echo "  recursive transfer target is not self-contained" >&2; return 1; }
+}
+
+test_graph_flat_transfer_is_not_self_contained() {
+  local tmp="$1" empty="$1/graph/empty.ocmconfig"
+  _graph_transfer "$tmp" || return 1
+  _graph_empty_config "$empty"
+  assert_eq "$(jq '[.artifacts[].repository] | unique | length' "$GRAPH_DEMO_OUT/flat-ctf/artifact-index.json")" \
+    "1" "flat CTF holds one repository" || return 1
+  assert_fails "$OCM" get cv "ctf::$GRAPH_DEMO_OUT/flat-ctf//github.com/lioramilbaum/graph/platform:$VERSION" \
+    --recursive --config "$empty" -o json </dev/null >/dev/null 2>&1 || return 1
+}
+
+test_graph_plan_uploads_shared_reference_once() {
+  local tmp="$1" uploads runtime_fetches
+  _graph_build "$tmp" || return 1
+  bash "$ROOT/scripts/graph.sh" plan </dev/null >/dev/null 2>&1 || return 1
+  uploads="$(jq '[.transformations[] | select(.type == "CTFAddComponentVersion/v1alpha1")] | length' "$GRAPH_DEMO_OUT/plan.json")"
+  assert_eq "$uploads" "4" "plan has one upload per component" || return 1
+  runtime_fetches="$(jq '[.transformations[] | select(.type == "CTFGetLocalResource/v1alpha1") | select(.spec.component | contains("graph/runtime"))] | length' "$GRAPH_DEMO_OUT/plan.json")"
+  assert_eq "$runtime_fetches" "1" "shared runtime is fetched once" || return 1
+}
+
+test_graph_transfer_detects_changed_transitive_reference() {
+  local tmp="$1" out
+  _graph_build "$tmp" || return 1
+  out="$(bash "$ROOT/scripts/graph.sh" tamper </dev/null 2>/dev/null)" || return 1
+  assert_contains "$out" "digest mismatch" "tamper is rejected" || return 1
+  assert_contains "$out" "runtime" "rejection names the runtime" || return 1
+}
+
+test_make_graph_target() {
+  local dry_run help_out
+  dry_run="$(make -s --dry-run -C "$ROOT" graph 2>/dev/null)"
+  assert_contains "$dry_run" "scripts/graph.sh" "dry-run includes graph.sh" || return 1
+  help_out="$(make -s -C "$ROOT" help 2>/dev/null)"
+  assert_contains "$help_out" "graph" "make help lists graph"
+}
+
+test_readme_documents_component_graphs() {
+  local readme="$ROOT/README.md" section check readme_yaml constructor_yaml
+
+  grep -qxF '## Component graphs' "$readme" || \
+    { echo "  README missing '## Component graphs' heading" >&2; return 1; }
+  section="$(awk '/^## Component graphs/{f=1;next} /^## /{f=0} f' "$readme")"
+
+  local checks=(
+    "diamond"
+    "first match wins"
+    "digest mismatch"
+    "make graph"
+    "| flat |"
+    "| recursive |"
+    "(#component-references)"
+    "(#resolvers)"
+    "(#transfer-and-transport)"
+    "(#signing-and-verification)"
+  )
+  for check in "${checks[@]}"; do
+    assert_contains "$section" "$check" "README section contains: $check" || return 1
+  done
+
+  # Drift guard: every yaml block (minus # lines), in order, must match the three constructor files.
+  readme_yaml="$(awk '/^```yaml/{f=1;next} /^```/{f=0} f' <<<"$section" | grep -v '^#')"
+  constructor_yaml="$(grep -hv '^#' "$ROOT/components/graph/runtime.yaml" \
+    "$ROOT/components/graph/apps.yaml" "$ROOT/components/graph/platform.yaml")"
+  [[ "$readme_yaml" == "$constructor_yaml" ]] || {
+    echo "  README yaml blocks differ from components/graph/*.yaml" >&2
+    return 1
+  }
+}
+
+# ── GitHub access ────────────────────────────────────────────────────────────
+
+# _github_env <tmp>
+_github_env() {
+  export GITHUB_DEMO_OUT="$1/github" \
+         GITHUB_DEMO_CTF="$1/github-ctf" \
+         GITHUB_DEMO_PORT="${GITHUB_TEST_PORT:-18452}" \
+         OCM="$GITHUB_OCM"
+}
+
+# _github_build <tmp>: builds the component; output goes to a log so failures are visible.
+_github_build() {
+  _github_env "$1"
+  bash "$ROOT/scripts/github.sh" build </dev/null >"$1/github-build.log" 2>&1 \
+    || { tail -n 20 "$1/github-build.log" >&2; return 1; }
+}
+
+_github_ref() {
+  echo "ctf::$GITHUB_DEMO_CTF//github.com/lioramilbaum/github-demo:$VERSION"
+}
+
+# _github_scenarios <tmp>: builds, then runs every scenario into <tmp>/scenarios.out.
+_github_scenarios() {
+  _github_build "$1" || return 1
+  bash "$ROOT/scripts/github.sh" scenarios </dev/null >"$1/scenarios.out" 2>"$1/scenarios.err" \
+    || { tail -n 20 "$1/scenarios.err" >&2; return 1; }
+}
+
+# _github_row <tmp> <scenario>: the tab-separated row for one scenario.
+_github_row() {
+  awk -F'\t' -v name="$2" '$1 == name' "$1/scenarios.out"
+}
+
+test_github_archive_is_deterministic() {
+  local tmp="$1" sha="1111111111111111111111111111111111111111" top
+  for name in a b; do
+    python3 -I "$ROOT/scripts/github-api-server.py" --mode archive --sha "$sha" \
+      --commits-dir "$ROOT/components/github/upstream" \
+      --owner lioramilbaum --repo hello-world --out "$tmp/$name.tgz" || return 1
+  done
+  assert_eq "$(sha256 "$tmp/a.tgz")" "$(sha256 "$tmp/b.tgz")" "two archive builds match" || return 1
+  top="$(tar -tzf "$tmp/a.tgz" | sed -n '1p')"
+  assert_eq "$top" "lioramilbaum-hello-world-1111111/" "archive top directory" || return 1
+}
+
+test_github_access_pinned_at_build_time() {
+  local tmp="$1" access
+  _github_build "$tmp" || return 1
+  access="$("$OCM" get cv "$(_github_ref)" -o json </dev/null | jq -r '.[0].component.resources[0].access | [.type, .ref, .commit] | join(" ")')"
+  assert_eq "$access" "GitHub/v1 refs/heads/main 1111111111111111111111111111111111111111" "access is pinned to commit" || return 1
+}
+
+test_github_download_matches_digest() {
+  local tmp="$1" stored
+  _github_build "$tmp" || return 1
+  bash "$ROOT/scripts/github.sh" download </dev/null >/dev/null 2>&1 || return 1
+  stored="$("$OCM" get cv "$(_github_ref)" -o json </dev/null | jq -r '.[0].component.resources[0].digest.value')"
+  assert_eq "$(sha256 "$tmp/github/archive.tgz")" "$stored" "downloaded archive matches stored digest" || return 1
+}
+
+test_github_ref_moved_keeps_pinned_commit() {
+  local tmp="$1" row
+  _github_scenarios "$tmp" || return 1
+  row="$(_github_row "$tmp" branch-moved)"
+  assert_contains "$row" "pinned-commit-kept" "branch move is ignored" || return 1
+  assert_contains "$row" "1111111111111111111111111111111111111111" "fetched the pinned commit" || return 1
+}
+
+test_github_download_rejects_rewritten_archive() {
+  local tmp="$1" row
+  _github_scenarios "$tmp" || return 1
+  row="$(_github_row "$tmp" archive-rewritten)"
+  assert_contains "$row" "digest-mismatch" "rewritten archive is rejected" || return 1
+  [[ ! -e "$tmp/github/scenario-archive.tgz" ]] || { echo "  rejected archive left behind" >&2; return 1; }
+}
+
+test_github_access_needs_api_at_consume_time() {
+  local tmp="$1" row
+  _github_scenarios "$tmp" || return 1
+  row="$(_github_row "$tmp" api-down)"
+  assert_contains "$row" "connection-refused" "download fails without the API" || return 1
+}
+
+test_github_transfer_copy_inlines_archive() {
+  local tmp="$1" row
+  _github_scenarios "$tmp" || return 1
+  row="$(_github_row "$tmp" copied)"
+  assert_contains "$row" "LocalBlob/v1" "copied archive is inlined" || return 1
+}
+
+test_github_server_port_in_use() {
+  local tmp="$1" port="${GITHUB_TEST_PORT:-18452}" pid out
+  _github_env "$tmp"
+  # SO_REUSEADDR: a port left in TIME_WAIT by earlier tests must not stop the holder from binding.
+  python3 -I -c "import socket,time; s=socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1); s.bind(('127.0.0.1', $port)); s.listen(); time.sleep(60)" &
+  pid=$!
+  # shellcheck disable=SC2064
+  trap "kill $pid 2>/dev/null || true" EXIT
+  local i=0
+  while ! (exec 3<>"/dev/tcp/127.0.0.1/$port") 2>/dev/null; do
+    i=$((i+1)); [[ $i -lt 10 ]] || { echo "port holder never bound" >&2; return 1; }
+    sleep 0.3
+  done
+  exec 3>&- 2>/dev/null || true
+
+  if out="$(bash "$ROOT/scripts/github.sh" build 2>&1)"; then
+    echo "  build should fail when the port is in use" >&2
+    return 1
+  fi
+  assert_contains "$out" "port in use" "build reports the port in use"
+}
+
+test_github_online_is_opt_in() {
+  local tmp="$1" out rc=0
+  _github_env "$tmp"
+  out="$(env -u GITHUB_DEMO_ONLINE bash "$ROOT/scripts/github.sh" online 2>&1)" || rc=$?
+  assert_eq "$rc" "0" "online exits 0 without opt-in" || return 1
+  assert_contains "$out" "skip:" "online reports skip" || return 1
+  [[ ! -e "$GITHUB_DEMO_OUT/online-ctf" ]] || { echo "  online-ctf created without opt-in" >&2; return 1; }
+}
+
+test_github_online_release_asset() {
+  local tmp="$1" out
+  [[ "${OCM_ONLINE_TESTS:-0}" == 1 ]] || { echo "  skip: set OCM_ONLINE_TESTS=1"; return 77; }
+  _github_env "$tmp"
+  out="$(GITHUB_DEMO_ONLINE=1 bash "$ROOT/scripts/github.sh" online 2>&1)" || { echo "$out" >&2; return 1; }
+  assert_contains "$out" "release asset: valid gzip" "online release asset is gzip"
+}
+
+test_make_github_target() {
+  local dry_run help_out
+  dry_run="$(make -s --dry-run -C "$ROOT" github 2>/dev/null)"
+  assert_contains "$dry_run" "scripts/github.sh" "dry-run includes github.sh" || return 1
+  help_out="$(make -s -C "$ROOT" help 2>/dev/null)"
+  assert_contains "$help_out" "github" "make help lists github"
+}
+
+test_readme_documents_github_access() {
+  local readme="$ROOT/README.md" section check readme_yaml constructor_yaml
+
+  grep -qxF '## GitHub access' "$readme" || \
+    { echo "  README missing '## GitHub access' heading" >&2; return 1; }
+  section="$(awk '/^## GitHub access/{f=1;next} /^## /{f=0} f' "$readme")"
+
+  local checks=(
+    "GitHub/v1"
+    "deprecated in favour of"
+    "(#git-repositories)"
+    "(#http-resources)"
+    "Wget/v1"
+    "api/v3"
+    "/_codeload/"
+    "tarball"
+    "digest-mismatch"
+    "connection-refused"
+    "pinned-commit-kept"
+    "LocalBlob/v1"
+    "leaves the file"
+    "GITHUB_DEMO_ONLINE=1"
+    "S3/v1"
+    "make github"
+    "(#credential-system)"
+  )
+  for check in "${checks[@]}"; do
+    assert_contains "$section" "$check" "README section contains: $check" || return 1
+  done
+
+  # Drift guard: the first yaml block (minus # lines) must match the constructor.
+  readme_yaml="$(awk '/^```yaml/{f=1;next} /^```/{f=0} f' <<<"$section" | grep -v '^#')"
+  constructor_yaml="$(grep -v '^#' "$ROOT/components/github/component-constructor.yaml")"
+  [[ "$readme_yaml" == "$constructor_yaml" ]] || {
+    echo "  README yaml block differs from components/github/component-constructor.yaml" >&2
+    return 1
+  }
+}
+
+# ── Signing normalisation ────────────────────────────────────────────────────
+
+# _normalisation_env <tmp>
+_normalisation_env() {
+  export NORM_DEMO_OUT="$1/normalisation" OCM="$NORM_OCM"
+}
+
+# _normalisation_row <compare-output> <variant> <column>: one field of one compare row.
+_normalisation_row() {
+  awk -F'\t' -v name="$2" -v col="$3" '$1 == name { print $col }' <<<"$1"
+}
+
+test_normalisation_matches_ocm_digest() {
+  local tmp="$1" out
+  _normalisation_env "$tmp"
+  _build
+  out="$(bash "$ROOT/scripts/normalisation.sh" normalise </dev/null 2>/dev/null)" || return 1
+  assert_eq "$(sha256 "$NORM_DEMO_OUT/application.normalised.json")" \
+    "$(awk -F'\t' '$1 == "ocm" { print $2 }' <<<"$out")" "normalised file hashes to the OCM digest" || return 1
+}
+
+test_normalisation_excludes_unsigned_fields() {
+  local tmp="$1" content
+  _normalisation_env "$tmp"
+  _build
+  bash "$ROOT/scripts/normalisation.sh" normalise </dev/null >/dev/null 2>&1 || return 1
+  content="$(< "$NORM_DEMO_OUT/application.normalised.json")"
+  assert_not_contains "$content" '"meta"' || return 1
+  assert_not_contains "$content" '"signatures"' || return 1
+  assert_not_contains "$content" '"repositoryContexts"' || return 1
+  assert_not_contains "$content" '"access"' || return 1
+  assert_not_contains "$content" '"srcRefs"' || return 1
+  assert_not_contains "$content" 'application.lioramilbaum.github.com/tier' || return 1
+  assert_contains "$content" '"provider":{"name":' "provider is normalised to a map" || return 1
+}
+
+test_normalisation_label_vs_blob_digests() {
+  local tmp="$1" out
+  _normalisation_env "$tmp"
+  out="$(bash "$ROOT/scripts/normalisation.sh" compare </dev/null 2>/dev/null)" || return 1
+  assert_eq "$(_normalisation_row "$out" unsigned-label 4)$(_normalisation_row "$out" unsigned-label 5)" "nono" \
+    "unsigned label changes neither digest" || return 1
+  assert_eq "$(_normalisation_row "$out" signed-label 4)$(_normalisation_row "$out" signed-label 5)" "noyes" \
+    "signed label changes only the component digest" || return 1
+  assert_eq "$(_normalisation_row "$out" blob 4)$(_normalisation_row "$out" blob 5)" "yesyes" \
+    "blob change changes both digests" || return 1
+}
+
+test_normalisation_reimplementation_matches_each_variant() {
+  local tmp="$1" out rows bad
+  _normalisation_env "$tmp"
+  out="$(bash "$ROOT/scripts/normalisation.sh" compare </dev/null 2>/dev/null)" || return 1
+  rows="$(awk -F'\t' 'NR > 1' <<<"$out" | wc -l | tr -d ' ')"
+  assert_eq "$rows" "4" "compare has four variant rows" || return 1
+  bad="$(awk -F'\t' 'NR > 1 && $6 != "yes"' <<<"$out" | wc -l | tr -d ' ')"
+  assert_eq "$bad" "0" "every variant matches the jq reimplementation" || return 1
+}
+
+test_normalisation_rejects_legacy_v1() {
+  local tmp="$1" out
+  _normalisation_env "$tmp"
+  out="$(bash "$ROOT/scripts/normalisation.sh" algorithms </dev/null 2>/dev/null)" || return 1
+  assert_contains "$out" "jsonNormalisation/v1" || return 1
+  assert_contains "$out" "unknown normalisation" "legacy algorithm is rejected" || return 1
+}
+
+test_make_normalisation_target() {
+  local dry_run help_out
+  dry_run="$(make -s --dry-run -C "$ROOT" normalisation 2>/dev/null)"
+  assert_contains "$dry_run" "scripts/build.sh" "dry-run includes build.sh" || return 1
+  assert_contains "$dry_run" "scripts/normalisation.sh" "dry-run includes normalisation.sh" || return 1
+  help_out="$(make -s -C "$ROOT" help 2>/dev/null)"
+  assert_contains "$help_out" "normalisation" "make help lists normalisation"
+}
+
+test_readme_documents_signing_normalisation() {
+  local readme="$ROOT/README.md" section check readme_yaml constructor_yaml
+
+  grep -qxF '## Signing normalisation' "$readme" || \
+    { echo "  README missing '## Signing normalisation' heading" >&2; return 1; }
+  section="$(awk '/^## Signing normalisation/{f=1;next} /^## /{f=0} f' "$readme")"
+
+  local checks=(
+    "jsonNormalisation/v4alpha1"
+    "unknown normalisation algorithm"
+    "jsonNormalisation/v1"
+    "make normalisation"
+    "components/normalisation/jsonNormalisation-v4alpha1.jq"
+    "ocm sign cv --dry-run"
+    "jq-matches-ocm"
+    "| \`unsigned-label\` |"
+    "| \`signed-label\` |"
+    "| \`blob\` |"
+    "(#signing-and-verification)"
+  )
+  for check in "${checks[@]}"; do
+    assert_contains "$section" "$check" "README section contains: $check" || return 1
+  done
+
+  # Drift guard: the first yaml block (minus # lines) must match the constructor.
+  readme_yaml="$(awk '/^```yaml/{f=1;next} /^```/{f=0} f' <<<"$section" | grep -v '^#')"
+  constructor_yaml="$(grep -v '^#' "$ROOT/components/normalisation/component-constructor.yaml")"
+  [[ "$readme_yaml" == "$constructor_yaml" ]] || {
+    echo "  README yaml block differs from components/normalisation/component-constructor.yaml" >&2
+    return 1
+  }
+}
+
+# ── S3 resources ─────────────────────────────────────────────────────────────
+
+# _s3_env <tmp>
+_s3_env() {
+  export S3_NAME="ocm-demo-s3-test" \
+         S3_PORT="${S3_TEST_PORT:-19001}" \
+         S3_DEMO_CTF="$1/s3-ctf" \
+         S3_DEMO_OUT="$1/s3" \
+         OCM="$S3_OCM"
+}
+
+_s3_docker_available() {
+  command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1
+}
+
+# _s3_start <tmp>: start and seed the test server; the test subshell removes it on exit.
+_s3_start() {
+  _s3_env "$1"
+  trap 'bash "$ROOT/scripts/s3.sh" stop >/dev/null 2>&1 || true' EXIT
+  bash "$ROOT/scripts/s3.sh" start >/dev/null
+  bash "$ROOT/scripts/s3.sh" seed >/dev/null
+}
+
+# _s3_build: build the demo component against the running test server.
+_s3_build() {
+  bash "$ROOT/scripts/s3.sh" build >/dev/null 2>&1
+}
+
+# _s3_scenarios <tmp>: start, build and sign the demo, then run every scenario into scenarios.tsv.
+_s3_scenarios() {
+  _s3_start "$1"
+  _s3_build
+  bash "$ROOT/scripts/s3.sh" sign >/dev/null
+  bash "$ROOT/scripts/s3.sh" scenarios > "$S3_DEMO_OUT/scenarios.tsv"
+}
+
+# _s3_row <scenario> <resource>
+_s3_row() {
+  awk -F'\t' -v s="$1" -v r="$2" '$1 == s && $2 == r { print $3 }' "$S3_DEMO_OUT/scenarios.tsv"
+}
+
+# _s3_access <resource> <jq-filter>: reads the built descriptor.
+_s3_access() {
+  "$OCM" get cv "ctf::${S3_DEMO_CTF}//github.com/lioramilbaum/s3-demo:${VERSION}" -o json </dev/null \
+    | jq -r --arg n "$1" ".[0].component.resources[] | select(.name == \$n) | $2"
+}
+
+# _s3_get <path>: signed GET against the test server, bypassing OCM.
+_s3_get() {
+  curl -fsS --aws-sigv4 "aws:amz:us-east-1:s3" --user "ocm-demo:ocm-demo-secret" \
+    -H "x-amz-content-sha256: e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855" \
+    "http://127.0.0.1:${S3_PORT}$1"
+}
+
+test_s3_image_pinned_by_digest() {
+  local image
+  image="$(grep '^S3_IMAGE=' "$ROOT/scripts/s3.sh")"
+  assert_contains "$image" "@sha256:"
+}
+
+test_s3_docker_skip_without_docker() {
+  _s3_env "$1"
+  local stub="$1/stub-bin" out rc=0
+  mkdir -p "$stub"
+  printf '#!/usr/bin/env bash\nexit 1\n' > "$stub/docker"
+  chmod +x "$stub/docker"
+  out="$(PATH="$stub:$PATH" bash "$ROOT/scripts/s3.sh" start 2>&1)" || rc=$?
+  assert_eq "$rc" "0" "exit status without docker" || return 1
+  assert_contains "$out" "skip:"
+}
+
+test_s3_seed_uploads_object() {
+  _s3_docker_available || { echo "  skip: Docker not available"; return 77; }
+  _s3_start "$1"
+  assert_eq "$(_s3_get /ocm-demo/releases/notes.txt)" "$(cat "$ROOT/components/s3/upstream/release-notes.txt")"
+}
+
+test_s3_access_records_endpoint() {
+  _s3_docker_available || { echo "  skip: Docker not available"; return 77; }
+  _s3_start "$1"
+  _s3_build
+  assert_eq "$(_s3_access notes '.access.endpoint')" "http://127.0.0.1:${S3_PORT}"
+}
+
+test_s3_access_v1_uses_bucket_key_fields() {
+  _s3_docker_available || { echo "  skip: Docker not available"; return 77; }
+  _s3_start "$1"
+  _s3_build
+  assert_eq "$(_s3_access notes-v1 '.access.bucket')" "ocm-demo" || return 1
+  assert_eq "$(_s3_access notes-v1 '.access.key')" "releases/notes.txt"
+}
+
+test_s3_access_v2_uses_bucket_name_fields() {
+  _s3_docker_available || { echo "  skip: Docker not available"; return 77; }
+  _s3_start "$1"
+  _s3_build
+  assert_eq "$(_s3_access notes '.access.bucketName')" "ocm-demo"
+}
+
+test_s3_unversioned_build_warns_no_pin() {
+  _s3_docker_available || { echo "  skip: Docker not available"; return 77; }
+  _s3_start "$1"
+  local log
+  log="$(bash "$ROOT/scripts/s3.sh" build 2>&1)"
+  assert_contains "$log" "carries no version"
+}
+
+test_s3_versioned_bucket_pins_version() {
+  _s3_docker_available || { echo "  skip: Docker not available"; return 77; }
+  _s3_start "$1"
+  _s3_build
+  local version
+  version="$(cat "$S3_DEMO_OUT/seed-version")"
+  [[ -n "$version" ]] || { echo "  seed-version is empty" >&2; return 1; }
+  assert_eq "$(_s3_access notes-pinned '.access.version')" "$version"
+}
+
+test_s3_input_becomes_local_blob() {
+  _s3_docker_available || { echo "  skip: Docker not available"; return 77; }
+  _s3_start "$1"
+  _s3_build
+  assert_eq "$(_s3_access notes-input '.access.type')" "LocalBlob/v1"
+}
+
+test_s3_download_v1_and_v2() {
+  _s3_docker_available || { echo "  skip: Docker not available"; return 77; }
+  _s3_start "$1"
+  _s3_build
+  bash "$ROOT/scripts/s3.sh" sign >/dev/null
+  local out
+  out="$(bash "$ROOT/scripts/s3.sh" download)"
+  assert_contains "$out" $'download\tnotes-v1\tok' || return 1
+  assert_contains "$out" $'download\tnotes\tok'
+}
+
+test_s3_download_rejects_overwritten_object() {
+  _s3_docker_available || { echo "  skip: Docker not available"; return 77; }
+  _s3_scenarios "$1"
+  assert_eq "$(_s3_row overwritten notes)" "digest-mismatch" || return 1
+}
+
+test_s3_pinned_version_survives_overwrite() {
+  _s3_docker_available || { echo "  skip: Docker not available"; return 77; }
+  _s3_scenarios "$1"
+  assert_eq "$(_s3_row overwritten-versioned notes-pinned)" "ok"
+}
+
+test_s3_input_works_offline() {
+  _s3_docker_available || { echo "  skip: Docker not available"; return 77; }
+  _s3_scenarios "$1"
+  assert_eq "$(_s3_row server-down notes-input)" "ok"
+}
+
+test_s3_credentials_required() {
+  _s3_docker_available || { echo "  skip: Docker not available"; return 77; }
+  _s3_scenarios "$1"
+  assert_eq "$(_s3_row no-credentials notes)" "credentials-missing"
+}
+
+test_s3_glob_star_matches() {
+  _s3_docker_available || { echo "  skip: Docker not available"; return 77; }
+  _s3_scenarios "$1"
+  assert_eq "$(_s3_row glob-star notes)" "ok"
+}
+
+test_s3_doublestar_not_matched() {
+  _s3_docker_available || { echo "  skip: Docker not available"; return 77; }
+  _s3_scenarios "$1"
+  assert_eq "$(_s3_row glob-doublestar notes)" "credentials-missing"
+}
+
+test_s3_transfer_copies_v2_only() {
+  _s3_docker_available || { echo "  skip: Docker not available"; return 77; }
+  _s3_scenarios "$1"
+  assert_eq "$(_s3_row copied-v2 notes)" "LocalBlob/v1" || return 1
+  assert_eq "$(_s3_row copied-v1 notes-v1)" "S3/v1"
+}
+
+test_s3_stop_removes_container() {
+  _s3_docker_available || { echo "  skip: Docker not available"; return 77; }
+  _s3_start "$1"
+  bash "$ROOT/scripts/s3.sh" stop >/dev/null
+  if docker ps -a --format '{{.Names}}' | grep -qx "$S3_NAME"; then
+    echo "  container $S3_NAME still exists after stop" >&2
+    return 1
+  fi
+}
+
+test_make_s3_target() {
+  local dry help
+  dry="$(make -C "$ROOT" -n s3 OCM="$S3_OCM")"
+  assert_contains "$dry" "scripts/s3.sh" || return 1
+  help="$(make -C "$ROOT" help)"
+  assert_contains "$help" "  s3 "
+}
+
+test_readme_documents_s3_resources() {
+  local readme="$ROOT/README.md" section readme_yaml constructor_yaml
+  grep -qxF '## S3 resources' "$readme" || {
+    echo "  README missing '## S3 resources' heading" >&2
+    return 1
+  }
+  section="$(awk '/^## S3 resources/{f=1;next} /^## /{f=0} f' "$readme")"
+
+  local checks=(
+    "rustfs"
+    "S3/v1"
+    "S3/v2"
+    "AWS_SHARED_CREDENTIALS_FILE"
+    "carries no version"
+    "x-amz-version-id"
+    "digest-mismatch"
+    "credentials-missing"
+    "connection-refused"
+    "LocalBlob/v1"
+    "--copy-resources"
+    "Input vs access"
+    "make s3"
+    "bash scripts/s3.sh stop"
+    "(#credential-system)"
+  )
+  local check
+  for check in "${checks[@]}"; do
+    assert_contains "$section" "$check" "README section contains: $check" || return 1
+  done
+
+  # Drift guard: the first yaml block (minus # lines) must match the constructor.
+  readme_yaml="$(awk '/^```yaml/{f=1;next} /^```/{f=0} f' <<<"$section" | grep -v '^#')"
+  constructor_yaml="$(grep -v '^#' "$ROOT/components/s3/component-constructor.yaml")"
+  [[ "$readme_yaml" == "$constructor_yaml" ]] || {
+    echo "  README yaml block differs from components/s3/component-constructor.yaml" >&2
+    return 1
+  }
+}
+
+# ── Resources without access (None) ─────────────────────────────────────────
+
+# _none_env <tmp>
+_none_env() {
+  export NONE_DEMO_CTF="$1/none-access-ctf" \
+         NONE_DEMO_OUT="$1/none-access" \
+         OCM="$NONE_OCM"
+}
+
+# _none_build <tmp>: build the demo component.
+_none_build() {
+  _none_env "$1"
+  bash "$ROOT/scripts/none-access.sh" build >/dev/null 2>&1
+}
+
+# _none_signed <tmp>: build and sign the demo component.
+_none_signed() {
+  _none_build "$1"
+  bash "$ROOT/scripts/none-access.sh" sign >/dev/null 2>&1
+}
+
+# _none_variants <tmp>: run the variants table into variants.tsv.
+_none_variants() {
+  _none_env "$1"
+  mkdir -p "$NONE_DEMO_OUT"
+  bash "$ROOT/scripts/none-access.sh" variants > "$NONE_DEMO_OUT/variants.tsv" 2>/dev/null
+}
+
+# _none_row <variant> <column>: columns are 1 variant, 2 access-type, 3 has-digest,
+# 4 component-digest, 5 same-as-base, 6 sign-warning.
+_none_row() {
+  awk -F'\t' -v v="$1" -v c="$2" '$1 == v { print $c }' "$NONE_DEMO_OUT/variants.tsv"
+}
+
+test_none_access_provenance_json_matches_label() {
+  local label actual
+  label="$(grep -F 'value: "' "$ROOT/components/none-access/component-constructor.yaml" | sed 's/.*value: "\([0-9a-f]*\)".*/\1/')"
+  actual="$(sha256 "$ROOT/components/none-access/provenance.json")"
+  assert_eq "$actual" "$label"
+}
+
+test_none_access_resource_has_no_digest_in_descriptor() {
+  _none_build "$1"
+  local digest
+  digest="$("$OCM" get cv "ctf::${NONE_DEMO_CTF}//github.com/lioramilbaum/none-access-demo:${VERSION}" -o json </dev/null \
+    | jq -r '.[0].component.resources[] | select(.name == "provenance") | .digest // "none"')"
+  assert_eq "$digest" "none"
+}
+
+test_none_access_build_warns_no_digest_processor() {
+  _none_build "$1"
+  assert_contains "$(cat "$1/none-access/build.log")" "digest processor"
+}
+
+test_none_access_control_resource_downloads() {
+  _none_build "$1"
+  local out
+  out="$(bash "$ROOT/scripts/none-access.sh" download)"
+  assert_contains "$out" $'release-notes\tok'
+}
+
+test_none_access_download_fails_gracefully() {
+  _none_build "$1"
+  local out
+  out="$(bash "$ROOT/scripts/none-access.sh" download)"
+  assert_contains "$out" $'provenance\tno-access' || return 1
+}
+
+test_none_access_sign_and_verify() {
+  _none_signed "$1"
+  bash "$ROOT/scripts/none-access.sh" verify >/dev/null
+}
+
+test_none_access_digest_not_signed() {
+  _none_variants "$1"
+  assert_eq "$(_none_row digest-a 5)" "yes" "digest-a same as base" || return 1
+  assert_eq "$(_none_row digest-b 5)" "yes" "digest-b same as base"
+}
+
+test_none_access_digest_triggers_warning() {
+  _none_variants "$1"
+  assert_contains "$(_none_row digest-a 6)" "not allowed"
+}
+
+test_none_access_lowercase_warns_missing_digest() {
+  _none_variants "$1"
+  local warning
+  warning="$(_none_row lowercase 6)"
+  assert_contains "$warning" "missing digest" || return 1
+  assert_not_contains "$warning" "none"
+}
+
+test_none_access_versioned_type_is_not_none() {
+  _none_variants "$1"
+  assert_eq "$(_none_row versioned-type 5)" "no"
+}
+
+test_none_access_identity_is_signed() {
+  _none_variants "$1"
+  assert_eq "$(_none_row renamed 5)" "no"
+}
+
+test_none_access_label_is_signed() {
+  _none_variants "$1"
+  assert_eq "$(_none_row label-changed 5)" "no"
+}
+
+test_none_access_audit_passes() {
+  _none_signed "$1"
+  local out
+  out="$(bash "$ROOT/scripts/none-access.sh" audit)"
+  assert_contains "$out" "passed"
+}
+
+test_none_access_audit_detects_tamper() {
+  _none_signed "$1"
+  local tampered="$1/tampered-provenance.json" err rc=0
+  cp "$ROOT/components/none-access/provenance.json" "$tampered"
+  printf ' ' >> "$tampered"
+  err="$(NONE_PROVENANCE_FILE="$tampered" bash "$ROOT/scripts/none-access.sh" audit 2>&1)" || rc=$?
+  [[ $rc -ne 0 ]] || { echo "  audit accepted tampered provenance" >&2; return 1; }
+  assert_contains "$err" "audit failed"
+}
+
+test_none_access_transfer_keeps_none() {
+  _none_signed "$1"
+  local out
+  out="$(bash "$ROOT/scripts/none-access.sh" transfer)"
+  assert_contains "$out" $'plain\tNone\tok'
+}
+
+test_none_access_copy_resources_keeps_none() {
+  _none_signed "$1"
+  local out
+  out="$(bash "$ROOT/scripts/none-access.sh" transfer)"
+  assert_contains "$out" $'copy-resources\tNone\tok'
+}
+
+test_make_none_access_target() {
+  local dry help
+  dry="$(make -C "$ROOT" -n none-access OCM="$NONE_OCM")"
+  assert_contains "$dry" "scripts/none-access.sh" || return 1
+  help="$(make -C "$ROOT" help)"
+  assert_contains "$help" "  none-access "
+}
+
+test_readme_documents_none_access() {
+  local readme="$ROOT/README.md" section readme_yaml constructor_yaml
+  grep -qxF '## Resources without access (None)' "$readme" || {
+    echo "  README missing '## Resources without access (None)' heading" >&2
+    return 1
+  }
+  section="$(awk '/^## Resources without access/{f=1;next} /^## /{f=0} f' "$readme")"
+
+  local checks=(
+    "None/v1"
+    "not signed"
+    "(#signing-normalisation)"
+    "jsonNormalisation/v4alpha1"
+    "not allowed"
+    "missing digest"
+    "signing: true"
+    "bash scripts/none-access.sh audit"
+    "audit failed"
+    "make none-access"
+  )
+  local check
+  for check in "${checks[@]}"; do
+    assert_contains "$section" "$check" "README section contains: $check" || return 1
+  done
+
+  # Drift guard: the first yaml block (minus # lines) must match the constructor.
+  readme_yaml="$(awk '/^```yaml/{f=1;next} /^```/{f=0} f' <<<"$section" | grep -v '^#')"
+  constructor_yaml="$(grep -v '^#' "$ROOT/components/none-access/component-constructor.yaml")"
+  [[ "$readme_yaml" == "$constructor_yaml" ]] || {
+    echo "  README yaml block differs from components/none-access/component-constructor.yaml" >&2
+    return 1
+  }
+}
+
 # ── Run all tests ─────────────────────────────────────────────────────────────
 
 run_test "build produces application tree" test_build_produces_application_tree
@@ -4978,6 +6725,21 @@ run_test "git requires ocm 0.19" test_git_requires_ocm_019
 run_test "git show reports provenance" test_git_show_reports_provenance
 run_test "make git target" test_make_git_target
 run_test "readme documents git repositories" test_readme_documents_git_repositories
+run_test "oci layout is reproducible" test_oci_layout_is_reproducible
+run_test "oci image resource metadata" test_oci_image_resource_metadata
+run_test "oci resource digest is manifest digest" test_oci_resource_digest_is_manifest_digest
+run_test "oci download yields oci layout" test_oci_download_yields_oci_layout
+run_test "oci multiarch index references variants" test_oci_multiarch_index_references_variants
+run_test "oci download requires signature" test_oci_download_requires_signature
+run_test "oci signature covers image digest" test_oci_signature_covers_image_digest
+run_test "oci transfer plan copy-resources leaves local images" test_oci_plan_copy_resources_leaves_local_images
+run_test "oci transfer plan uploader rewrites references" test_oci_plan_uploader_rewrites_references
+run_test "oci transfer to ctf keeps digests" test_oci_transfer_to_ctf_keeps_digests
+run_test "oci inspect reports architectures" test_oci_inspect_reports_architectures
+run_test "localization relocate rewrites access keeps digest" test_localization_relocate_rewrites_access_keeps_digest
+run_test "localization readme documents three levels" test_localization_readme_documents_three_levels
+run_test "make oci target" test_make_oci_target
+run_test "readme documents oci images" test_readme_documents_oci_images
 run_test "gpg signature is openpgp" test_gpg_signature_is_openpgp
 run_test "gpg configs pin signer key" test_gpg_configs_pin_signer_key
 run_test "gpg signs with subkey" test_gpg_signs_with_subkey
@@ -4999,7 +6761,113 @@ run_test "gpg own keys use supplied files" test_gpg_own_keys_use_supplied_files
 run_test "gpg show reports key" test_gpg_show_reports_key
 run_test "make gpg target" test_make_gpg_target
 run_test "readme documents gpg signing" test_readme_documents_gpg_signing
+run_test "credentials build creates ctf" test_credentials_build_creates_ctf
+run_test "credentials show lists consumer types" test_credentials_show_lists_consumer_types
+run_test "credentials match exact wins over wildcard" test_credentials_match_exact_wins_over_wildcard
+run_test "credentials match wildcard catches subpath" test_credentials_match_wildcard_catches_subpath
+run_test "credentials match path star does not cross slash" test_credentials_match_path_star_does_not_cross_slash
+run_test "credentials chain combines configs" test_credentials_chain_combines_configs
+run_test "credentials wget identity hostname required" test_credentials_wget_identity_hostname_required
+run_test "credentials wget identity port attribute" test_credentials_wget_identity_port_attribute
+run_test "credentials generic config wraps multiple" test_credentials_generic_config_wraps_multiple
+run_test "credentials scenarios matrix output" test_credentials_scenarios_matrix_output
+run_test "make credentials target" test_make_credentials_target
+run_test "readme documents credential system" test_readme_documents_credential_system
+run_test "plugin capabilities returns access type" test_plugin_capabilities_returns_access_type
+run_test "plugin healthz responds" test_plugin_healthz_responds
+run_test "plugin build registers access type" test_plugin_build_registers_access_type
+run_test "plugin download returns blob" test_plugin_download_returns_blob
+run_test "plugin identity endpoint" test_plugin_identity_endpoint
+run_test "plugin missing plugin fails gracefully" test_plugin_missing_plugin_fails_gracefully
+run_test "plugin show lists capabilities" test_plugin_show_lists_capabilities
+run_test "plugin scenarios correct response" test_plugin_scenarios_correct_response
+run_test "plugin scenarios malformed response" test_plugin_scenarios_malformed_response
+run_test "plugin loglevel debug shows registration" test_plugin_loglevel_debug_shows_registration
+run_test "make plugin target" test_make_plugin_target
+run_test "readme documents plugin demo" test_readme_documents_plugin_demo
+run_test "registry docker available" test_registry_docker_available
+run_test "registry start creates container" test_registry_start_creates_container
+run_test "registry push component" test_registry_push_component_to_registry
+run_test "registry get cv from registry" test_registry_get_cv_from_registry
+run_test "registry sign in registry" test_registry_sign_in_registry
+run_test "registry verify signed component" test_registry_verify_signed_component
+run_test "registry pull downloads resource" test_registry_pull_downloads_resource
+run_test "registry stop removes container" test_registry_stop_removes_container
+run_test "registry push idempotent" test_registry_push_idempotent
+run_test "registry transfer preserves resources" test_registry_transfer_preserves_resources
+run_test "registry unsigned verify fails" test_registry_unsigned_verify_fails
+run_test "registry oci url format" test_registry_oci_url_format
+run_test "make registry target" test_make_registry_target
+run_test "readme documents local oci registry" test_readme_documents_local_oci_registry
+run_test "graph references span three repositories" test_graph_references_span_three_repositories
+run_test "graph recursive get walks all levels" test_graph_recursive_get_walks_all_levels
+run_test "graph resolver order first match wins" test_graph_resolver_order_first_match_wins
+run_test "graph recursive transfer collects graph" test_graph_recursive_transfer_collects_graph
+run_test "graph flat transfer is not self contained" test_graph_flat_transfer_is_not_self_contained
+run_test "graph plan uploads shared reference once" test_graph_plan_uploads_shared_reference_once
+run_test "graph transfer detects changed transitive reference" test_graph_transfer_detects_changed_transitive_reference
+run_test "make graph target" test_make_graph_target
+run_test "readme documents component graphs" test_readme_documents_component_graphs
+run_test "github archive is deterministic" test_github_archive_is_deterministic
+run_test "github access pinned at build time" test_github_access_pinned_at_build_time
+run_test "github download matches digest" test_github_download_matches_digest
+run_test "github ref moved keeps pinned commit" test_github_ref_moved_keeps_pinned_commit
+run_test "github download rejects rewritten archive" test_github_download_rejects_rewritten_archive
+run_test "github access needs api at consume time" test_github_access_needs_api_at_consume_time
+run_test "github transfer copy inlines archive" test_github_transfer_copy_inlines_archive
+run_test "github server port in use" test_github_server_port_in_use
+run_test "github online is opt in" test_github_online_is_opt_in
+run_test "github online release asset" test_github_online_release_asset
+run_test "make github target" test_make_github_target
+run_test "readme documents github access" test_readme_documents_github_access
+run_test "normalisation matches ocm digest" test_normalisation_matches_ocm_digest
+run_test "normalisation excludes unsigned fields" test_normalisation_excludes_unsigned_fields
+run_test "normalisation label vs blob digests" test_normalisation_label_vs_blob_digests
+run_test "normalisation reimplementation matches each variant" test_normalisation_reimplementation_matches_each_variant
+run_test "normalisation rejects legacy v1" test_normalisation_rejects_legacy_v1
+run_test "make normalisation target" test_make_normalisation_target
+run_test "readme documents signing normalisation" test_readme_documents_signing_normalisation
+
+run_test "s3 image pinned by digest" test_s3_image_pinned_by_digest
+run_test "s3 docker skip without docker" test_s3_docker_skip_without_docker
+run_test "s3 seed uploads object" test_s3_seed_uploads_object
+run_test "s3 access records endpoint" test_s3_access_records_endpoint
+run_test "s3 access v1 uses bucket key fields" test_s3_access_v1_uses_bucket_key_fields
+run_test "s3 access v2 uses bucket name fields" test_s3_access_v2_uses_bucket_name_fields
+run_test "s3 unversioned build warns no pin" test_s3_unversioned_build_warns_no_pin
+run_test "s3 versioned bucket pins version" test_s3_versioned_bucket_pins_version
+run_test "s3 input becomes local blob" test_s3_input_becomes_local_blob
+run_test "s3 download v1 and v2" test_s3_download_v1_and_v2
+run_test "s3 download rejects overwritten object" test_s3_download_rejects_overwritten_object
+run_test "s3 pinned version survives overwrite" test_s3_pinned_version_survives_overwrite
+run_test "s3 input works offline" test_s3_input_works_offline
+run_test "s3 credentials required" test_s3_credentials_required
+run_test "s3 glob star matches" test_s3_glob_star_matches
+run_test "s3 doublestar not matched" test_s3_doublestar_not_matched
+run_test "s3 transfer copies v2 only" test_s3_transfer_copies_v2_only
+run_test "s3 stop removes container" test_s3_stop_removes_container
+run_test "make s3 target" test_make_s3_target
+run_test "readme documents s3 resources" test_readme_documents_s3_resources
+
+run_test "none-access sha256 matches constructor label" test_none_access_provenance_json_matches_label
+run_test "none-access resource has no digest in descriptor" test_none_access_resource_has_no_digest_in_descriptor
+run_test "none-access build warns no digest processor" test_none_access_build_warns_no_digest_processor
+run_test "none-access control resource downloads" test_none_access_control_resource_downloads
+run_test "none-access download fails gracefully" test_none_access_download_fails_gracefully
+run_test "none-access sign and verify" test_none_access_sign_and_verify
+run_test "none-access digest not signed" test_none_access_digest_not_signed
+run_test "none-access digest triggers warning" test_none_access_digest_triggers_warning
+run_test "none-access lowercase warns missing digest" test_none_access_lowercase_warns_missing_digest
+run_test "none-access versioned type is not none" test_none_access_versioned_type_is_not_none
+run_test "none-access identity is signed" test_none_access_identity_is_signed
+run_test "none-access label is signed" test_none_access_label_is_signed
+run_test "none-access audit passes" test_none_access_audit_passes
+run_test "none-access audit detects tamper" test_none_access_audit_detects_tamper
+run_test "none-access transfer keeps none" test_none_access_transfer_keeps_none
+run_test "none-access copy resources keeps none" test_none_access_copy_resources_keeps_none
+run_test "make none-access target" test_make_none_access_target
+run_test "readme documents none access" test_readme_documents_none_access
 
 echo ""
-echo "Results: $PASS passed, $FAIL failed"
+echo "Results: $PASS passed, $FAIL failed, $SKIP skipped"
 [[ $FAIL -eq 0 ]]

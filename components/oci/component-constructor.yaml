@@ -1,0 +1,31 @@
+# Demo component for OCI image resources (ociImage from local OCI layout tars).
+name: github.com/lioramilbaum/oci-demo
+version: ${VERSION}
+provider:
+  name: github.com/lioramilbaum
+resources:
+  - name: hello-image
+    type: ociImage
+    version: ${VERSION}
+    extraIdentity:
+      architecture: amd64
+    input:
+      type: file
+      path: ./hello-oci-amd64.oci.tar
+      mediaType: application/vnd.ocm.software.oci.layout.v1+tar
+  - name: hello-image
+    type: ociImage
+    version: ${VERSION}
+    extraIdentity:
+      architecture: arm64
+    input:
+      type: file
+      path: ./hello-oci-arm64.oci.tar
+      mediaType: application/vnd.ocm.software.oci.layout.v1+tar
+  - name: hello-image-multiarch
+    type: ociImage
+    version: ${VERSION}
+    input:
+      type: file
+      path: ./hello-oci-multiarch.oci.tar
+      mediaType: application/vnd.ocm.software.oci.layout.v1+tar
