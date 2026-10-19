@@ -43,7 +43,7 @@ _sign() {
 
 _verify() {
   # Checks only the product's own signature, NOT the referenced component's content.
-  # See README ## Component References — Trust limitation.
+  # See docs/component-graphs.md ## Component References — Trust limitation.
   "$OCM" verify cv \
     --config "${VERIFY_CONFIG:-$BUILD_DIR/verify.ocmconfig}" \
     --signature default \

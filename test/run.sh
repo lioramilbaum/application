@@ -84,6 +84,18 @@ assert_fails() {
   fi
 }
 
+# Docs are split between README.md and docs/*.md, so searches cover all of them.
+DOC_FILES=("$ROOT/README.md" "$ROOT"/docs/*.md)
+# doc_section TITLE: body of the "# TITLE..." or "## TITLE..." section across all doc files (prefix match, fence-aware)
+doc_section() {
+  awk -v h="$1" 'FNR==1{f=0; c=0} /^(```|~~~)/{ if(!c){c=1; m=substr($0,1,3)} else if(substr($0,1,3)==m){c=0} } !c && /^##? /{t=$0; sub(/^##? /,"",t); f=(index(t,h)==1); next} f' "${DOC_FILES[@]}"
+}
+doc_heading_exists() { grep -qxF -e "# $1" -e "## $1" "${DOC_FILES[@]}"; }
+# _heading_slugs FILE: GitHub-style anchor slug of each heading outside fences
+_heading_slugs() {
+  awk '/^(```|~~~)/{ if(!c){c=1; m=substr($0,1,3)} else if(substr($0,1,3)==m){c=0}; next } !c && /^#+ /{t=$0; sub(/^#+ /,"",t); s=tolower(t); gsub(/[^a-z0-9 _-]/,"",s); gsub(/ /,"-",s); print s}' "$1"
+}
+
 _build_golden() {
   if [[ ! -d "$GOLDEN_DIR/ctf" ]]; then
     mkdir -p "$GOLDEN_DIR"
@@ -1605,7 +1617,7 @@ test_resource_access_types() {
 test_readme_documents_resource_access_types() {
   # awk rather than sed/head: BSD (macOS) sed and head reject the GNU-only forms
   local section
-  section="$(awk '/^## Resource repositories/{f=1; next} /^## /{f=0} f' "$ROOT/README.md")"
+  section="$(doc_section "Resource repositories")"
   [[ -n "$section" ]] || { echo "  README has no '## Resource repositories' section" >&2; return 1; }
   assert_contains "$section" "OCIImage/v1" || return 1
   assert_contains "$section" "LocalBlob/v1" || return 1
@@ -1804,7 +1816,7 @@ test_transfer_config_routes_images_per_architecture() {
 
 test_readme_documents_transfer_and_transport() {
   local tmp="$1" section consuming_section
-  section="$(awk '/^## Transfer and transport/{f=1; next} /^## /{f=0} f' "$ROOT/README.md")"
+  section="$(doc_section "Transfer and transport")"
   [[ -n "$section" ]] || { echo "  ## Transfer and transport section missing" >&2; return 1; }
 
   assert_contains "$section" "ocm.software/docs/concepts/transfer-and-transport" || return 1
@@ -1819,8 +1831,8 @@ test_readme_documents_transfer_and_transport() {
   assert_contains "$section" "localblob.uploader.transfer.config.ocm.software/v1alpha1" || return 1
   assert_contains "$section" "extraIdentity.architecture" || return 1
   assert_contains "$section" "digest mismatch" || return 1
-  assert_contains "$section" "(#signing-and-verification)" || return 1
-  assert_contains "$section" "(#consuming-the-component)" || return 1
+  assert_contains "$section" "#signing-and-verification)" || return 1
+  assert_contains "$section" "#consuming-the-component)" || return 1
   assert_not_contains "$section" "ocm transfer plan" || return 1
 
   _build
@@ -1834,8 +1846,8 @@ test_readme_documents_transfer_and_transport() {
     assert_contains "$section" "$t" || return 1
   done < <(jq -r '[.transformations[].type] | unique | .[]' "$plan_file")
 
-  consuming_section="$(awk '/^## Consuming the component/{f=1; next} /^## /{f=0} f' "$ROOT/README.md")"
-  assert_contains "$consuming_section" "(#transfer-and-transport)" || return 1
+  consuming_section="$(doc_section "Consuming the component")"
+  assert_contains "$consuming_section" "#transfer-and-transport)" || return 1
 }
 
 test_ctf_layout_is_canonical() {
@@ -1916,7 +1928,7 @@ test_ctf_archive_is_portable_and_signed() {
 
 test_readme_documents_canonical_component_repositories() {
   local tmp="$1" section
-  section="$(awk '/^## Canonical component repositories/{f=1; next} /^## /{f=0} f' "$ROOT/README.md")"
+  section="$(doc_section "Canonical component repositories")"
   [[ -n "$section" ]] || { echo "  README has no ## Canonical component repositories section"; return 1; }
   assert_contains "$section" "Common Transport Format" || return 1
   assert_contains "$section" "build/ctf/" || return 1
@@ -1929,7 +1941,7 @@ test_readme_documents_canonical_component_repositories() {
 
 test_readme_documents_kubernetes_controller() {
   local tmp="$1" section
-  section="$(awk '/^## Kubernetes controller/{f=1; next} /^## /{f=0} f' "$ROOT/README.md")"
+  section="$(doc_section "Kubernetes controller")"
   [[ -n "$section" ]] || { echo "  README has no '## Kubernetes controller' section" >&2; return 1; }
   assert_contains "$section" "apiVersion: delivery.ocm.software/v1alpha1" || return 1
   assert_contains "$section" "kind: Repository" || return 1
@@ -1947,7 +1959,7 @@ test_readme_documents_kubernetes_controller() {
 
 test_readme_documents_kubernetes_deployer() {
   local tmp="$1" section
-  section="$(awk '/^## Kubernetes deployer/{f=1; next} /^## /{f=0} f' "$ROOT/README.md")"
+  section="$(doc_section "Kubernetes deployer")"
   [[ -n "$section" ]] || { echo "  README has no '## Kubernetes deployer' section" >&2; return 1; }
   assert_contains "$section" "apiVersion: delivery.ocm.software/v1alpha1" || return 1
   assert_contains "$section" "kind: Resource" || return 1
@@ -1986,7 +1998,7 @@ test_builtin_plugins_serve_component_types() {
 
 test_readme_documents_plugin_system() {
   local tmp="$1" section t
-  section="$(awk '/^## Plugin system/{f=1; next} /^## /{f=0} f' "$ROOT/README.md")"
+  section="$(doc_section "Plugin system")"
   [[ -n "$section" ]] || { echo "  README has no '## Plugin system' section" >&2; return 1; }
   assert_contains "$section" "https://ocm.software/docs/concepts/plugin-system/" || return 1
   assert_contains "$section" "bindings/go/plugin" || return 1
@@ -2087,7 +2099,7 @@ TABLE
 
 test_readme_documents_signing_and_verification() {
   local tmp="$1" section t algo norm hash
-  section="$(awk '/^## Signing and verification/{f=1; next} /^## /{f=0} f' "$ROOT/README.md")"
+  section="$(doc_section "Signing and verification")"
   [[ -n "$section" ]] || { echo "  README has no '## Signing and verification' section" >&2; return 1; }
   assert_contains "$section" "https://ocm.software/docs/concepts/signing-and-verification/" || return 1
   assert_contains "$section" "jsonNormalisation/v4alpha1" || return 1
@@ -2284,7 +2296,7 @@ test_manifests_selects_target_arch_variant() {
 
 test_readme_documents_component_identity() {
   local tmp="$1" section tree_section consuming_section n v identity
-  section="$(awk '/^## Component identity/{f=1; next} /^## /{f=0} f' "$ROOT/README.md")"
+  section="$(doc_section "Component identity")"
   [[ -n "$section" ]] || { echo "  README has no '## Component identity' section" >&2; return 1; }
 
   assert_contains "$section" "https://ocm.software/docs/concepts/component-identity/" || return 1
@@ -2297,8 +2309,8 @@ test_readme_documents_component_identity() {
   assert_contains "$section" "duplicate resource identities" || return 1
   assert_contains "$section" "expected exactly one resource candidate" || return 1
   assert_contains "$section" "consumer identity" || return 1
-  assert_contains "$section" "(#credential-system)" || return 1
-  assert_contains "$section" "(#signing-and-verification)" || return 1
+  assert_contains "$section" "#credential-system)" || return 1
+  assert_contains "$section" "#signing-and-verification)" || return 1
   assert_not_contains "$section" "major and minor" || return 1
   assert_not_contains "$section" "None uses \`extraIdentity\`" || return 1
   assert_not_contains "$section" "would select" || return 1
@@ -2320,11 +2332,11 @@ test_readme_documents_component_identity() {
   done < <("$OCM" get cv "$(cv_ref)" -o json \
     | jq -r '.[0].component.sources[].name')
 
-  tree_section="$(awk '/^## Component tree/{f=1; next} /^## /{f=0} f' "$ROOT/README.md")"
-  assert_contains "$tree_section" "(#component-identity)" || return 1
+  tree_section="$(doc_section "Component tree")"
+  assert_contains "$tree_section" "#component-identity)" || return 1
 
-  consuming_section="$(awk '/^## Consuming the component/{f=1; next} /^## /{f=0} f' "$ROOT/README.md")"
-  assert_contains "$consuming_section" "(#component-identity)" || return 1
+  consuming_section="$(doc_section "Consuming the component")"
+  assert_contains "$consuming_section" "#component-identity)" || return 1
 }
 
 test_discovery_selects_image_variants() {
@@ -2370,7 +2382,7 @@ test_discovery_selects_image_variants() {
 
 test_readme_documents_kubernetes_component_discovery() {
   local section
-  section="$(awk '/^## Kubernetes component discovery/{f=1;next} /^## /{f=0} f' "$ROOT/README.md")"
+  section="$(doc_section "Kubernetes component discovery")"
   [[ -n "$section" ]] || { echo "  README missing '## Kubernetes component discovery' section" >&2; return 1; }
 
   assert_contains "$section" "https://ocm.software/docs/concepts/kubernetes-component-discovery/" || return 1
@@ -2479,7 +2491,7 @@ test_ownership_trace_reports_owner() {
 
 test_readme_documents_ownership() {
   local section readme_yaml disk_yaml
-  section="$(awk '/^## Ownership/{f=1;next} /^## /{f=0} f' "$ROOT/README.md")"
+  section="$(doc_section "Ownership")"
   [[ -n "$section" ]] || { echo "  README missing '## Ownership' section" >&2; return 1; }
 
   assert_contains "$section" "https://ocm.software/docs/concepts/ownership/" || return 1
@@ -2496,8 +2508,8 @@ test_readme_documents_ownership() {
   assert_contains "$section" "oras discover" || return 1
   assert_contains "$section" "make ownership" || return 1
   assert_contains "$section" "401" || return 1
-  assert_contains "$section" "(#transfer-and-transport)" || return 1
-  assert_contains "$section" "(#signing-and-verification)" || return 1
+  assert_contains "$section" "#transfer-and-transport)" || return 1
+  assert_contains "$section" "#signing-and-verification)" || return 1
 
   assert_not_contains "$section" "ComponentVersion" || return 1
 
@@ -2658,7 +2670,7 @@ test_sbom_link_is_signed() {
 
 test_readme_documents_sboms() {
   local section
-  section="$(awk '/^## Software Bills of Materials/{f=1;next} /^## /{f=0} f' "$ROOT/README.md")"
+  section="$(doc_section "Software Bills of Materials")"
   [[ -n "$section" ]] || \
     { echo "  README missing '## Software Bills of Materials' section" >&2; return 1; }
 
@@ -2678,8 +2690,8 @@ test_readme_documents_sboms() {
     "ocm download resource"
     "--sbom"
     "name=hello-world-sbom"
-    "(#signing-and-verification)"
-    "(#transfer-and-transport)"
+    "#signing-and-verification)"
+    "#transfer-and-transport)"
   )
 
   for check in "${checks[@]}"; do
@@ -2817,9 +2829,8 @@ test_make_product_target() {
 }
 
 test_readme_documents_component_references() {
-  local readme="$ROOT/README.md"
   local section
-  section="$(awk '/^## Component References/{f=1;next} /^## /{f=0} f' "$readme")"
+  section="$(doc_section "Component References")"
   [[ -n "$section" ]] || \
     { echo "  README missing '## Component References' section" >&2; return 1; }
 
@@ -2833,10 +2844,10 @@ test_readme_documents_component_references() {
     "digest mismatch"
     "copy-or-fail"
     "ocm verify cv"
-    "(#resolvers)"
-    "(#canonical-component-repositories)"
-    "(#signing-and-verification)"
-    "(#transfer-and-transport)"
+    "#resolvers)"
+    "#canonical-component-repositories)"
+    "#signing-and-verification)"
+    "#transfer-and-transport)"
   )
   for check in "${checks[@]}"; do
     assert_contains "$section" "$check" "README section contains: $check" || return 1
@@ -2851,9 +2862,9 @@ test_readme_documents_component_references() {
 
   # Resolvers section must no longer say "no componentReferences" and must link to this section
   local resolvers_section
-  resolvers_section="$(awk '/^## Resolvers/{f=1;next} /^## /{f=0} f' "$readme")"
+  resolvers_section="$(doc_section "Resolvers")"
   assert_not_contains "$resolvers_section" "This repository has no \`componentReferences\`" || return 1
-  assert_contains "$resolvers_section" "(#component-references)" || return 1
+  assert_contains "$resolvers_section" "#component-references)" || return 1
 }
 
 test_versions_lists_newest_first() {
@@ -3058,9 +3069,8 @@ test_make_versions_target() {
 }
 
 test_readme_documents_version_selection() {
-  local readme="$ROOT/README.md"
   local section
-  section="$(awk '/^## Version selection/{f=1;next} /^## /{f=0} f' "$readme")"
+  section="$(doc_section "Version selection")"
   [[ -n "$section" ]] || \
     { echo "  README missing '## Version selection' section" >&2; return 1; }
 
@@ -3079,10 +3089,10 @@ test_readme_documents_version_selection() {
     "invalid semantic version"
     "semverFilter"
     "versionConstraint"
-    "(#resolvers)"
-    "(#kubernetes-controller)"
-    "(#component-references)"
-    "(#component-identity)"
+    "#resolvers)"
+    "#kubernetes-controller)"
+    "#component-references)"
+    "#component-identity)"
   )
   for check in "${checks[@]}"; do
     assert_contains "$section" "$check" "README section contains: $check" || return 1
@@ -3113,8 +3123,8 @@ test_readme_documents_version_selection() {
 
   # Component identity section must link to version-selection.
   local id_section
-  id_section="$(awk '/^## Component identity/{f=1;next} /^## /{f=0} f' "$readme")"
-  assert_contains "$id_section" "(#version-selection)" \
+  id_section="$(doc_section "Component identity")"
+  assert_contains "$id_section" "#version-selection)" \
     "Component identity section links to version-selection" || return 1
 }
 
@@ -3419,9 +3429,8 @@ test_make_helm_target() {
 }
 
 test_readme_documents_helm_charts() {
-  local readme="$ROOT/README.md"
   local section
-  section="$(awk '/^## Helm charts/{f=1;next} /^## /{f=0} f' "$readme")"
+  section="$(doc_section "Helm charts")"
   [[ -n "$section" ]] || \
     { echo "  README missing '## Helm charts' section" >&2; return 1; }
 
@@ -3439,11 +3448,11 @@ test_readme_documents_helm_charts() {
     "make helm"
     "build/helm-ctf"
     "values.ocm.yaml"
-    "(#plugin-system)"
-    "(#signing-and-verification)"
-    "(#transfer-and-transport)"
-    "(#version-selection)"
-    "(#kubernetes-deployer)"
+    "#plugin-system)"
+    "#signing-and-verification)"
+    "#transfer-and-transport)"
+    "#version-selection)"
+    "#kubernetes-deployer)"
   )
   for check in "${checks[@]}"; do
     assert_contains "$section" "$check" "README section contains: $check" || return 1
@@ -3461,8 +3470,8 @@ test_readme_documents_helm_charts() {
       return 1; }
 
   local res_section
-  res_section="$(awk '/^## Resource repositories/{f=1;next} /^## /{f=0} f' "$readme")"
-  assert_contains "$res_section" "(#helm-charts)" "Resource repositories links to helm charts"
+  res_section="$(doc_section "Resource repositories")"
+  assert_contains "$res_section" "#helm-charts)" "Resource repositories links to helm charts"
 }
 
 _wget_env() {
@@ -3788,9 +3797,8 @@ test_make_wget_target() {
 }
 
 test_readme_documents_http_resources() {
-  local readme="$ROOT/README.md"
   local section
-  section="$(awk '/^## HTTP resources/{f=1;next} /^## /{f=0} f' "$readme")"
+  section="$(doc_section "HTTP resources")"
   [[ -n "$section" ]] || \
     { echo "  README missing '## HTTP resources' section" >&2; return 1; }
 
@@ -3809,10 +3817,10 @@ test_readme_documents_http_resources() {
     "#3889"
     "make wget"
     "build/wget-ctf"
-    "(#resource-repositories)"
-    "(#signing-and-verification)"
-    "(#credential-system)"
-    "(#transfer-and-transport)"
+    "#resource-repositories)"
+    "#signing-and-verification)"
+    "#credential-system)"
+    "#transfer-and-transport)"
   )
   for check in "${checks[@]}"; do
     assert_contains "$section" "$check" "README section contains: $check" || return 1
@@ -3830,8 +3838,8 @@ test_readme_documents_http_resources() {
       return 1; }
 
   local res_section
-  res_section="$(awk '/^## Resource repositories/{f=1;next} /^## /{f=0} f' "$readme")"
-  assert_contains "$res_section" "(#http-resources)" "Resource repositories links to http resources"
+  res_section="$(doc_section "Resource repositories")"
+  assert_contains "$res_section" "#http-resources)" "Resource repositories links to http resources"
 }
 
 _pki_env() {
@@ -4034,8 +4042,8 @@ test_make_pki_target() {
 }
 
 test_readme_documents_certificate_chain_signing() {
-  local tmp="$1" readme="$ROOT/README.md" section check name
-  section="$(awk '/^## Certificate-chain signing/{f=1;next} /^## /{f=0} f' "$readme")"
+  local tmp="$1" section check name
+  section="$(doc_section "Certificate-chain signing")"
   [[ -n "$section" ]] || { echo "  README missing '## Certificate-chain signing' section" >&2; return 1; }
 
   local checks=(
@@ -4056,8 +4064,8 @@ test_readme_documents_certificate_chain_signing() {
     "ocm verify cv"
     "make pki"
     "build/pki-ctf"
-    "(#signing-and-verification)"
-    "(#transfer-and-transport)"
+    "#signing-and-verification)"
+    "#transfer-and-transport)"
   )
   for check in "${checks[@]}"; do
     assert_contains "$section" "$check" "README section contains: $check" || return 1
@@ -4080,8 +4088,8 @@ test_readme_documents_certificate_chain_signing() {
   done < <(bash "$ROOT/scripts/pki.sh" scenarios 2>/dev/null)
 
   local sv
-  sv="$(awk '/^## Signing and verification/{f=1;next} /^## /{f=0} f' "$readme")"
-  assert_contains "$sv" "(#certificate-chain-signing)" "Signing and verification links to certificate-chain signing"
+  sv="$(doc_section "Signing and verification")"
+  assert_contains "$sv" "#certificate-chain-signing)" "Signing and verification links to certificate-chain signing"
 }
 
 _git_env() {
@@ -4447,8 +4455,8 @@ test_make_git_target() {
 }
 
 test_readme_documents_git_repositories() {
-  local tmp="$1" readme="$ROOT/README.md" section check name
-  section="$(awk '/^## Git repositories/{f=1;next} /^## /{f=0} f' "$readme")"
+  local tmp="$1" section check name
+  section="$(doc_section "Git repositories")"
   [[ -n "$section" ]] || { echo "  README missing '## Git repositories' section" >&2; return 1; }
 
   local checks=(
@@ -4472,10 +4480,10 @@ test_readme_documents_git_repositories() {
     "GIT_DEMO_REF"
     "make git"
     "build/git-ctf"
-    "(#source-provenance)"
-    "(#signing-and-verification)"
-    "(#transfer-and-transport)"
-    "(#credential-system)"
+    "#source-provenance)"
+    "#signing-and-verification)"
+    "#transfer-and-transport)"
+    "#credential-system)"
   )
   for check in "${checks[@]}"; do
     assert_contains "$section" "$check" "README section contains: $check" || return 1
@@ -4771,8 +4779,8 @@ test_make_gpg_target() {
 }
 
 test_readme_documents_gpg_signing() {
-  local tmp="$1" readme="$ROOT/README.md" section check name
-  section="$(awk '/^## GPG signing/{f=1;next} /^## /{f=0} f' "$readme")"
+  local tmp="$1" section check name
+  section="$(doc_section "GPG signing")"
   [[ -n "$section" ]] || { echo "  README missing '## GPG signing' section" >&2; return 1; }
 
   # The README spells the path literally as prose, so the tilde must not expand here.
@@ -4799,10 +4807,10 @@ test_readme_documents_gpg_signing() {
     "passphrase"
     "#3858"
     "#3691"
-    "(#transfer-and-transport)"
-    "(#signing-and-verification)"
-    "(#credential-system)"
-    "(#certificate-chain-signing)"
+    "#transfer-and-transport)"
+    "#signing-and-verification)"
+    "#credential-system)"
+    "#certificate-chain-signing)"
   )
   for check in "${checks[@]}"; do
     assert_contains "$section" "$check" "README section contains: $check" || return 1
@@ -4825,8 +4833,8 @@ test_readme_documents_gpg_signing() {
   done < <(bash "$ROOT/scripts/gpg.sh" scenarios 2>/dev/null)
 
   local sv
-  sv="$(awk '/^## Signing and verification/{f=1;next} /^## /{f=0} f' "$readme")"
-  assert_contains "$sv" "(#gpg-signing)" "Trust models link to GPG signing"
+  sv="$(doc_section "Signing and verification")"
+  assert_contains "$sv" "#gpg-signing)" "Trust models link to GPG signing"
 }
 
 _oci_env() {
@@ -4984,9 +4992,9 @@ test_localization_relocate_rewrites_access_keeps_digest() {
 }
 
 test_localization_readme_documents_three_levels() {
-  local readme="$ROOT/README.md" check
+  local check
   for check in "Build time" "Transfer time" "Deploy time" "does NOT substitute"; do
-    assert_contains "$(cat "$readme")" "$check" "README documents: $check" || return 1
+    assert_contains "$(cat "${DOC_FILES[@]}")" "$check" "README documents: $check" || return 1
   done
 }
 
@@ -5003,9 +5011,8 @@ test_make_oci_target() {
 }
 
 test_readme_documents_oci_images() {
-  local readme="$ROOT/README.md"
   local section
-  section="$(awk '/^## OCI images/{f=1;next} /^## /{f=0} f' "$readme")"
+  section="$(doc_section "OCI images")"
   [[ -n "$section" ]] || \
     { echo "  README missing '## OCI images' section" >&2; return 1; }
 
@@ -5015,7 +5022,7 @@ test_readme_documents_oci_images() {
     "hello-image-multiarch"
     "relocate.ocmconfig"
     "layout.py"
-    "(#transfer-and-transport)"
+    "#transfer-and-transport)"
     "make oci"
   )
   for check in "${checks[@]}"; do
@@ -5032,8 +5039,8 @@ test_readme_documents_oci_images() {
   }
 
   local res_section
-  res_section="$(awk '/^## Resource repositories/{f=1;next} /^## /{f=0} f' "$readme")"
-  assert_contains "$res_section" "(#oci-images)" "Resource repositories links to OCI images"
+  res_section="$(doc_section "Resource repositories")"
+  assert_contains "$res_section" "#oci-images)" "Resource repositories links to OCI images"
 }
 
 # _credentials_env <tmp>
@@ -5175,9 +5182,8 @@ test_make_credentials_target() {
 }
 
 test_readme_documents_credential_system() {
-  local readme="$ROOT/README.md"
   local section
-  section="$(awk '/^## Credential system/{f=1;next} /^## /{f=0} f' "$readme")"
+  section="$(doc_section "Credential system")"
   [[ -n "$section" ]] || \
     { echo "  README missing '## Credential system' section" >&2; return 1; }
 
@@ -5361,8 +5367,8 @@ test_make_plugin_target() {
 }
 
 test_readme_documents_plugin_demo() {
-  local readme="$ROOT/README.md" section block expected check
-  section="$(awk '/^## Plugin system/{f=1;next} /^## /{f=0} f' "$readme")"
+  local section block expected check
+  section="$(doc_section "Plugin system")"
   [[ -n "$section" ]] || { echo "  README missing '## Plugin system' section" >&2; return 1; }
 
   local checks=(
@@ -5656,11 +5662,11 @@ test_make_registry_target() {
 }
 
 test_readme_documents_local_oci_registry() {
-  local readme="$ROOT/README.md" section check readme_yaml constructor_yaml
+  local section check readme_yaml constructor_yaml
 
-  grep -qxF '## Local OCI registry' "$readme" || \
+  doc_heading_exists "Local OCI registry" || \
     { echo "  README missing '## Local OCI registry' heading" >&2; return 1; }
-  section="$(awk '/^## Local OCI registry/{f=1;next} /^## /{f=0} f' "$readme")"
+  section="$(doc_section "Local OCI registry")"
 
   local checks=(
     "oci::http://127.0.0.1:5055/ocm"
@@ -5674,7 +5680,7 @@ test_readme_documents_local_oci_registry() {
     "make registry"
     "scripts/registry.sh stop"
     "already exists"
-    "(#credential-system)"
+    "#credential-system)"
   )
   for check in "${checks[@]}"; do
     assert_contains "$section" "$check" "README section contains: $check" || return 1
@@ -5816,11 +5822,11 @@ test_make_graph_target() {
 }
 
 test_readme_documents_component_graphs() {
-  local readme="$ROOT/README.md" section check readme_yaml constructor_yaml
+  local section check readme_yaml constructor_yaml
 
-  grep -qxF '## Component graphs' "$readme" || \
+  doc_heading_exists "Component graphs" || \
     { echo "  README missing '## Component graphs' heading" >&2; return 1; }
-  section="$(awk '/^## Component graphs/{f=1;next} /^## /{f=0} f' "$readme")"
+  section="$(doc_section "Component graphs")"
 
   local checks=(
     "diamond"
@@ -5829,10 +5835,10 @@ test_readme_documents_component_graphs() {
     "make graph"
     "| flat |"
     "| recursive |"
-    "(#component-references)"
-    "(#resolvers)"
-    "(#transfer-and-transport)"
-    "(#signing-and-verification)"
+    "#component-references)"
+    "#resolvers)"
+    "#transfer-and-transport)"
+    "#signing-and-verification)"
   )
   for check in "${checks[@]}"; do
     assert_contains "$section" "$check" "README section contains: $check" || return 1
@@ -5986,17 +5992,17 @@ test_make_github_target() {
 }
 
 test_readme_documents_github_access() {
-  local readme="$ROOT/README.md" section check readme_yaml constructor_yaml
+  local section check readme_yaml constructor_yaml
 
-  grep -qxF '## GitHub access' "$readme" || \
+  doc_heading_exists "GitHub access" || \
     { echo "  README missing '## GitHub access' heading" >&2; return 1; }
-  section="$(awk '/^## GitHub access/{f=1;next} /^## /{f=0} f' "$readme")"
+  section="$(doc_section "GitHub access")"
 
   local checks=(
     "GitHub/v1"
     "deprecated in favour of"
-    "(#git-repositories)"
-    "(#http-resources)"
+    "#git-repositories)"
+    "#http-resources)"
     "Wget/v1"
     "api/v3"
     "/_codeload/"
@@ -6009,7 +6015,7 @@ test_readme_documents_github_access() {
     "GITHUB_DEMO_ONLINE=1"
     "S3/v1"
     "make github"
-    "(#credential-system)"
+    "#credential-system)"
   )
   for check in "${checks[@]}"; do
     assert_contains "$section" "$check" "README section contains: $check" || return 1
@@ -6100,11 +6106,11 @@ test_make_normalisation_target() {
 }
 
 test_readme_documents_signing_normalisation() {
-  local readme="$ROOT/README.md" section check readme_yaml constructor_yaml
+  local section check readme_yaml constructor_yaml
 
-  grep -qxF '## Signing normalisation' "$readme" || \
+  doc_heading_exists "Signing normalisation" || \
     { echo "  README missing '## Signing normalisation' heading" >&2; return 1; }
-  section="$(awk '/^## Signing normalisation/{f=1;next} /^## /{f=0} f' "$readme")"
+  section="$(doc_section "Signing normalisation")"
 
   local checks=(
     "jsonNormalisation/v4alpha1"
@@ -6117,7 +6123,7 @@ test_readme_documents_signing_normalisation() {
     "| \`unsigned-label\` |"
     "| \`signed-label\` |"
     "| \`blob\` |"
-    "(#signing-and-verification)"
+    "#signing-and-verification)"
   )
   for check in "${checks[@]}"; do
     assert_contains "$section" "$check" "README section contains: $check" || return 1
@@ -6329,12 +6335,12 @@ test_make_s3_target() {
 }
 
 test_readme_documents_s3_resources() {
-  local readme="$ROOT/README.md" section readme_yaml constructor_yaml
-  grep -qxF '## S3 resources' "$readme" || {
+  local section readme_yaml constructor_yaml
+  doc_heading_exists "S3 resources" || {
     echo "  README missing '## S3 resources' heading" >&2
     return 1
   }
-  section="$(awk '/^## S3 resources/{f=1;next} /^## /{f=0} f' "$readme")"
+  section="$(doc_section "S3 resources")"
 
   local checks=(
     "rustfs"
@@ -6351,7 +6357,7 @@ test_readme_documents_s3_resources() {
     "Input vs access"
     "make s3"
     "bash scripts/s3.sh stop"
-    "(#credential-system)"
+    "#credential-system)"
   )
   local check
   for check in "${checks[@]}"; do
@@ -6514,17 +6520,17 @@ test_make_none_access_target() {
 }
 
 test_readme_documents_none_access() {
-  local readme="$ROOT/README.md" section readme_yaml constructor_yaml
-  grep -qxF '## Resources without access (None)' "$readme" || {
+  local section readme_yaml constructor_yaml
+  doc_heading_exists "Resources without access (None)" || {
     echo "  README missing '## Resources without access (None)' heading" >&2
     return 1
   }
-  section="$(awk '/^## Resources without access/{f=1;next} /^## /{f=0} f' "$readme")"
+  section="$(doc_section "Resources without access")"
 
   local checks=(
     "None/v1"
     "not signed"
-    "(#signing-normalisation)"
+    "#signing-normalisation)"
     "jsonNormalisation/v4alpha1"
     "not allowed"
     "missing digest"
@@ -6545,6 +6551,45 @@ test_readme_documents_none_access() {
     echo "  README yaml block differs from components/none-access/component-constructor.yaml" >&2
     return 1
   }
+}
+
+test_readme_is_docs_index() {
+  local line_count doc name heading
+  [[ -d "$ROOT/docs" ]] || { echo "  docs/ directory is missing" >&2; return 1; }
+  line_count="$(wc -l < "$ROOT/README.md" | tr -d ' ')"
+  [[ "$line_count" -le 120 ]] || { echo "  README.md has $line_count lines, expected at most 120" >&2; return 1; }
+  for doc in "$ROOT"/docs/*.md; do
+    name="$(basename "$doc")"
+    grep -qF "](docs/$name" "$ROOT/README.md" || { echo "  README.md does not link docs/$name" >&2; return 1; }
+  done
+  # The index keeps only its own "## " headings; every other section must live in docs/.
+  while IFS= read -r heading; do
+    case "$heading" in
+      "## Quick start"|"## Documentation") ;;
+      *) echo "  README.md still contains '$heading' (it belongs in docs/)" >&2; return 1 ;;
+    esac
+  done < <(grep -E '^## ' "$ROOT/README.md")
+}
+
+test_docs_links_resolve() {
+  local file target path anchor dest failed=0
+  while IFS=$'\t' read -r file target; do
+    case "$target" in
+      http://*|https://*|mailto:*) continue ;;
+    esac
+    path="${target%%#*}"
+    anchor=""
+    if [[ "$target" == *"#"* ]]; then anchor="${target#*#}"; fi
+    if [[ -z "$path" ]]; then dest="$file"; else dest="$(dirname "$file")/$path"; fi
+    if [[ ! -e "$dest" ]]; then
+      echo "  ${file#"$ROOT"/} links to missing file: $target" >&2
+      failed=1
+    elif [[ -n "$anchor" ]] && ! grep -qxF -- "$anchor" <<< "$(_heading_slugs "$dest")"; then
+      echo "  ${file#"$ROOT"/} links to missing anchor: $target" >&2
+      failed=1
+    fi
+  done < <(awk '/^(```|~~~)/{ if(!c){c=1; m=substr($0,1,3)} else if(substr($0,1,3)==m){c=0}; next } !c { line=$0; while (match(line, /!?\[[^]]*\]\([^)]*\)/)) { tok=substr(line, RSTART, RLENGTH); if (substr(tok,1,1) != "!") { i=index(tok,"]("); print FILENAME "\t" substr(tok, i+2, length(tok)-i-2) }; line=substr(line, RSTART+RLENGTH) } }' "${DOC_FILES[@]}")
+  return "$failed"
 }
 
 # ── Run all tests ─────────────────────────────────────────────────────────────
@@ -6867,6 +6912,8 @@ run_test "none-access transfer keeps none" test_none_access_transfer_keeps_none
 run_test "none-access copy resources keeps none" test_none_access_copy_resources_keeps_none
 run_test "make none-access target" test_make_none_access_target
 run_test "readme documents none access" test_readme_documents_none_access
+run_test "readme is a docs index" test_readme_is_docs_index
+run_test "docs links resolve" test_docs_links_resolve
 
 echo ""
 echo "Results: $PASS passed, $FAIL failed, $SKIP skipped"
