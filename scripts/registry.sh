@@ -31,7 +31,7 @@ _require_docker() {
 }
 
 _ctf_ref() {
-  echo "ctf::${1:-$REGISTRY_DEMO_CTF}//${REGISTRY_COMPONENT}:${VERSION}"
+  echo "ctf::${REGISTRY_DEMO_CTF}//${REGISTRY_COMPONENT}:${VERSION}"
 }
 
 _registry_ref() {
