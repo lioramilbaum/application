@@ -1,0 +1,11 @@
+name: github.com/lioramilbaum/graph/runtime
+version: ${VERSION}
+provider:
+  name: github.com/lioramilbaum
+resources:
+  - name: runtime-notes
+    type: plainText
+    version: ${VERSION}
+    input:
+      type: UTF8/v1
+      text: "${GRAPH_RUNTIME_TEXT}"

@@ -1,0 +1,17 @@
+name: github.com/lioramilbaum/normalisation-demo
+version: ${VERSION}
+provider:
+  name: github.com/lioramilbaum
+labels:
+  - name: normalisation.lioramilbaum.github.com/note
+    value: "${NORM_NOTE}"
+  - name: normalisation.lioramilbaum.github.com/channel
+    value: "${NORM_CHANNEL}"
+    signing: true
+resources:
+  - name: payload
+    type: plainText
+    version: ${VERSION}
+    input:
+      type: UTF8/v1
+      text: "${NORM_PAYLOAD}"

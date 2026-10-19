@@ -1,0 +1,52 @@
+name: github.com/lioramilbaum/s3-demo
+version: ${VERSION}
+provider:
+  name: github.com/lioramilbaum
+resources:
+  - name: notes-v1
+    type: plainText
+    version: ${VERSION}
+    relation: external
+    access:
+      type: S3/v1
+      bucket: ocm-demo
+      key: releases/notes.txt
+      region: us-east-1
+      endpoint: "${S3_DEMO_ENDPOINT}"
+      usePathStyle: true
+    mediaType: text/plain
+  - name: notes
+    type: plainText
+    version: ${VERSION}
+    relation: external
+    access:
+      type: S3/v2
+      bucketName: ocm-demo
+      objectKey: releases/notes.txt
+      region: us-east-1
+      endpoint: "${S3_DEMO_ENDPOINT}"
+      usePathStyle: true
+    mediaType: text/plain
+  - name: notes-pinned
+    type: plainText
+    version: ${VERSION}
+    relation: external
+    access:
+      type: S3/v2
+      bucketName: ocm-demo-versioned
+      objectKey: releases/notes.txt
+      region: us-east-1
+      endpoint: "${S3_DEMO_ENDPOINT}"
+      usePathStyle: true
+    mediaType: text/plain
+  - name: notes-input
+    type: plainText
+    version: ${VERSION}
+    input:
+      type: S3/v2
+      bucketName: ocm-demo
+      objectKey: releases/notes.txt
+      region: us-east-1
+      endpoint: "${S3_DEMO_ENDPOINT}"
+      usePathStyle: true
+      mediaType: text/plain

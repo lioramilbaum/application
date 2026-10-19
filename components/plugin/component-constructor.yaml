@@ -1,0 +1,13 @@
+# Demo component for plugin system demo.
+name: github.com/lioramilbaum/plugin-demo
+version: ${VERSION}
+provider:
+  name: github.com/lioramilbaum
+resources:
+  - name: demo-blob
+    type: blob
+    version: ${VERSION}
+    access:
+      type: demo-store/v1alpha1
+      storeId: my-store
+      blobId: blob-001

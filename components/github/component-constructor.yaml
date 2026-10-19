@@ -1,0 +1,13 @@
+name: github.com/lioramilbaum/github-demo
+version: ${VERSION}
+provider:
+  name: github.com/lioramilbaum
+resources:
+  - name: hello-world-repo-archive
+    type: blob
+    version: ${VERSION}
+    relation: external
+    access:
+      type: GitHub/v1
+      repoUrl: "${GITHUB_DEMO_REPO_URL}"
+      ref: refs/heads/main

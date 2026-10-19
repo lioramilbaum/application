@@ -1,0 +1,21 @@
+name: github.com/lioramilbaum/github-demo-online
+version: ${VERSION}
+provider:
+  name: github.com/lioramilbaum
+resources:
+  - name: ocm-examples-archive
+    type: blob
+    version: ${VERSION}
+    relation: external
+    access:
+      type: GitHub/v1
+      repoUrl: "https://github.com/open-component-model/ocm-examples"
+      commit: "4ece2f35150d6be75da1eb9c76288812e95338cc"
+  - name: ocm-helm-chart-release-asset
+    type: blob
+    version: ${VERSION}
+    relation: external
+    access:
+      type: Wget/v1
+      url: "https://github.com/open-component-model/open-component-model/releases/download/v0.19.1/chart-0.19.1.tgz"
+      mediaType: application/gzip
