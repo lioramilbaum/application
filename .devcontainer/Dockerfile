@@ -1,6 +1,6 @@
 FROM mcr.microsoft.com/devcontainers/base:3.0.10-ubuntu24.04
 RUN apt-get update && export DEBIAN_FRONTEND=noninteractive \
-    && apt-get install -y --no-install-recommends make shellcheck jq curl openssl ca-certificates python3 \
+    && apt-get install -y --no-install-recommends make shellcheck jq curl openssl ca-certificates python3 python3-yaml \
     && rm -rf /var/lib/apt/lists/*
 
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]
@@ -33,3 +33,22 @@ RUN set -eux; arch="$(dpkg --print-architecture)"; \
     rm -f /tmp/ocm /tmp/kind; \
     ocm version; \
     kind version
+
+ARG FLUX_VERSION=v2.9.6
+# FLUX_SHA256_* ARGs are updated by hand when Renovate bumps FLUX_VERSION.
+ARG FLUX_SHA256_LINUX_AMD64=b4d22673e9246cbd628881f1a9ef3b090085dced291e42d804555cee8e8d42c5
+ARG FLUX_SHA256_LINUX_ARM64=6663c154755b732f43dc993d72321f71c2fc1ff0bcb94b2696e0a8638fa562b4
+
+RUN set -eux; \
+    arch="$(dpkg --print-architecture)"; \
+    case "$arch" in \
+      amd64) sha="$FLUX_SHA256_LINUX_AMD64" ;; \
+      arm64) sha="$FLUX_SHA256_LINUX_ARM64" ;; \
+      *) echo "unsupported architecture: $arch"; exit 1 ;; \
+    esac; \
+    curl -fsSL "https://github.com/fluxcd/flux2/releases/download/${FLUX_VERSION}/flux_${FLUX_VERSION#v}_linux_${arch}.tar.gz" \
+      -o /tmp/flux.tar.gz; \
+    echo "${sha}  /tmp/flux.tar.gz" | sha256sum -c -; \
+    tar -xzf /tmp/flux.tar.gz -C /usr/local/bin flux; \
+    rm /tmp/flux.tar.gz; \
+    flux version --client

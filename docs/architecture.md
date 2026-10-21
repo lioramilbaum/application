@@ -109,6 +109,8 @@ This component's elements and their identities:
 | resource `hello-world-manifests` | `name=hello-world-manifests,version=0.1.0` | `github.com/lioramilbaum/application:0.1.0:resource/hello-world-manifests` |
 | resource `hello-world-localization` | `name=hello-world-localization,version=0.1.0` | `github.com/lioramilbaum/application:0.1.0:resource/hello-world-localization` |
 | resource `hello-world-config` | `name=hello-world-config,version=0.1.0` | `github.com/lioramilbaum/application:0.1.0:resource/hello-world-config` |
+| resource `hello-world-kustomize` | `name=hello-world-kustomize,version=0.1.0` | `github.com/lioramilbaum/application:0.1.0:resource/hello-world-kustomize` |
+| resource `hello-world-rgd` | `name=hello-world-rgd,version=0.1.0` | `github.com/lioramilbaum/application:0.1.0:resource/hello-world-rgd` |
 | resource `hello-world-sbom` | `name=hello-world-sbom,version=0.1.0` | `github.com/lioramilbaum/application:0.1.0:resource/hello-world-sbom` |
 | resource `deploy-bundle` | `name=deploy-bundle,version=0.1.0` | `github.com/lioramilbaum/application:0.1.0:resource/deploy-bundle` |
 | source `application-source` | `name=application-source,version=0.1.0` | `github.com/lioramilbaum/application:0.1.0:source/application-source` |
@@ -131,7 +133,7 @@ back to a subset match, and requires exactly one candidate:
 |---|---|
 | `name=deploy-bundle` | OK (subset match, one candidate) |
 | `name=deploy-bundle,version=0.1.0` | OK (exact match) |
-| `version=0.1.0` | error: `expected exactly one resource candidate to download, got 7` |
+| `version=0.1.0` | error: `expected exactly one resource candidate to download, got 9` |
 | `name=deploy-bundle,version=9.9.9` | error: `expected exactly one resource candidate to download, got 0` |
 | `name=hello-world-image` | error: `expected exactly one resource candidate to download, got 2` |
 | `name=hello-world-image,architecture=amd64` | OK (subset match, one candidate) |

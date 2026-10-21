@@ -3,7 +3,7 @@ OCM            ?= ocm
 
 export VERSION OCM
 
-.PHONY: help build sign verify resolvers manifests deploy publish transfer-plan ownership sbom product versions helm wget pki git gpg oci credentials plugin registry graph github normalisation s3 none-access lint test e2e cluster-up cluster-down e2e-run clean
+.PHONY: help build sign verify resolvers manifests deploy publish transfer-plan ownership sbom product versions helm wget pki git gpg oci credentials plugin registry controller graph github normalisation s3 none-access lint test e2e cluster-up cluster-down e2e-run clean
 
 help: ## Show this help
 	@grep -E '^[a-zA-Z0-9_-]+:.*?## .*$$' $(MAKEFILE_LIST) | \
@@ -72,6 +72,9 @@ plugin: ## Install the demo-store Python plugin, build the plugin demo (demo-sto
 registry: ## Start a local registry:2 on 127.0.0.1:5055, push (ocm transfer cv), sign, verify, pull and show the registry demo; requires Docker (skips without it); stop with: bash scripts/registry.sh stop
 	@bash scripts/registry.sh
 
+controller: ## Create or reuse the ocm-controller kind cluster, install OCM controllers, kro and Flux, deploy the published component (OCM_CONTROLLER_REPO=ghcr.io/lioramilbaum/ocm) via NamespacedDeployer + kro + Flux and check the pod answers; KEEP_CLUSTER=1 keeps it (requires docker, helm, flux, kind; stop with: bash scripts/controller.sh down)
+	@bash scripts/controller.sh
+
 graph: ## Build a three-level component graph across three CTFs (platform → frontend/backend → runtime), show get cv --recursive, resolver order, flat vs recursive transfer and transitive digest enforcement; offline
 	@bash scripts/graph.sh
 
@@ -111,3 +114,4 @@ e2e-run: ## Run e2e against an existing cluster (CI: cluster is created as a sep
 
 clean: ## Remove build artifacts
 	rm -rf build
+	rm -f components/hello-world/hello-world-kustomize.oci.tar

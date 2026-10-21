@@ -28,6 +28,7 @@ make lint      # lint shell scripts
 - [Repositories](docs/repositories.md): resolvers, resource repositories, and canonical component repositories
 - [Transfer and consumption](docs/transfer.md): transfer and transport, and consuming the component
 - [Kubernetes](docs/kubernetes.md): controller, deployer, and component discovery
+- [Controller stack](docs/controller.md): OCM controllers, kro and Flux; make controller
 - [Plugin system](docs/plugins.md): external plugins and the demo-store plugin
 
 ### Signing

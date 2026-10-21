@@ -7,14 +7,16 @@
 - `make`
 - `shellcheck` (for linting)
 - `jq`
+- `python3` (for `make build`: `components/hello-world/flux-artifact.py` generates the Flux OCI artifact; `make oci`: `components/oci/layout.py` writes the layout tars; `make wget`, `make credentials`, and `make plugin`: the local upstream and recording servers, the demo-store plugin (Python 3.9+ stdlib only), and their readiness/probe checks; `make test`: test helpers)
 - `openssl` (`make pki` uses `openssl ca` to issue demo certificates; tested with OpenSSL 3.0 and 4.0 and LibreSSL 3.3)
-- `python3` and `curl` (for `make wget`, `make credentials`, and `make plugin`: the local upstream and recording servers, the demo-store plugin (Python 3.9+ stdlib only), and their readiness/probe checks)
+- `curl` (for `make wget`, `make credentials`, and `make plugin`: readiness and probe checks)
 - `git` 2.32 or newer (for `make git`: creates the demo repository and reads it back)
 - `gpg` (GnuPG 2.2 or newer, for `make gpg`)
-- `python3` and `tar` (for `make oci`: `components/oci/layout.py` writes the layout tars, and `tar` reads the layers back)
+- `tar` (for `make oci`: reads the layers back)
 - `kubectl` (for deploying and for `make manifests`, which uses `kubectl kustomize`)
-- `helm` is optional, only for rendering the downloaded chart with `helm template`
+- `helm` is optional for `make helm` (only for rendering the downloaded chart with `helm template`) but required for `make controller`
 - `docker` (for `make e2e` or `make e2e-run` only, and for `make registry`)
+- `flux` CLI v2.9.6 (required for `make controller` only; the devcontainer installs it)
 - Docker Hub access for `make build` and `make test` (to resolve `nginx:1.31-alpine`)
 
 OCM CLI and kind are provided by the devcontainer image. Outside the devcontainer, put `ocm` and `kind` on your PATH.
@@ -35,6 +37,7 @@ make cluster-up      # create or reuse the kind cluster; writes build/e2e/kubeco
 make e2e-run         # run e2e against an existing cluster
 make cluster-down    # delete the kind cluster
 make e2e             # spin up kind cluster, deploy, verify pod ready, tear down (requires docker)
+make controller      # create or reuse the ocm-controller kind cluster, install OCM controllers, kro and Flux, deploy the published component and check the pod (requires docker, helm, flux; KEEP_CLUSTER=1 keeps it; see docs/controller.md)
 make publish OCM_REPO=ghcr.io/<you>/ocm  # transfer to an OCI registry, copying external resources (e.g. the nginx image) as OCI artifacts; optional OCM_REGISTRY_USERNAME/OCM_REGISTRY_PASSWORD
 make ownership       # build the ownership demo component and trace the owner of each resource
 make sbom            # regenerate the CycloneDX SBOM (build/sbom/hello-world.cdx.json); also run by make build
@@ -77,6 +80,8 @@ make cluster-down    # Delete the cluster
 
 The `e2e.sh` script automatically detects whether the cluster existed before this run and only tears it down if this run created it. This allows reusing pre-existing clusters in CI environments.
 
+`make controller` is separate from `make e2e`. It uses its own kind cluster, `ocm-controller`, and deploys the published component from `ghcr.io/lioramilbaum/ocm` through the OCM controllers, kro and Flux. It needs internet access and a published component with the `hello-world-rgd` and `hello-world-kustomize` resources, and CI does not run it. See [Controller stack](controller.md).
+
 ## Version management
 
 Renovate bumps `OCM_CLI_VERSION` together with both `OCM_SHA256_LINUX_AMD64` and `OCM_SHA256_LINUX_ARM64` in a single PR, using the `github-release-attachments` datasource and `# renovate: ocm-linux-<arch> <version>` marker comments in the Dockerfile.
@@ -102,10 +107,12 @@ Tests include:
 - Local registry mirror for kind nodes: `cluster.sh configures local registry mirror`
 - CI e2e isolation: `e2e workflow isolates deploy`
 - Resource access types: `resource access types`, `readme documents resource access types`
-- Publish copies resources: `publish copies resources as OCI artifacts`
+- Publish copies resources: `publish copies resources as OCI artifacts`, `publish rejects missing repo and config`
 - Transfer plans: `transfer without copy-resources keeps external reference`, `transfer copy-resources inlines image as local blob`, `transfer copy-resources uploads OCI artifact`
 - Canonical component repositories (CTF): `ctf layout is canonical`, `ctf archive is portable and signed`, `readme documents canonical component repositories`
 - Kubernetes controller: `readme documents kubernetes controller`
+- Controller stack script (`make controller`): `controller.sh run deletes cluster it created`, `controller.sh run keeps cluster with KEEP_CLUSTER`, `controller.sh run reuses existing cluster`, `controller.sh down deletes cluster`, `controller.sh rejects unknown subcommand`, `controller.sh apply sets target architecture`, `controller.sh check fails without answer`, `controller.sh install requires tools`
+- Renovate configuration: `renovate updates OCM SHA256 ARGs`, `renovate managers match their targets`, `renovate captures pinned versions`, `renovate regexes reject invalid input`, `renovate extractVersion maps release tags`, `renovate groups Flux updates`
 - Kubernetes deployer: `readme documents kubernetes deployer`
 - Plugin system: `builtin plugins serve component types`, `readme documents plugin system`, demo plugin: `plugin capabilities returns access type`, `plugin healthz responds`, `plugin build registers access type`, `plugin download returns blob`, `plugin identity endpoint`, `plugin missing plugin fails gracefully`, `plugin show lists capabilities`, `plugin scenarios correct response`, `plugin scenarios malformed response`, `plugin loglevel debug shows registration`, `make plugin target`, `readme documents plugin demo`
 - Signing and verification: `signature covers normalized descriptor`, `readme documents signing and verification`

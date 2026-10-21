@@ -3,7 +3,7 @@ set -euo pipefail
 # shellcheck source=scripts/lib.sh
 source "$(dirname "$0")/lib.sh"
 
-require "$OCM" git jq
+require "$OCM" git jq python3
 
 SOURCE_COMMIT="${SOURCE_COMMIT:-$(git -C "$ROOT" rev-parse HEAD 2>/dev/null || true)}"
 [[ "$SOURCE_COMMIT" =~ ^[0-9a-f]{40}$ ]] || \
@@ -12,6 +12,8 @@ export SOURCE_COMMIT
 
 mkdir -p "$BUILD_DIR"
 rm -rf "$CTF"
+# Flux OCI artifact is generated, not committed: sbom.sh hashes it and the constructor packages it.
+python3 -I "$ROOT/components/hello-world/flux-artifact.py" "$ROOT/components/hello-world"
 bash "$ROOT/scripts/sbom.sh" >/dev/null
 
 # OCM_ADD_FLAGS is a user-supplied, space-separated list of extra flags;

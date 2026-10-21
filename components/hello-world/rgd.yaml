@@ -1,0 +1,96 @@
+apiVersion: kro.run/v1alpha1
+kind: ResourceGraphDefinition
+metadata:
+  name: hello-world
+spec:
+  schema:
+    apiVersion: v1alpha1
+    kind: HelloWorld
+    spec:
+      component:
+        type: string
+        default: "application"
+      architecture:
+        type: string
+        default: "amd64"
+      replicas:
+        type: integer
+      html:
+        type: string
+  resources:
+    - id: kustomize
+      template:
+        apiVersion: delivery.ocm.software/v1alpha1
+        kind: Resource
+        metadata:
+          name: ${schema.metadata.name}-kustomize
+        spec:
+          componentRef:
+            name: ${schema.spec.component}
+          resource:
+            byReference:
+              resource:
+                name: hello-world-kustomize
+          additionalStatusFields:
+            registry: resource.access.imageReference.split("/")[0]
+            repository: resource.access.imageReference.split("/")[1:].join("/").split("@")[0]
+            digest: resource.access.imageReference.split("@")[1]
+    - id: image
+      template:
+        apiVersion: delivery.ocm.software/v1alpha1
+        kind: Resource
+        metadata:
+          name: ${schema.metadata.name}-image
+        spec:
+          componentRef:
+            name: ${schema.spec.component}
+          resource:
+            byReference:
+              resource:
+                name: hello-world-image
+                extraIdentity:
+                  architecture: ${schema.spec.architecture}
+          additionalStatusFields:
+            registry: resource.access.imageReference.split("/")[0]
+            repository: resource.access.imageReference.split("/")[1:].join("/").split("@")[0]
+            digest: '"sha256:" + resource.digest.value'
+    - id: ocirepository
+      readyWhen:
+        - ${ocirepository.status.artifact != null}
+      template:
+        apiVersion: source.toolkit.fluxcd.io/v1beta2
+        kind: OCIRepository
+        metadata:
+          name: ${schema.metadata.name}
+        spec:
+          interval: 10m
+          url: oci://${kustomize.status.additional.registry}/${kustomize.status.additional.repository}
+          ref:
+            digest: ${kustomize.status.additional.digest}
+    - id: kustomization
+      template:
+        apiVersion: kustomize.toolkit.fluxcd.io/v1
+        kind: Kustomization
+        metadata:
+          name: ${schema.metadata.name}
+        spec:
+          interval: 10m
+          prune: true
+          wait: true
+          path: ./
+          sourceRef:
+            kind: OCIRepository
+            name: ${schema.metadata.name}
+          patches:
+            - patch: ${json.marshal([{"op":"test","path":"/spec/template/spec/containers/0/image","value":"HELLO_WORLD_IMAGE"},{"op":"replace","path":"/spec/template/spec/containers/0/image","value":image.status.additional.registry+"/"+image.status.additional.repository+"@"+image.status.additional.digest}])}
+              target:
+                kind: Deployment
+                name: hello-world
+            - patch: ${json.marshal([{"op":"test","path":"/spec/replicas","value":"HELLO_WORLD_REPLICAS"},{"op":"replace","path":"/spec/replicas","value":dyn(schema.spec.replicas)}])}
+              target:
+                kind: Deployment
+                name: hello-world
+            - patch: ${json.marshal([{"op":"test","path":"/data/index.html","value":"HELLO_WORLD_HTML"},{"op":"replace","path":"/data/index.html","value":schema.spec.html}])}
+              target:
+                kind: ConfigMap
+                name: hello-world-html

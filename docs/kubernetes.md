@@ -30,7 +30,7 @@ spec:
   interval: 10m
 ```
 
-This repository installs no controller or CRDs; the source is
+The controllers and CRDs are installed by [Controller stack](controller.md), not by this page. The source is
 [`bindings/go/kubernetes/controller`](https://github.com/open-component-model/open-component-model/tree/main/bindings/go/kubernetes/controller).
 [Kubernetes deployer](#kubernetes-deployer) shows how to apply the manifests from the cluster.
 
@@ -62,6 +62,7 @@ The deployer applies the blob as-is and skips `manifests.sh` localization: `HELL
 reaches the cluster unpatched, and the controller has no `Localization` CR to fill it in
 ([how-to](https://ocm.software/docs/how-to/deploy-manifests-with-deployer/),
 [source](https://github.com/open-component-model/open-component-model/tree/main/bindings/go/kubernetes/controller/internal/controller/deployer)).
+The [controller stack](controller.md) avoids that gap differently: the deployer applies a kro `ResourceGraphDefinition`, and a Flux `Kustomization` created from it patches the `HELLO_WORLD_*` placeholders using values from OCM resource status.
 
 ## Kubernetes component discovery
 
