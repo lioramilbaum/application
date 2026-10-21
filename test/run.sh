@@ -1406,7 +1406,7 @@ test_renovate_captures_pinned_versions() {
   _expect_renovate_match "$re_flux_sh" "$(cat "$ROOT/scripts/controller.sh")" "$expected_flux_sh" || return 1
 
   # OCM controller chart version
-  local re_ocm_chart; re_ocm_chart=$(_renovate_manager "controller" "open-component-model/open-component-model") || return 1
+  local re_ocm_chart; re_ocm_chart=$(_renovate_manager "controller" "ghcr.io/open-component-model/kubernetes/controller/chart") || return 1
   local expected_ocm_chart; expected_ocm_chart=$(sed -n 's/^OCM_CONTROLLER_CHART_VERSION="\(.*\)"$/\1/p' "$ROOT/scripts/controller.sh" | head -1)
   [[ -n "$expected_ocm_chart" ]] || { echo "  OCM_CONTROLLER_CHART_VERSION not found in controller.sh" >&2; return 1; }
   _expect_renovate_match "$re_ocm_chart" "$(cat "$ROOT/scripts/controller.sh")" "$expected_ocm_chart" || return 1
@@ -1469,10 +1469,10 @@ test_renovate_regexes_reject_invalid_input() {
   _expect_renovate_match "$re" '"version": "1.37"'        || return 1
 
   # OCM controller chart
-  re=$(_renovate_manager "controller" "open-component-model/open-component-model") || return 1
-  _expect_renovate_match "$re" 'OCM_CONTROLLER_CHART_VERSION="0.15.0"' "0.15.0" || return 1
-  _expect_renovate_match "$re" 'OCM_CONTROLLER_CHART_VERSION="v0.15.0"'         || return 1
-  _expect_renovate_match "$re" 'OCM_CONTROLLER_CHART_VERSION="0.15"'            || return 1
+  re=$(_renovate_manager "controller" "ghcr.io/open-component-model/kubernetes/controller/chart") || return 1
+  _expect_renovate_match "$re" 'OCM_CONTROLLER_CHART_VERSION="0.19.1"' "0.19.1" || return 1
+  _expect_renovate_match "$re" 'OCM_CONTROLLER_CHART_VERSION="v0.19.1"'         || return 1
+  _expect_renovate_match "$re" 'OCM_CONTROLLER_CHART_VERSION="0.19"'            || return 1
 
   # kro
   re=$(_renovate_manager "controller" "kro-run/kro") || return 1
@@ -1491,15 +1491,9 @@ test_renovate_regexes_reject_invalid_input() {
 test_renovate_extract_version_templates() {
   local tmp="$1"
 
-  # OCM chart: kubernetes/controller/v0.15.0 → 0.15.0
-  local ev; ev=$(jq -r '.customManagers[] | select(.depNameTemplate == "open-component-model/open-component-model" and ((.managerFilePatterns // []) | any(test("controller")))) | .extractVersionTemplate' "$ROOT/renovate.json")
-  [[ -n "$ev" && "$ev" != "null" ]] || { echo "  OCM chart manager missing extractVersionTemplate" >&2; return 1; }
-  [[ $(echo "$ev" | wc -l | tr -d ' ') -eq 1 ]] || { echo "  ambiguous extractVersionTemplate: expected 1 match, got multiple" >&2; return 1; }
-  local got; got=$(jq -rn --arg tag "kubernetes/controller/v0.15.0" --arg re "$ev" '$tag | capture($re) | .version')
-  [[ "$got" == "0.15.0" ]] || { echo "  OCM chart extractVersionTemplate: expected 0.15.0, got $got" >&2; return 1; }
-  # A CLI tag must not match (v0.19.1 has no kubernetes/controller/ prefix)
-  local no_match; no_match=$(jq -rn --arg tag "v0.19.1" --arg re "$ev" 'try ($tag | capture($re) | .version) catch ""' 2>/dev/null || echo "")
-  [[ -z "$no_match" ]] || { echo "  OCM chart extractVersionTemplate matched CLI tag v0.19.1: $no_match" >&2; return 1; }
+  # OCM chart: uses docker datasource pointing at the OCI registry (no extractVersionTemplate needed)
+  local ocm_chart_ds; ocm_chart_ds=$(jq -r '.customManagers[] | select(.depNameTemplate == "ghcr.io/open-component-model/kubernetes/controller/chart" and ((.managerFilePatterns // []) | any(test("controller")))) | .datasourceTemplate' "$ROOT/renovate.json")
+  [[ "$ocm_chart_ds" == "docker" ]] || { echo "  OCM chart manager datasourceTemplate: expected docker, got $ocm_chart_ds" >&2; return 1; }
 
   # Helm: v4.3.1 → 4.3.1
   ev=$(jq -r '.customManagers[] | select(.depNameTemplate == "helm/helm") | .extractVersionTemplate' "$ROOT/renovate.json")
@@ -7142,7 +7136,7 @@ test_controller_sh_installs_stack() {
   _stub_controller_tools "$tmp"
   PATH="$tmp:$PATH" HELM="$tmp/helm" FLUX="$tmp/flux" KUBECTL="$tmp/kubectl" \
     bash "$ROOT/scripts/controller.sh" install || return 1
-  grep -q "upgrade --install ocm-k8s-toolkit oci://ghcr.io/open-component-model/kubernetes/controller/chart --version 0.15.0 --namespace ocm-k8s-toolkit-system" "$tmp/helm.log" || return 1
+  grep -q "upgrade --install ocm-k8s-toolkit oci://ghcr.io/open-component-model/kubernetes/controller/chart --version 0.19.1 --namespace ocm-k8s-toolkit-system" "$tmp/helm.log" || return 1
   grep -q "upgrade --install kro oci://registry.k8s.io/kro/charts/kro --version v0.9.4 --namespace kro-system" "$tmp/helm.log" || return 1
   grep -q "install --version v2.9.6" "$tmp/flux.log" || return 1
 }
