@@ -63,7 +63,7 @@
       "matchStrings": ["\"helm\": \"(?<currentValue>[0-9]+\\.[0-9]+\\.[0-9]+)\""],
       "depNameTemplate": "helm/helm",
       "datasourceTemplate": "github-releases",
-      "extractVersion": "^v(?<version>.*)$"
+      "extractVersionTemplate": "^v(?<version>.*)$"
     },
     {
       "customType": "regex",
@@ -88,7 +88,7 @@
       "matchStrings": ["OCM_CONTROLLER_CHART_VERSION=\"(?<currentValue>[0-9]+\\.[0-9]+\\.[0-9]+)\""],
       "depNameTemplate": "open-component-model/open-component-model",
       "datasourceTemplate": "github-releases",
-      "extractVersion": "^kubernetes/controller/v(?<version>.*)$"
+      "extractVersionTemplate": "^kubernetes/controller/v(?<version>.*)$"
     },
     {
       "customType": "regex",
