@@ -101,4 +101,4 @@ The chart is a local blob, so it travels inside the component archive. `ocm tran
 - Before OCM 0.21, a relative `helm/v1` path is resolved against the process working directory, so the constructor uses an absolute path (see [Input or access](#input-or-access)).
 - `scripts/helm.sh` packages, verifies and unpacks the chart. It does not install it into a cluster; use [Kubernetes deployer](kubernetes.md#kubernetes-deployer) for that.
 
-Related: [Plugin system](plugins.md#plugin-system) · [Signing and verification](signing.md#signing-and-verification) · [Transfer and transport](transfer.md#transfer-and-transport) · [Version selection](component-graphs.md#version-selection) · [Kubernetes deployer](kubernetes.md#kubernetes-deployer)
+Related: [Plugin system](plugins.md#plugin-system) · [Signing and verification](signing.md#signing-and-verification) · [Transfer and transport](transfer.md#transfer-and-transport) · [Version selection](versions.md#version-selection) · [Kubernetes deployer](kubernetes.md#kubernetes-deployer)

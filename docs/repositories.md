@@ -4,7 +4,7 @@
 
 A component reference does not carry a repository address. The repository on the command line locates the root component only. Resolvers map component name patterns to repositories, so `get cv --recursive`, `transfer cv --recursive`, and `add cv` can find the components that a component references. An explicit repository in a `componentReferences` entry always wins for that component. See the [OCM resolvers](https://ocm.software/docs/concepts/resolvers/) documentation for the full model.
 
-The application component itself has no `componentReferences`. `scripts/product.sh` uses `build/resolvers.ocmconfig` to resolve the application when building the product component — see [Component References](component-graphs.md#component-references). Resolvers also matter to consumers that reference `github.com/lioramilbaum/application`.
+The application component itself has no `componentReferences`. `scripts/product.sh` uses `build/resolvers.ocmconfig` to resolve the application when building the product component — see [Component References](product.md#component-references). Resolvers also matter to consumers that reference `github.com/lioramilbaum/application`.
 
 A resolver entry takes these fields, under `type: resolvers.config.ocm.software/v1alpha1` nested inside a `generic.config.ocm.software/v1` block:
 
@@ -108,7 +108,7 @@ See [Transfer and transport](transfer.md#transfer-and-transport) for the dry-run
 
 A [canonical repository](https://ocm.software/docs/concepts/canonical-component-repositories/)
 holds every component of a component graph, so `get cv --recursive` and `transfer cv --recursive`
-need no resolvers. This component has no references, so any repository that holds it is canonical. The product component in `build/product-ctf/` is not canonical; `ocm transfer cv --recursive` into a fresh repository makes both components canonical — see [Component References](component-graphs.md#component-references).
+need no resolvers. This component has no references, so any repository that holds it is canonical. The product component in `build/product-ctf/` is not canonical; `ocm transfer cv --recursive` into a fresh repository makes both components canonical — see [Component References](product.md#component-references).
 
 `make build` always writes it to `build/ctf/` in the
 [Common Transport Format](https://ocm.software/docs/concepts/transfer-and-transport/) (CTF),

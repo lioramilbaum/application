@@ -2,7 +2,7 @@
 
 A minimal HelloWorld application built with the [Open Component Model](https://ocm.software) (OCM v2), deployed on a kind cluster.
 
-The repository also contains demos for individual OCM concepts (component graphs, GitHub access, signing normalisation, S3 resources, and resources without access). Each has a `make` target and a documentation page under [`docs/`](docs/).
+The repository also contains demos for individual OCM concepts (component graphs, the product component, version selection, GitHub access, signing normalisation, S3 resources, and resources without access). Each has a `make` target and a documentation page under [`docs/`](docs/).
 
 ## Quick start
 
@@ -40,7 +40,9 @@ make lint      # lint shell scripts
 ### Components and graphs
 
 - [Ownership and SBOMs](docs/ownership-and-sbom.md): ownership records and software bills of materials
-- [Component graphs](docs/component-graphs.md): component references, graphs, and version selection
+- [Component graphs](docs/component-graphs.md): diamond graphs, resolver order, flat and recursive transfer, and transitive digests
+- [Product component](docs/product.md): component references, make product, and the reference trust limitation
+- [Version selection](docs/versions.md): constraints, --latest, pre-releases, and versioning schemes; make versions
 
 ### Resource types
 
