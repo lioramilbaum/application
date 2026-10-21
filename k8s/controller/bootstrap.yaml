@@ -1,0 +1,73 @@
+apiVersion: delivery.ocm.software/v1alpha1
+kind: Repository
+metadata:
+  name: application-repository
+  namespace: default
+spec:
+  repositorySpec:
+    type: OCIRegistry
+    baseUrl: ghcr.io/lioramilbaum/ocm
+  interval: 10m
+---
+apiVersion: delivery.ocm.software/v1alpha1
+kind: Component
+metadata:
+  name: application
+  namespace: default
+spec:
+  component: github.com/lioramilbaum/application
+  repositoryRef:
+    name: application-repository
+  semver: ">=0.1.0"
+  interval: 10m
+---
+apiVersion: delivery.ocm.software/v1alpha1
+kind: Resource
+metadata:
+  name: hello-world-rgd
+  namespace: default
+spec:
+  componentRef:
+    name: application
+  resource:
+    byReference:
+      resource:
+        name: hello-world-rgd
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: hello-world-deployer
+  namespace: default
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: hello-world-deployer
+rules:
+  - apiGroups: ["kro.run"]
+    resources: ["resourcegraphdefinitions"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: hello-world-deployer
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: hello-world-deployer
+subjects:
+  - kind: ServiceAccount
+    name: hello-world-deployer
+    namespace: default
+---
+apiVersion: delivery.ocm.software/v1alpha1
+kind: NamespacedDeployer
+metadata:
+  name: hello-world
+  namespace: default
+spec:
+  resourceRef:
+    name: hello-world-rgd
+  serviceAccountName: hello-world-deployer

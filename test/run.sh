@@ -37,8 +37,11 @@ run_test() {
   tmp=$(mktemp -d)
   # shellcheck disable=SC2064
   trap "rm -rf '$tmp'" EXIT
+  set +e
   # shellcheck disable=SC2030
-  (set -euo pipefail; export BUILD_DIR="$tmp" CTF="$tmp/ctf" DEPLOY_DIR="$tmp/deploy"; "$2" "$tmp") || rc=$?
+  (set -euo pipefail; export BUILD_DIR="$tmp" CTF="$tmp/ctf" DEPLOY_DIR="$tmp/deploy"; "$2" "$tmp")
+  rc=$?
+  set -e
   if [[ $rc -eq 0 ]]; then
     echo "PASS: $name"
     PASS=$((PASS + 1))
@@ -202,6 +205,34 @@ fi
 EOF
   chmod 0755 "$dir/stub-bin/docker"
   echo "$dir/stub-bin"
+}
+
+_stub_controller_tools() {
+  local dir="$1"
+  # helm stub
+  cat > "$dir/helm" <<'EOF'
+#!/usr/bin/env bash
+echo "helm $*" >> "$STUB_LOG_DIR/helm.log"
+EOF
+  chmod +x "$dir/helm"
+  # flux stub
+  cat > "$dir/flux" <<'EOF'
+#!/usr/bin/env bash
+echo "flux $*" >> "$STUB_LOG_DIR/flux.log"
+EOF
+  chmod +x "$dir/flux"
+  # kubectl stub (logs args, handles exec by printing Hello, handles apply -f - by tee-ing stdin)
+  cat > "$dir/kubectl" <<'EOF'
+#!/usr/bin/env bash
+echo "kubectl $*" >> "$STUB_LOG_DIR/kubectl.log"
+if [[ "$*" == *"-f -"* ]]; then
+  tee -a "$STUB_LOG_DIR/kubectl-stdin.log" > /dev/null
+fi
+if [[ "$*" == *"exec"* ]]; then
+  echo "${STUB_EXEC_OUTPUT:-Hello, World!}"
+fi
+EOF
+  chmod +x "$dir/kubectl"
 }
 
 # Records ocm argv and stdin instead of running ocm
@@ -435,7 +466,7 @@ test_build_produces_application_tree() {
   local resource_names
   resource_names=$("$OCM" get cv "$(cv_ref "$ROOT_COMPONENT")" \
     -o json 2>/dev/null | jq -r '.[0].component.resources[].name' | sort | paste -sd, -)
-  assert_eq "$resource_names" "deploy-bundle,hello-world-config,hello-world-image,hello-world-image,hello-world-localization,hello-world-manifests,hello-world-sbom" "resource names"
+  assert_eq "$resource_names" "deploy-bundle,hello-world-config,hello-world-image,hello-world-image,hello-world-kustomize,hello-world-localization,hello-world-manifests,hello-world-rgd,hello-world-sbom" "resource names"
 
   local image_archs
   image_archs=$("$OCM" get cv "$(cv_ref "$ROOT_COMPONENT")" \
@@ -972,7 +1003,7 @@ test_deploy_bundle_metadata() {
 
   # Verify tar contents
   local tar_contents
-  tar_contents="$(tar -tzf "$tar_file" | grep -v '/$' | sort | paste -sd, -)"
+  tar_contents="$(tar -tf "$tar_file" | grep -v '/$' | sort | paste -sd, -)"
   assert_eq "$tar_contents" "component-constructor.yaml,scripts/deploy.sh,scripts/lib.sh,scripts/manifests.sh,scripts/verify.sh" "deploy-bundle contents"
 
   # Verify build-time scripts are NOT in the tar
@@ -1255,6 +1286,289 @@ test_devcontainer_pins_tools() {
   ' "$rv" > /dev/null || die "renovate.json still references fetch- scripts"
 }
 
+# _renovate_manager FILE_SUBSTR DEPNAME [MATCH_SUBSTR]
+# Prints matchStrings[0] of the single customManager matching the given criteria.
+# Dies unless exactly one manager matches.
+_renovate_manager() {
+  local file_sub="$1" depname="$2" match_sub="${3:-}"
+  local managers; managers=$(jq -r --arg fs "$file_sub" --arg dn "$depname" --arg ms "$match_sub" '
+    [.customManagers[] |
+      select(
+        ((.managerFilePatterns // []) | any(test($fs))) and
+        .depNameTemplate == $dn and
+        (if $ms == "" then true else ((.matchStrings // []) | any(test($ms))) end)
+      )
+    ]
+  ' "$ROOT/renovate.json") || die "_renovate_manager: jq failed"
+  local count; count=$(echo "$managers" | jq 'length')
+  [[ "$count" -eq 1 ]] || die "_renovate_manager: expected 1 manager for depName=$depname file=$file_sub, got $count"
+  echo "$managers" | jq -r '.[0].matchStrings[0]'
+}
+
+# _renovate_captures RE TEXT
+# Prints JSON array of all capture objects found in TEXT.
+_renovate_captures() {
+  local re="$1" text="$2"
+  jq -cn --arg re "$re" --arg s "$text" '[$s | capture($re; "g")]'
+}
+
+# _expect_renovate_match RE SAMPLE [EXPECTED_VALUE]
+# With EXPECTED_VALUE: asserts exactly one capture with currentValue == EXPECTED_VALUE.
+# Without EXPECTED_VALUE: asserts zero captures (negative test).
+_expect_renovate_match() {
+  local re="$1" sample="$2" expected="${3:-__NO_MATCH__}"
+  local caps; caps=$(_renovate_captures "$re" "$sample") || { echo "  jq failed on: $sample" >&2; return 1; }
+  local count; count=$(echo "$caps" | jq 'length')
+  if [[ "$expected" == "__NO_MATCH__" ]]; then
+    [[ "$count" -eq 0 ]] || { echo "  expected no match but got $count for: $sample" >&2; return 1; }
+  else
+    [[ "$count" -eq 1 ]] || { echo "  expected 1 match but got $count for: $sample" >&2; return 1; }
+    local got; got=$(echo "$caps" | jq -r '.[0].currentValue')
+    [[ "$got" == "$expected" ]] || { echo "  expected currentValue=$expected but got=$got" >&2; return 1; }
+  fi
+}
+
+test_renovate_managers_match_targets() {
+  local tmp="$1"
+
+  # Build list of repo files (relative paths)
+  local files; files=$(find "$ROOT" \( -name .git -o -name build -o -name .test-golden \) -prune -o -type f -print | sed "s|^$ROOT/||" | sort)
+
+  local manager count=0
+  while IFS= read -r manager; do
+    local file_patterns; file_patterns=$(echo "$manager" | jq -r '.managerFilePatterns[]')
+    [[ -n "$file_patterns" ]] || { echo "  manager $(echo "$manager" | jq -r '.depNameTemplate'): managerFilePatterns is empty or missing" >&2; return 1; }
+    local match_strings; match_strings=$(echo "$manager" | jq -r '.matchStrings[]')
+    local depname; depname=$(echo "$manager" | jq -r '.depNameTemplate')
+    local datasource; datasource=$(echo "$manager" | jq -r '.datasourceTemplate')
+
+    # Structural checks
+    [[ $(echo "$manager" | jq -r '.customType') == "regex" ]] \
+      || { echo "  manager $depname: customType is not regex" >&2; return 1; }
+    [[ -n "$depname" && "$depname" != "null" ]] \
+      || { echo "  manager: depNameTemplate is missing" >&2; return 1; }
+    [[ -n "$datasource" && "$datasource" != "null" ]] \
+      || { echo "  manager $depname: datasourceTemplate is missing" >&2; return 1; }
+    echo "$match_strings" | grep -q '(?<currentValue>' \
+      || { echo "  manager $depname: matchString missing (?<currentValue>" >&2; return 1; }
+
+    # RE2 guard — no lookarounds or backrefs (named groups (?<name> are allowed)
+    if echo "$match_strings" | grep -qE '\(\?(=|!|<[=!])|\\[1-9]'; then
+      echo "  manager $depname: matchString uses lookaround or backref (not RE2-safe)" >&2; return 1
+    fi
+
+    # Each pattern must match at least one repo file
+    while IFS= read -r pat; do
+      # Strip surrounding /…/
+      local re; re=$(echo "$pat" | sed 's|^/||;s|/$||')
+      local matches; matches=$(echo "$files" | grep -E "$re" | head -1) || true
+      [[ -n "$matches" ]] \
+        || { echo "  manager $depname: pattern $pat matches no repo file" >&2; return 1; }
+    done < <(echo "$file_patterns")
+
+    count=$((count + 1))
+  done < <(jq -c '.customManagers[]' "$ROOT/renovate.json")
+
+  echo "  checked $count custom managers" >&2
+}
+
+test_renovate_captures_pinned_versions() {
+  local tmp="$1"
+
+  # OCM CLI version
+  local re_ocm_cli; re_ocm_cli=$(_renovate_manager "Dockerfile" "open-component-model/open-component-model" "OCM_CLI_VERSION") || return 1
+  local expected_ocm; expected_ocm=$(sed -n 's/^ARG OCM_CLI_VERSION=//p' "$ROOT/.devcontainer/Dockerfile" | head -1)
+  [[ -n "$expected_ocm" ]] || { echo "  OCM_CLI_VERSION not found in Dockerfile" >&2; return 1; }
+  _expect_renovate_match "$re_ocm_cli" "$(cat "$ROOT/.devcontainer/Dockerfile")" "$expected_ocm" || return 1
+
+  # KIND version
+  local re_kind; re_kind=$(_renovate_manager "Dockerfile" "kubernetes-sigs/kind") || return 1
+  local expected_kind; expected_kind=$(sed -n 's/^ARG KIND_VERSION=//p' "$ROOT/.devcontainer/Dockerfile" | head -1)
+  [[ -n "$expected_kind" ]] || { echo "  KIND_VERSION not found in Dockerfile" >&2; return 1; }
+  _expect_renovate_match "$re_kind" "$(cat "$ROOT/.devcontainer/Dockerfile")" "$expected_kind" || return 1
+
+  # Flux version in Dockerfile
+  local re_flux_df; re_flux_df=$(_renovate_manager "Dockerfile" "fluxcd/flux2") || return 1
+  local expected_flux_df; expected_flux_df=$(sed -n 's/^ARG FLUX_VERSION=//p' "$ROOT/.devcontainer/Dockerfile" | head -1)
+  [[ -n "$expected_flux_df" ]] || { echo "  FLUX_VERSION not found in Dockerfile" >&2; return 1; }
+  _expect_renovate_match "$re_flux_df" "$(cat "$ROOT/.devcontainer/Dockerfile")" "$expected_flux_df" || return 1
+
+  # Helm version in devcontainer.json (the helm feature pin, not the kubectl feature version)
+  local re_helm; re_helm=$(_renovate_manager "devcontainer" "helm/helm") || return 1
+  local expected_helm; expected_helm=$(jq -r '[.features[] | .helm? // empty] | .[0] // empty' "$ROOT/.devcontainer/devcontainer.json")
+  [[ -n "$expected_helm" ]] || { echo "  helm version not found in devcontainer.json" >&2; return 1; }
+  _expect_renovate_match "$re_helm" "$(cat "$ROOT/.devcontainer/devcontainer.json")" "$expected_helm" || return 1
+
+  # Flux version in controller.sh
+  local re_flux_sh; re_flux_sh=$(_renovate_manager "controller" "fluxcd/flux2") || return 1
+  local expected_flux_sh; expected_flux_sh=$(sed -n 's/^FLUX_VERSION="\(.*\)"$/\1/p' "$ROOT/scripts/controller.sh" | head -1)
+  [[ -n "$expected_flux_sh" ]] || { echo "  FLUX_VERSION not found in controller.sh" >&2; return 1; }
+  _expect_renovate_match "$re_flux_sh" "$(cat "$ROOT/scripts/controller.sh")" "$expected_flux_sh" || return 1
+
+  # OCM controller chart version
+  local re_ocm_chart; re_ocm_chart=$(_renovate_manager "controller" "open-component-model/open-component-model") || return 1
+  local expected_ocm_chart; expected_ocm_chart=$(sed -n 's/^OCM_CONTROLLER_CHART_VERSION="\(.*\)"$/\1/p' "$ROOT/scripts/controller.sh" | head -1)
+  [[ -n "$expected_ocm_chart" ]] || { echo "  OCM_CONTROLLER_CHART_VERSION not found in controller.sh" >&2; return 1; }
+  _expect_renovate_match "$re_ocm_chart" "$(cat "$ROOT/scripts/controller.sh")" "$expected_ocm_chart" || return 1
+
+  # kro chart version
+  local re_kro; re_kro=$(_renovate_manager "controller" "kro-run/kro") || return 1
+  local expected_kro; expected_kro=$(sed -n 's/^KRO_CHART_VERSION="\(.*\)"$/\1/p' "$ROOT/scripts/controller.sh" | head -1)
+  [[ -n "$expected_kro" ]] || { echo "  KRO_CHART_VERSION not found in controller.sh" >&2; return 1; }
+  _expect_renovate_match "$re_kro" "$(cat "$ROOT/scripts/controller.sh")" "$expected_kro" || return 1
+
+  # nginx image — must match both amd64 and arm64 lines
+  local re_nginx; re_nginx=$(_renovate_manager "component-constructor" "library/nginx") || return 1
+  local nginx_lines; nginx_lines=$(grep -oE 'docker\.io/library/nginx:[^@[:space:]]+@sha256:[a-f0-9]{64}' "$ROOT/component-constructor.yaml" || true)
+  [[ -n "$nginx_lines" ]] || { echo "  nginx imageReference not found in component-constructor.yaml" >&2; return 1; }
+  local nginx_count; nginx_count=$(echo "$nginx_lines" | wc -l | tr -d ' ')
+  local caps; caps=$(_renovate_captures "$re_nginx" "$(cat "$ROOT/component-constructor.yaml")") || return 1
+  local cap_count; cap_count=$(echo "$caps" | jq 'length')
+  [[ "$cap_count" -eq "$nginx_count" ]] || { echo "  nginx: expected $nginx_count captures, got $cap_count" >&2; return 1; }
+  # Each capture must have non-empty currentValue and currentDigest
+  echo "$caps" | jq -e '[.[] | select(.currentValue == "" or .currentDigest == "")] | length == 0' > /dev/null \
+    || { echo "  nginx: empty currentValue or currentDigest in captures" >&2; return 1; }
+}
+
+test_renovate_regexes_reject_invalid_input() {
+  local tmp="$1"
+  local h64; h64=$(python3 -c "print('a'*64)")  # 64-char hex stand-in
+
+  # OCM CLI
+  local re; re=$(_renovate_manager "Dockerfile" "open-component-model/open-component-model" "OCM_CLI_VERSION") || return 1
+  _expect_renovate_match "$re" "ARG OCM_CLI_VERSION=v1.2.3" "v1.2.3" || return 1
+  _expect_renovate_match "$re" "ARG OCM_CLI_VERSION=1.2.3"          || return 1
+  _expect_renovate_match "$re" "ARG OCM_CLI_VERSION=latest"         || return 1
+  _expect_renovate_match "$re" "ARG OCM_CLI_VERSION=v1.2"          || return 1
+
+  # KIND
+  re=$(_renovate_manager "Dockerfile" "kubernetes-sigs/kind") || return 1
+  _expect_renovate_match "$re" "ARG KIND_VERSION=v0.1.0" "v0.1.0" || return 1
+  _expect_renovate_match "$re" "ARG KIND_VERSION=0.1.0"           || return 1
+  _expect_renovate_match "$re" "ARG KIND_SHA256_LINUX_AMD64=$h64"  || return 1
+
+  # Flux in Dockerfile
+  re=$(_renovate_manager "Dockerfile" "fluxcd/flux2") || return 1
+  _expect_renovate_match "$re" "ARG FLUX_VERSION=v2.9.6" "v2.9.6" || return 1
+  _expect_renovate_match "$re" 'FLUX_VERSION="v2.9.6"'            || return 1   # controller.sh form
+  _expect_renovate_match "$re" "ARG FLUX_VERSION=2.9.6"          || return 1
+  _expect_renovate_match "$re" "ARG FLUX_SHA256_LINUX_AMD64=$h64" || return 1
+
+  # Flux in controller.sh
+  re=$(_renovate_manager "controller" "fluxcd/flux2") || return 1
+  _expect_renovate_match "$re" 'FLUX_VERSION="v2.9.6"' "v2.9.6"   || return 1
+  _expect_renovate_match "$re" "FLUX_VERSION=v2.9.6"               || return 1  # unquoted
+  _expect_renovate_match "$re" 'FLUX_VERSION="2.9.6"'              || return 1  # no v prefix
+  _expect_renovate_match "$re" "ARG FLUX_VERSION=v2.9.6"           || return 1  # Dockerfile form
+
+  # Helm
+  re=$(_renovate_manager "devcontainer" "helm/helm") || return 1
+  _expect_renovate_match "$re" '"helm": "4.3.1"' "4.3.1"  || return 1
+  _expect_renovate_match "$re" '"helm": "v4.3.1"'         || return 1
+  _expect_renovate_match "$re" '"helm": "latest"'         || return 1
+  _expect_renovate_match "$re" '"version": "1.37"'        || return 1
+
+  # OCM controller chart
+  re=$(_renovate_manager "controller" "open-component-model/open-component-model") || return 1
+  _expect_renovate_match "$re" 'OCM_CONTROLLER_CHART_VERSION="0.15.0"' "0.15.0" || return 1
+  _expect_renovate_match "$re" 'OCM_CONTROLLER_CHART_VERSION="v0.15.0"'         || return 1
+  _expect_renovate_match "$re" 'OCM_CONTROLLER_CHART_VERSION="0.15"'            || return 1
+
+  # kro
+  re=$(_renovate_manager "controller" "kro-run/kro") || return 1
+  _expect_renovate_match "$re" 'KRO_CHART_VERSION="v0.9.4"' "v0.9.4" || return 1
+  _expect_renovate_match "$re" 'KRO_CHART_VERSION="0.9.4"'           || return 1
+
+  # nginx
+  re=$(_renovate_manager "component-constructor" "library/nginx") || return 1
+  _expect_renovate_match "$re" "imageReference: docker.io/library/nginx:1.31-alpine@sha256:${h64}" "1.31-alpine" || return 1
+  _expect_renovate_match "$re" "imageReference: docker.io/library/nginx:1.31-alpine"               || return 1  # no digest
+  _expect_renovate_match "$re" "imageReference: docker.io/library/redis:7@sha256:${h64}"           || return 1  # wrong image
+  local h63; h63=$(python3 -c "print('a'*63)")
+  _expect_renovate_match "$re" "imageReference: docker.io/library/nginx:1.31-alpine@sha256:${h63}" || return 1  # 63-char digest
+}
+
+test_renovate_extract_version_templates() {
+  local tmp="$1"
+
+  # OCM chart: kubernetes/controller/v0.15.0 → 0.15.0
+  local ev; ev=$(jq -r '.customManagers[] | select(.depNameTemplate == "open-component-model/open-component-model" and ((.managerFilePatterns // []) | any(test("controller")))) | .extractVersion' "$ROOT/renovate.json")
+  [[ -n "$ev" && "$ev" != "null" ]] || { echo "  OCM chart manager missing extractVersion" >&2; return 1; }
+  [[ $(echo "$ev" | wc -l | tr -d ' ') -eq 1 ]] || { echo "  ambiguous extractVersion: expected 1 match, got multiple" >&2; return 1; }
+  local got; got=$(jq -rn --arg tag "kubernetes/controller/v0.15.0" --arg re "$ev" '$tag | capture($re) | .version')
+  [[ "$got" == "0.15.0" ]] || { echo "  OCM chart extractVersion: expected 0.15.0, got $got" >&2; return 1; }
+  # A CLI tag must not match (v0.19.1 has no kubernetes/controller/ prefix)
+  local no_match; no_match=$(jq -rn --arg tag "v0.19.1" --arg re "$ev" 'try ($tag | capture($re) | .version) catch ""' 2>/dev/null || echo "")
+  [[ -z "$no_match" ]] || { echo "  OCM chart extractVersion matched CLI tag v0.19.1: $no_match" >&2; return 1; }
+
+  # Helm: v4.3.1 → 4.3.1
+  ev=$(jq -r '.customManagers[] | select(.depNameTemplate == "helm/helm") | .extractVersion' "$ROOT/renovate.json")
+  [[ -n "$ev" && "$ev" != "null" ]] || { echo "  helm manager missing extractVersion" >&2; return 1; }
+  [[ $(echo "$ev" | wc -l | tr -d ' ') -eq 1 ]] || { echo "  ambiguous extractVersion: expected 1 match, got multiple" >&2; return 1; }
+  got=$(jq -rn --arg tag "v4.3.1" --arg re "$ev" '$tag | capture($re) | .version')
+  [[ "$got" == "4.3.1" ]] || { echo "  helm extractVersion: expected 4.3.1, got $got" >&2; return 1; }
+  no_match=$(jq -rn --arg tag "4.3.1" --arg re "$ev" 'try ($tag | capture($re) | .version) catch ""' 2>/dev/null || echo "")
+  [[ -z "$no_match" ]] || { echo "  helm extractVersion matched unversioned tag 4.3.1: $no_match" >&2; return 1; }
+
+  # Every github-releases manager whose currentValue lacks a leading v must have extractVersion
+  local missing; missing=$(jq -r '
+    .customManagers[] |
+    select(
+      .datasourceTemplate == "github-releases" and
+      ((.matchStrings | join("")) | test("\\?<currentValue>[^v]"))
+    ) |
+    select(.extractVersion == null or .extractVersion == "") |
+    .depNameTemplate
+  ' "$ROOT/renovate.json")
+  [[ -z "$missing" ]] || { echo "  github-releases manager missing extractVersion: $missing" >&2; return 1; }
+}
+
+test_renovate_groups_flux_updates() {
+  local tmp="$1"
+
+  # Exactly 2 managers track fluxcd/flux2
+  local flux_managers; flux_managers=$(jq '[.customManagers[] | select(.depNameTemplate == "fluxcd/flux2")]' "$ROOT/renovate.json")
+  local flux_count; flux_count=$(echo "$flux_managers" | jq 'length')
+  [[ "$flux_count" -eq 2 ]] || { echo "  expected 2 flux managers, got $flux_count" >&2; return 1; }
+
+  # One must target Dockerfile, one must target controller.sh
+  echo "$flux_managers" | jq -e '[.[].managerFilePatterns[] | test("Dockerfile")] | any' > /dev/null \
+    || { echo "  no Flux manager targets Dockerfile" >&2; return 1; }
+  echo "$flux_managers" | jq -e '[.[].managerFilePatterns[] | test("controller")] | any' > /dev/null \
+    || { echo "  no Flux manager targets controller.sh" >&2; return 1; }
+
+  # Exactly one packageRule groups fluxcd/flux2
+  local flux_rules; flux_rules=$(jq '[.packageRules[] | select((.matchDepNames // []) | index("fluxcd/flux2"))]' "$ROOT/renovate.json")
+  local rule_count; rule_count=$(echo "$flux_rules" | jq 'length')
+  [[ "$rule_count" -eq 1 ]] || { echo "  expected 1 packageRule for flux, got $rule_count" >&2; return 1; }
+  local gname; gname=$(echo "$flux_rules" | jq -r '.[0].groupName')
+  [[ -n "$gname" && "$gname" != "null" ]] || { echo "  flux packageRule missing groupName" >&2; return 1; }
+
+  # The two Flux captures must agree (Dockerfile == controller.sh)
+  local re_df; re_df=$(_renovate_manager "Dockerfile" "fluxcd/flux2") || return 1
+  local re_sh; re_sh=$(_renovate_manager "controller" "fluxcd/flux2") || return 1
+  local ver_df; ver_df=$(_renovate_captures "$re_df" "$(cat "$ROOT/.devcontainer/Dockerfile")" | jq -r '.[0].currentValue // empty')
+  local ver_sh; ver_sh=$(_renovate_captures "$re_sh" "$(cat "$ROOT/scripts/controller.sh")" | jq -r '.[0].currentValue // empty')
+  [[ -n "$ver_df" ]] || { echo "  Flux version not found in Dockerfile" >&2; return 1; }
+  [[ -n "$ver_sh" ]] || { echo "  Flux version not found in controller.sh" >&2; return 1; }
+  [[ "$ver_df" == "$ver_sh" ]] || { echo "  Flux version drift: Dockerfile=$ver_df controller.sh=$ver_sh" >&2; return 1; }
+}
+
+test_renovate_ocm_cli_rule_scoped() {
+  local tmp="$1"
+
+  # OCM CLI packageRule must be scoped to the Dockerfile so chart bumps in controller.sh are not grouped with it
+  local ocm_rule; ocm_rule=$(jq '[.packageRules[] | select(.matchDepNames | index("open-component-model/open-component-model"))] | .[0]' "$ROOT/renovate.json")
+  [[ "$ocm_rule" != "null" && -n "$ocm_rule" ]] || { echo "  OCM CLI packageRule not found" >&2; return 1; }
+  local mfn; mfn=$(echo "$ocm_rule" | jq -r '.matchFileNames // empty')
+  [[ -n "$mfn" ]] || { echo "  OCM CLI packageRule missing matchFileNames — chart bumps will be grouped with CLI" >&2; return 1; }
+  echo "$ocm_rule" | jq -e '.matchFileNames | any(test("Dockerfile"))' > /dev/null \
+    || { echo "  OCM CLI packageRule matchFileNames does not include Dockerfile" >&2; return 1; }
+  if echo "$ocm_rule" | jq -e '.matchFileNames | any(test("controller\\.sh"))' > /dev/null; then
+    echo "  OCM CLI packageRule matchFileNames should not match controller.sh" >&2; return 1
+  fi
+}
+
 test_renovate_updates_ocm_sha256() {
   local df="$ROOT/.devcontainer/Dockerfile" rv="$ROOT/renovate.json"
   local ocm_version arch sha
@@ -1397,6 +1711,25 @@ test_publish_rejects_partial_registry_credentials() {
 
   assert_contains "$out" "OCM_REGISTRY_PASSWORD" || return 1
   [[ ! -f "$tmp/ocm-args.log" ]] || { echo "  ocm must not run with partial credentials" >&2; return 1; }
+}
+
+test_publish_rejects_missing_repo_and_config() {
+  local tmp="$1" out
+  # Missing OCM_REPO
+  if out="$(_run_publish_stubbed "$tmp" OCM_REPO="" 2>&1)"; then
+    echo "  publish should fail when OCM_REPO is empty" >&2
+    return 1
+  fi
+  assert_contains "$out" "OCM_REPO" || return 1
+  [[ ! -f "$tmp/ocm-args.log" ]] || { echo "  ocm was invoked with empty OCM_REPO" >&2; return 1; }
+
+  # Missing TRANSFER_CONFIG file
+  if out="$(_run_publish_stubbed "$tmp" TRANSFER_CONFIG="$tmp/missing.ocmconfig" 2>&1)"; then
+    echo "  publish should fail when TRANSFER_CONFIG does not exist" >&2
+    return 1
+  fi
+  assert_contains "$out" "TRANSFER_CONFIG" || return 1
+  [[ ! -f "$tmp/ocm-args.log" ]] || { echo "  ocm was invoked with missing TRANSFER_CONFIG" >&2; return 1; }
 }
 
 test_registry_identity_derived_from_ocm_repo() {
@@ -1603,7 +1936,7 @@ test_resource_access_types() {
     [[ "$img" == docker.io/* ]] || { echo "  $a image not referenced on docker.io: $img" >&2; return 1; }
   done
 
-  for name in hello-world-manifests hello-world-localization hello-world-sbom deploy-bundle; do
+  for name in hello-world-manifests hello-world-localization hello-world-rgd hello-world-kustomize hello-world-sbom deploy-bundle; do
     relation=$(echo "$cv_json" | jq -r --arg n "$name" '.[0].component.resources[] | select(.name==$n) | .relation')
     assert_eq "$relation" "local" "$name relation" || return 1
     access=$(echo "$cv_json" | jq -r --arg n "$name" '.[0].component.resources[] | select(.name==$n) | .access.type')
@@ -1869,6 +2202,15 @@ test_ctf_layout_is_canonical() {
 
   manifest="$CTF/blobs/${digest/:/.}"
   [[ -f "$manifest" ]] || { echo "  manifest blob missing: $manifest"; return 1; }
+
+  # With more than one OCI artifact in the CTF (e.g. hello-world-kustomize alongside the
+  # descriptor), the tagged entry is an image index; descend to the descriptor manifest.
+  if [[ "$(jq -r .mediaType "$manifest")" == "application/vnd.oci.image.index.v1+json" ]]; then
+    digest="$(jq -r '.manifests[] | select(.artifactType=="application/vnd.ocm.software.component-descriptor.v2") | .digest' "$manifest")"
+    [[ -n "$digest" ]] || { echo "  no descriptor manifest in index"; return 1; }
+    manifest="$CTF/blobs/${digest/:/.}"
+    [[ -f "$manifest" ]] || { echo "  descriptor manifest blob missing: $manifest"; return 1; }
+  fi
   assert_eq "$(jq -r .artifactType "$manifest")" \
     "application/vnd.ocm.software.component-descriptor.v2" "manifest artifactType" || return 1
 
@@ -2158,7 +2500,7 @@ test_component_identity_selects_artifacts() {
   out="$("$OCM" download resource "$(cv_ref)" --identity "version=$VERSION" \
     --output "$tmp/bad.yaml" 2>&1)" \
     && { echo "  version-only identity should fail" >&2; return 1; }
-  assert_contains "$out" "got 7" || return 1
+  assert_contains "$out" "got 9" || return 1
 
   out="$("$OCM" download resource "$(cv_ref)" \
     --identity "name=hello-world-manifests,version=9.9.9" \
@@ -2594,6 +2936,8 @@ test_sbom_describes_component_resources() {
 hello-world-manifests	components/hello-world/manifests.yaml
 hello-world-localization	components/hello-world/localization.json
 hello-world-config	components/hello-world/config.json
+hello-world-rgd	components/hello-world/rgd.yaml
+hello-world-kustomize	components/hello-world/hello-world-kustomize.oci.tar
 TABLE
 
   local dep_count comp_count
@@ -6592,6 +6936,282 @@ test_docs_links_resolve() {
   return "$failed"
 }
 
+test_flux_artifact_is_reproducible() {
+  local tmp="$1"
+  cp -r "$ROOT/components/hello-world" "$tmp/src-a"
+  cp -r "$ROOT/components/hello-world" "$tmp/src-b"
+  # Run each copy's own script so it resolves manifests.yaml from the copy (it reads from its own directory).
+  python3 -I "$tmp/src-a/flux-artifact.py" "$tmp/src-a" || { echo "  first run failed" >&2; return 1; }
+  python3 -I "$tmp/src-b/flux-artifact.py" "$tmp/src-b" || { echo "  second run failed" >&2; return 1; }
+  cmp "$tmp/src-a/hello-world-kustomize.oci.tar" "$tmp/src-b/hello-world-kustomize.oci.tar" \
+    || { echo "  flux artifact is not reproducible" >&2; return 1; }
+}
+
+test_flux_artifact_resource_is_flux_oci_layout() {
+  local tmp="$1"
+  _build || return 1
+  local cv; cv="$("$OCM" get cv "$(cv_ref "$ROOT_COMPONENT")" -o json)" || return 1
+  echo "$cv" | jq -e '.[0].component.resources[] | select(.name=="hello-world-kustomize") | .type == "blob"' > /dev/null || return 1
+  # Fetch the artifact from the CTF as an unextracted blob and verify its tar structure
+  "$OCM" download resource "$(cv_ref "$ROOT_COMPONENT")" --identity name=hello-world-kustomize \
+    --output "$tmp/flux.oci.tar" --extraction-policy disable >/dev/null || return 1
+  mkdir -p "$tmp/layout"
+  tar -xf "$tmp/flux.oci.tar" -C "$tmp/layout" || return 1
+  # ocm writes the layout entries with mode 0 when it repacks them from the CTF
+  chmod -R u+rw "$tmp/layout"
+  [[ -f "$tmp/layout/oci-layout" ]] || { echo "  missing oci-layout" >&2; return 1; }
+  jq -e '.manifests[0].mediaType == "application/vnd.oci.image.manifest.v1+json"' "$tmp/layout/index.json" > /dev/null || return 1
+  local manifest_digest; manifest_digest="$(jq -r '.manifests[0].digest | ltrimstr("sha256:")' "$tmp/layout/index.json")" || return 1
+  jq -e '.config.mediaType == "application/vnd.cncf.flux.config.v1+json"' "$tmp/layout/blobs/sha256/$manifest_digest" > /dev/null || return 1
+  jq -e '.layers[0].mediaType == "application/vnd.cncf.flux.content.v1.tar+gzip"' "$tmp/layout/blobs/sha256/$manifest_digest" > /dev/null || return 1
+}
+
+test_flux_artifact_is_not_committed() {
+  local tmp="$1"
+  # Skip if not inside a git checkout
+  git -C "$ROOT" rev-parse --is-inside-work-tree >/dev/null 2>&1 || return 77
+  # Must not be tracked
+  if git -C "$ROOT" ls-files --error-unmatch "components/hello-world/hello-world-kustomize.oci.tar" 2>/dev/null; then
+    echo "  hello-world-kustomize.oci.tar is still tracked by git" >&2
+    return 1
+  fi
+  # Must be ignored
+  git -C "$ROOT" check-ignore -q "components/hello-world/hello-world-kustomize.oci.tar" \
+    || { echo "  hello-world-kustomize.oci.tar is not in .gitignore" >&2; return 1; }
+}
+
+test_build_generates_flux_artifact() {
+  local tmp="$1"
+  # Same repo copy as _build_variant: constructor, scripts and components
+  local repo="$tmp/variant-repo"
+  mkdir -p "$repo"
+  cp -R "$ROOT/component-constructor.yaml" "$ROOT/scripts" "$ROOT/components" "$repo/"
+  # Remove the tar so build.sh must generate it
+  rm -f "$repo/components/hello-world/hello-world-kustomize.oci.tar"
+  # Append a build marker so we can verify the generated content matches
+  printf '\n# flux-artifact build marker\n' >> "$repo/components/hello-world/manifests.yaml"
+  SOURCE_COMMIT=0123456789abcdef0123456789abcdef01234567 \
+    BUILD_DIR="$tmp/variant-build" CTF="$tmp/variant-ctf" \
+    bash "$repo/scripts/build.sh" >"$tmp/build.log" 2>&1 \
+    || { echo "  build.sh failed" >&2; tail -5 "$tmp/build.log" >&2; return 1; }
+  local gen="$repo/components/hello-world/hello-world-kustomize.oci.tar"
+  [[ -f "$gen" ]] || { echo "  build.sh did not generate the tar" >&2; return 1; }
+  # Unpack the OCI layout, then the Flux content layer, and find the marker in manifests.yaml
+  mkdir -p "$tmp/gen/layout" "$tmp/gen/content"
+  tar -xf "$gen" -C "$tmp/gen/layout" || return 1
+  local manifest_digest layer_digest
+  manifest_digest="$(jq -r '.manifests[0].digest | ltrimstr("sha256:")' "$tmp/gen/layout/index.json")" || return 1
+  layer_digest="$(jq -r '.layers[0].digest | ltrimstr("sha256:")' "$tmp/gen/layout/blobs/sha256/$manifest_digest")" || return 1
+  tar -xzf "$tmp/gen/layout/blobs/sha256/$layer_digest" -C "$tmp/gen/content" || return 1
+  grep -q 'flux-artifact build marker' "$tmp/gen/content/manifests.yaml" \
+    || { echo "  generated tar does not contain modified manifests.yaml" >&2; return 1; }
+}
+
+test_rgd_mirrors_localization_and_config() {
+  local rgd="$ROOT/components/hello-world/rgd.yaml"
+  grep -q "kind: ResourceGraphDefinition" "$rgd" || return 1
+  grep -q "hello-world-kustomize" "$rgd" || return 1
+  grep -q "hello-world-image" "$rgd" || return 1
+  grep -q "json.marshal" "$rgd" || return 1
+  grep -q "kind: OCIRepository" "$rgd" || return 1
+  grep -q "kind: Kustomization" "$rgd" || return 1
+  # Every placeholder in manifests.yaml must appear in the rgd
+  local placeholder
+  while IFS= read -r placeholder; do
+    grep -q "$placeholder" "$rgd" || { echo "  RGD missing placeholder: $placeholder" >&2; return 1; }
+  done < <(grep -oE 'HELLO_WORLD_[A-Z_]+' "$ROOT/components/hello-world/manifests.yaml" | sort -u)
+  # instance.yaml replicas and html must equal config.json values
+  local cfg_replicas; cfg_replicas="$(jq -r '[.configurations[] | select(.name=="replicas")] | .[0].value' "$ROOT/components/hello-world/config.json")" || return 1
+  local inst_replicas; inst_replicas="$(grep 'replicas:' "$ROOT/k8s/controller/instance.yaml" | awk '{print $2}')" || return 1
+  [[ "$cfg_replicas" == "$inst_replicas" ]] || { echo "  instance.yaml replicas does not match config.json" >&2; return 1; }
+  local cfg_html; cfg_html="$(jq -r '[.configurations[] | select(.name=="index-html")] | .[0].value' "$ROOT/components/hello-world/config.json")" || return 1
+  local inst_html; inst_html="$(python3 -c "import yaml,sys; d=yaml.safe_load(sys.stdin); print(d['spec']['html'],end='')" < "$ROOT/k8s/controller/instance.yaml")" || return 1
+  [[ "$cfg_html" == "$inst_html" ]] || { echo "  instance.yaml html does not match config.json" >&2; return 1; }
+}
+
+test_controller_bootstrap_wires_published_component() {
+  local bootstrap="$ROOT/k8s/controller/bootstrap.yaml"
+  grep -q "baseUrl: ghcr.io/lioramilbaum/ocm" "$bootstrap" || return 1
+  grep -q "component: $ROOT_COMPONENT" "$bootstrap" || return 1
+  grep -q "kind: NamespacedDeployer" "$bootstrap" || return 1
+  grep -q "serviceAccountName: hello-world-deployer" "$bootstrap" || return 1
+  grep -q "resourcegraphdefinitions" "$bootstrap" || return 1
+  grep -q "name: hello-world-rgd" "$bootstrap" || return 1
+  # Every OCM resource referenced by byReference in bootstrap must exist in the built descriptor
+  _build || return 1
+  local cv_json rname
+  cv_json="$("$OCM" get cv "$(cv_ref "$ROOT_COMPONENT")" -o json)" || return 1
+  while IFS= read -r rname; do
+    jq -e --arg n "$rname" '.[0].component.resources[] | select(.name==$n)' <<< "$cv_json" > /dev/null \
+      || { echo "  resource $rname not found in descriptor" >&2; return 1; }
+  done < <(awk '/byReference:/{f=1; next} f && /name: /{print $NF; f=0}' "$bootstrap")
+}
+
+test_controller_sh_installs_stack() {
+  local tmp="$1"
+  export STUB_LOG_DIR="$tmp"
+  _stub_kind "$tmp" > /dev/null
+  _stub_controller_tools "$tmp"
+  PATH="$tmp:$PATH" HELM="$tmp/helm" FLUX="$tmp/flux" KUBECTL="$tmp/kubectl" \
+    bash "$ROOT/scripts/controller.sh" install || return 1
+  grep -q "upgrade --install ocm-k8s-toolkit oci://ghcr.io/open-component-model/kubernetes/controller/chart --version 0.15.0 --namespace ocm-k8s-toolkit-system" "$tmp/helm.log" || return 1
+  grep -q "upgrade --install kro oci://registry.k8s.io/kro/charts/kro --version v0.9.4 --namespace kro-system" "$tmp/helm.log" || return 1
+  grep -q "install --version v2.9.6" "$tmp/flux.log" || return 1
+}
+
+test_controller_sh_applies_bootstrap_and_checks_app() {
+  local tmp="$1"
+  export STUB_LOG_DIR="$tmp"
+  # Make kubectl wait/rollout succeed silently, exec print Hello
+  _stub_controller_tools "$tmp"
+  PATH="$tmp:$PATH" KUBECTL="$tmp/kubectl" \
+    OCM_CONTROLLER_REPO="ghcr.io/example/ocm" \
+    bash "$ROOT/scripts/controller.sh" apply || return 1
+  grep -q "baseUrl: ghcr.io/example/ocm" "$tmp/kubectl-stdin.log" || return 1
+  grep -q "kind: NamespacedDeployer" "$tmp/kubectl-stdin.log" || return 1
+  grep -q "wait --for=condition=Ready" "$tmp/kubectl.log" || return 1
+  grep -q "namespaceddeployer/hello-world" "$tmp/kubectl.log" || return 1
+}
+
+test_controller_sh_cluster_lifecycle() {
+  local tmp; tmp="$(mktemp -d)"
+  export STUB_LOG_DIR="$tmp"
+  local stub_dir; stub_dir="$(_stub_kind "$tmp")"
+  _stub_controller_tools "$tmp"
+  # cluster.sh runs inside `run` and uses the stubbed kind and docker
+  PATH="$stub_dir:$PATH" KIND="$stub_dir/kind" HELM="$tmp/helm" FLUX="$tmp/flux" KUBECTL="$tmp/kubectl" \
+    bash "$ROOT/scripts/controller.sh" run > /dev/null || return 1
+  assert_contains "$(cat "$tmp/kind.log")" "create cluster --name ocm-controller" || return 1
+  assert_contains "$(cat "$tmp/helm.log")" "upgrade --install kro" || return 1
+  rm -rf "$tmp"
+}
+
+test_make_controller_target() {
+  local out
+  out="$(make -n -C "$ROOT" controller 2>/dev/null)"
+  assert_contains "$out" "scripts/controller.sh" || return 1
+  out="$(make -C "$ROOT" help)"
+  assert_contains "$out" "  controller " || return 1
+}
+
+test_docs_document_controller_stack() {
+  local doc="$ROOT/docs/controller.md"
+  grep -q "https://ocm.software/docs/getting-started/set-up-controller-environments/" "$doc" || return 1
+  grep -q "https://ocm.software/docs/getting-started/deploy-helm-charts/" "$doc" || return 1
+  grep -q "flux install" "$doc" || return 1
+  grep -q "ghcr.io/open-component-model/kubernetes/controller/chart" "$doc" || return 1
+  grep -q "registry.k8s.io/kro/charts/kro" "$doc" || return 1
+  grep -q "make controller" "$doc" || return 1
+  grep -q "KEEP_CLUSTER" "$doc" || return 1
+  grep -q "OCM_CONTROLLER_REPO" "$doc" || return 1
+}
+
+test_controller_sh_run_deletes_created_cluster() {
+  local tmp="$1"
+  local stub_dir; stub_dir="$(_stub_kind "$tmp")"
+  _stub_controller_tools "$tmp"
+  PATH="$stub_dir:$PATH" KIND="$stub_dir/kind" HELM="$tmp/helm" FLUX="$tmp/flux" KUBECTL="$tmp/kubectl" \
+    STUB_LOG_DIR="$tmp" bash "$ROOT/scripts/controller.sh" run > /dev/null 2>&1 || true
+  # kind created the cluster
+  grep -q "create cluster.*--name ocm-controller" "$tmp/kind.log" || { echo "  kind create not called" >&2; return 1; }
+  # kubeconfig written inside tmp (not the e2e kubeconfig or ~/.kube/config)
+  grep -qF "create cluster --name ocm-controller --kubeconfig $tmp/" "$tmp/kind.log" \
+    || { echo "  kubeconfig not isolated to tmp" >&2; return 1; }
+  # kind deleted the cluster on exit
+  grep -q "delete cluster.*--name ocm-controller" "$tmp/kind.log" || { echo "  kind delete not called" >&2; return 1; }
+}
+
+test_controller_sh_run_keep_cluster() {
+  local tmp="$1"
+  local stub_dir; stub_dir="$(_stub_kind "$tmp")"
+  _stub_controller_tools "$tmp"
+  KEEP_CLUSTER=1 PATH="$stub_dir:$PATH" KIND="$stub_dir/kind" HELM="$tmp/helm" FLUX="$tmp/flux" KUBECTL="$tmp/kubectl" \
+    STUB_LOG_DIR="$tmp" bash "$ROOT/scripts/controller.sh" run > /dev/null 2>&1 || true
+  grep -q "create cluster.*--name ocm-controller" "$tmp/kind.log" || { echo "  kind create not called" >&2; return 1; }
+  ! grep -q "delete cluster" "$tmp/kind.log" \
+    || { echo "  kind delete was called despite KEEP_CLUSTER=1" >&2; return 1; }
+}
+
+test_controller_sh_run_reuses_existing_cluster() {
+  local tmp="$1"
+  local stub_dir; stub_dir="$(_stub_kind "$tmp")"
+  _stub_controller_tools "$tmp"
+  # Pre-seed the kind stub's cluster list (a file read by `kind get clusters`)
+  echo "ocm-controller" > "$tmp/kind-clusters"
+  PATH="$stub_dir:$PATH" KIND="$stub_dir/kind" HELM="$tmp/helm" FLUX="$tmp/flux" KUBECTL="$tmp/kubectl" \
+    STUB_LOG_DIR="$tmp" bash "$ROOT/scripts/controller.sh" run > /dev/null 2>&1 || true
+  # Should export kubeconfig, not create
+  grep -qE "export kubeconfig.*--name ocm-controller|get-kubeconfig.*ocm-controller" "$tmp/kind.log" \
+    || { echo "  kind get/export kubeconfig not called" >&2; return 1; }
+  ! grep -q "create cluster" "$tmp/kind.log" \
+    || { echo "  kind create was called on existing cluster" >&2; return 1; }
+}
+
+test_controller_sh_down_deletes_cluster() {
+  local tmp="$1"
+  local stub_dir; stub_dir="$(_stub_kind "$tmp")"
+  _stub_controller_tools "$tmp"
+  KIND="$stub_dir/kind" HELM="$tmp/helm" FLUX="$tmp/flux" KUBECTL="$tmp/kubectl" \
+    STUB_LOG_DIR="$tmp" bash "$ROOT/scripts/controller.sh" down > /dev/null 2>&1 || true
+  grep -q "delete cluster.*--name ocm-controller" "$tmp/kind.log" || { echo "  kind delete not called" >&2; return 1; }
+}
+
+test_controller_sh_rejects_unknown_subcommand() {
+  local tmp="$1"
+  local stub_dir; stub_dir="$(_stub_kind "$tmp")"
+  _stub_controller_tools "$tmp"
+  local out
+  if out=$(PATH="$stub_dir:$PATH" KIND="$stub_dir/kind" HELM="$tmp/helm" FLUX="$tmp/flux" KUBECTL="$tmp/kubectl" \
+    STUB_LOG_DIR="$tmp" bash "$ROOT/scripts/controller.sh" bogus 2>&1); then
+    echo "  expected non-zero exit for unknown subcommand" >&2; return 1
+  fi
+  echo "$out" | grep -qi "usage\|unknown\|invalid" || { echo "  no usage message for unknown subcommand, got: $out" >&2; return 1; }
+}
+
+test_controller_sh_apply_sets_target_architecture() {
+  local tmp="$1"
+  _stub_kind "$tmp" > /dev/null
+  _stub_controller_tools "$tmp"
+  TARGET_ARCH=arm64 HELM="$tmp/helm" FLUX="$tmp/flux" KUBECTL="$tmp/kubectl" \
+    KUBECONFIG="$tmp/kubeconfig" STUB_LOG_DIR="$tmp" \
+    bash "$ROOT/scripts/controller.sh" apply > /dev/null 2>&1 || true
+  grep -q "architecture: arm64" "$tmp/kubectl-stdin.log" 2>/dev/null \
+    || { echo "  arm64 architecture not applied in kubectl-stdin.log" >&2; return 1; }
+  ! grep -q "architecture: amd64" "$tmp/kubectl-stdin.log" 2>/dev/null \
+    || { echo "  amd64 still present after TARGET_ARCH=arm64" >&2; return 1; }
+}
+
+test_controller_sh_check_fails_without_answer() {
+  local tmp="$1"
+  _stub_kind "$tmp" > /dev/null
+  _stub_controller_tools "$tmp"
+  # Default check should succeed
+  HELM="$tmp/helm" FLUX="$tmp/flux" KUBECTL="$tmp/kubectl" \
+    KUBECONFIG="$tmp/kubeconfig" STUB_LOG_DIR="$tmp" \
+    bash "$ROOT/scripts/controller.sh" check > /dev/null 2>&1 \
+    || { echo "  default check failed unexpectedly" >&2; return 1; }
+  # Wrong response should fail
+  if STUB_EXEC_OUTPUT=nope HELM="$tmp/helm" FLUX="$tmp/flux" KUBECTL="$tmp/kubectl" \
+    KUBECONFIG="$tmp/kubeconfig" STUB_LOG_DIR="$tmp" \
+    bash "$ROOT/scripts/controller.sh" check > /dev/null 2>&1; then
+    echo "  check passed with wrong response" >&2; return 1
+  fi
+}
+
+test_controller_sh_install_requires_tools() {
+  local tmp="$1"
+  _stub_kind "$tmp" > /dev/null
+  _stub_controller_tools "$tmp"
+  local out
+  if out=$(HELM="/nonexistent/helm" FLUX="$tmp/flux" KUBECTL="$tmp/kubectl" \
+    STUB_LOG_DIR="$tmp" bash "$ROOT/scripts/controller.sh" install 2>&1); then
+    echo "  install passed with missing helm" >&2; return 1
+  fi
+  echo "$out" | grep -qi "required\|not found\|missing\|helm" \
+    || { echo "  no useful error message, got: $out" >&2; return 1; }
+  [[ ! -f "$tmp/helm.log" ]] || { echo "  helm was invoked despite missing tool" >&2; return 1; }
+}
+
 # ── Run all tests ─────────────────────────────────────────────────────────────
 
 run_test "build produces application tree" test_build_produces_application_tree
@@ -6638,11 +7258,18 @@ run_test "make e2e-run skips build and sign" test_make_e2e_run_skips_build_sign
 run_test "devcontainer config is valid" test_devcontainer_config_is_valid
 run_test "devcontainer pins tools" test_devcontainer_pins_tools
 run_test "renovate updates OCM SHA256 ARGs" test_renovate_updates_ocm_sha256
+run_test "renovate managers match their targets"   test_renovate_managers_match_targets
+run_test "renovate captures pinned versions"        test_renovate_captures_pinned_versions
+run_test "renovate regexes reject invalid input"    test_renovate_regexes_reject_invalid_input
+run_test "renovate extractVersion maps release tags" test_renovate_extract_version_templates
+run_test "renovate groups Flux updates"             test_renovate_groups_flux_updates
+run_test "renovate OCM CLI rule scoped to Dockerfile" test_renovate_ocm_cli_rule_scoped
 run_test "e2e workflow isolates deploy" test_e2e_workflow_isolates_deploy
 run_test "publish passes registry credentials via ocm config" test_publish_passes_registry_credentials_via_ocm_config
 run_test "publish does not write registry secret" test_publish_does_not_write_registry_secret
 run_test "publish without registry credentials uses discovery" test_publish_without_registry_credentials_uses_discovery
 run_test "publish rejects partial registry credentials" test_publish_rejects_partial_registry_credentials
+run_test "publish rejects missing repo and config" test_publish_rejects_missing_repo_and_config
 run_test "registry identity derived from OCM_REPO" test_registry_identity_derived_from_ocm_repo
 run_test "registry ocmconfig is valid for ocm" test_registry_ocmconfig_is_valid_for_ocm
 run_test "release publishes with OCM credentials" test_release_publishes_with_ocm_credentials
@@ -6914,6 +7541,26 @@ run_test "make none-access target" test_make_none_access_target
 run_test "readme documents none access" test_readme_documents_none_access
 run_test "readme is a docs index" test_readme_is_docs_index
 run_test "docs links resolve" test_docs_links_resolve
+
+run_test "flux artifact is reproducible" test_flux_artifact_is_reproducible
+run_test "flux artifact resource is flux oci layout" test_flux_artifact_resource_is_flux_oci_layout
+run_test "flux artifact is not committed"     test_flux_artifact_is_not_committed
+run_test "build generates flux artifact"      test_build_generates_flux_artifact
+run_test "rgd mirrors localization and config" test_rgd_mirrors_localization_and_config
+run_test "controller bootstrap wires published component" test_controller_bootstrap_wires_published_component
+run_test "controller.sh installs stack" test_controller_sh_installs_stack
+run_test "controller.sh applies bootstrap and checks app" test_controller_sh_applies_bootstrap_and_checks_app
+run_test "controller.sh cluster lifecycle" test_controller_sh_cluster_lifecycle
+run_test "controller.sh run deletes cluster it created"  test_controller_sh_run_deletes_created_cluster
+run_test "controller.sh run keeps cluster with KEEP_CLUSTER" test_controller_sh_run_keep_cluster
+run_test "controller.sh run reuses existing cluster"     test_controller_sh_run_reuses_existing_cluster
+run_test "controller.sh down deletes cluster"            test_controller_sh_down_deletes_cluster
+run_test "controller.sh rejects unknown subcommand"      test_controller_sh_rejects_unknown_subcommand
+run_test "controller.sh apply sets target architecture"  test_controller_sh_apply_sets_target_architecture
+run_test "controller.sh check fails without answer"      test_controller_sh_check_fails_without_answer
+run_test "controller.sh install requires tools"          test_controller_sh_install_requires_tools
+run_test "make controller target" test_make_controller_target
+run_test "docs document controller stack" test_docs_document_controller_stack
 
 echo ""
 echo "Results: $PASS passed, $FAIL failed, $SKIP skipped"

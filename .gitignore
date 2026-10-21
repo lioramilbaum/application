@@ -3,3 +3,4 @@ bin/
 .ocm/
 *.pem
 .test-golden/
+components/hello-world/hello-world-kustomize.oci.tar

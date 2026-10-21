@@ -1,0 +1,10 @@
+apiVersion: kro.run/v1alpha1
+kind: HelloWorld
+metadata:
+  name: hello-world
+  namespace: default
+spec:
+  component: application
+  architecture: amd64
+  replicas: 1
+  html: "Hello, World!\n"
