@@ -1492,36 +1492,37 @@ test_renovate_extract_version_templates() {
   local tmp="$1"
 
   # OCM chart: kubernetes/controller/v0.15.0 → 0.15.0
-  local ev; ev=$(jq -r '.customManagers[] | select(.depNameTemplate == "open-component-model/open-component-model" and ((.managerFilePatterns // []) | any(test("controller")))) | .extractVersion' "$ROOT/renovate.json")
-  [[ -n "$ev" && "$ev" != "null" ]] || { echo "  OCM chart manager missing extractVersion" >&2; return 1; }
-  [[ $(echo "$ev" | wc -l | tr -d ' ') -eq 1 ]] || { echo "  ambiguous extractVersion: expected 1 match, got multiple" >&2; return 1; }
+  local ev; ev=$(jq -r '.customManagers[] | select(.depNameTemplate == "open-component-model/open-component-model" and ((.managerFilePatterns // []) | any(test("controller")))) | .extractVersionTemplate' "$ROOT/renovate.json")
+  [[ -n "$ev" && "$ev" != "null" ]] || { echo "  OCM chart manager missing extractVersionTemplate" >&2; return 1; }
+  [[ $(echo "$ev" | wc -l | tr -d ' ') -eq 1 ]] || { echo "  ambiguous extractVersionTemplate: expected 1 match, got multiple" >&2; return 1; }
   local got; got=$(jq -rn --arg tag "kubernetes/controller/v0.15.0" --arg re "$ev" '$tag | capture($re) | .version')
-  [[ "$got" == "0.15.0" ]] || { echo "  OCM chart extractVersion: expected 0.15.0, got $got" >&2; return 1; }
+  [[ "$got" == "0.15.0" ]] || { echo "  OCM chart extractVersionTemplate: expected 0.15.0, got $got" >&2; return 1; }
   # A CLI tag must not match (v0.19.1 has no kubernetes/controller/ prefix)
   local no_match; no_match=$(jq -rn --arg tag "v0.19.1" --arg re "$ev" 'try ($tag | capture($re) | .version) catch ""' 2>/dev/null || echo "")
-  [[ -z "$no_match" ]] || { echo "  OCM chart extractVersion matched CLI tag v0.19.1: $no_match" >&2; return 1; }
+  [[ -z "$no_match" ]] || { echo "  OCM chart extractVersionTemplate matched CLI tag v0.19.1: $no_match" >&2; return 1; }
 
   # Helm: v4.3.1 → 4.3.1
-  ev=$(jq -r '.customManagers[] | select(.depNameTemplate == "helm/helm") | .extractVersion' "$ROOT/renovate.json")
-  [[ -n "$ev" && "$ev" != "null" ]] || { echo "  helm manager missing extractVersion" >&2; return 1; }
-  [[ $(echo "$ev" | wc -l | tr -d ' ') -eq 1 ]] || { echo "  ambiguous extractVersion: expected 1 match, got multiple" >&2; return 1; }
+  ev=$(jq -r '.customManagers[] | select(.depNameTemplate == "helm/helm") | .extractVersionTemplate' "$ROOT/renovate.json")
+  [[ -n "$ev" && "$ev" != "null" ]] || { echo "  helm manager missing extractVersionTemplate" >&2; return 1; }
+  [[ $(echo "$ev" | wc -l | tr -d ' ') -eq 1 ]] || { echo "  ambiguous extractVersionTemplate: expected 1 match, got multiple" >&2; return 1; }
   got=$(jq -rn --arg tag "v4.3.1" --arg re "$ev" '$tag | capture($re) | .version')
-  [[ "$got" == "4.3.1" ]] || { echo "  helm extractVersion: expected 4.3.1, got $got" >&2; return 1; }
+  [[ "$got" == "4.3.1" ]] || { echo "  helm extractVersionTemplate: expected 4.3.1, got $got" >&2; return 1; }
   no_match=$(jq -rn --arg tag "4.3.1" --arg re "$ev" 'try ($tag | capture($re) | .version) catch ""' 2>/dev/null || echo "")
-  [[ -z "$no_match" ]] || { echo "  helm extractVersion matched unversioned tag 4.3.1: $no_match" >&2; return 1; }
+  [[ -z "$no_match" ]] || { echo "  helm extractVersionTemplate matched unversioned tag 4.3.1: $no_match" >&2; return 1; }
 
-  # Every github-releases manager whose currentValue lacks a leading v must have extractVersion
+  # Every github-releases manager whose currentValue lacks a leading v must have extractVersionTemplate
   local missing; missing=$(jq -r '
     .customManagers[] |
     select(
       .datasourceTemplate == "github-releases" and
       ((.matchStrings | join("")) | test("\\?<currentValue>[^v]"))
     ) |
-    select(.extractVersion == null or .extractVersion == "") |
+    select(.extractVersionTemplate == null or .extractVersionTemplate == "") |
     .depNameTemplate
   ' "$ROOT/renovate.json")
-  [[ -z "$missing" ]] || { echo "  github-releases manager missing extractVersion: $missing" >&2; return 1; }
+  [[ -z "$missing" ]] || { echo "  github-releases manager missing extractVersionTemplate: $missing" >&2; return 1; }
 }
+
 
 test_renovate_groups_flux_updates() {
   local tmp="$1"
