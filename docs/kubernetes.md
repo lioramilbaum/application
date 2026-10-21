@@ -86,7 +86,7 @@ unsigned `tier` label is fine for queries but not for trust decisions; see
 The application component has no `componentReferences`, so its graph is just the root and
 `referenceSelector` has nothing to match here. A `Component` that tracks
 `github.com/lioramilbaum/product` would have `application` in its reference graph, which is what
-`referenceSelector` applies to; see [Component References](component-graphs.md#component-references) and
+`referenceSelector` applies to; see [Component References](product.md#component-references) and
 [Resolvers](repositories.md#resolvers).
 
 ```yaml

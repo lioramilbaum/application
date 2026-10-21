@@ -3211,6 +3211,35 @@ test_readme_documents_component_references() {
   assert_contains "$resolvers_section" "#component-references)" || return 1
 }
 
+test_docs_product_page() {
+  local page="$ROOT/docs/product.md" content check
+  [[ -f "$page" ]] || { echo "  docs/product.md is missing" >&2; return 1; }
+  [[ "$(head -n 1 "$page")" == "# Component References" ]] || \
+    { echo "  docs/product.md must start with '# Component References'" >&2; return 1; }
+
+  content="$(cat "$page")"
+  local checks=(
+    "make product"
+    "scripts/product.sh"
+    "components/product/component-constructor.yaml"
+    "build/product-ctf"
+    "Trust limitation"
+    "github.com/lioramilbaum/application"
+  )
+  for check in "${checks[@]}"; do
+    assert_contains "$content" "$check" "docs/product.md contains: $check" || return 1
+  done
+
+  # Moved, not copied: component-graphs.md must no longer carry the section.
+  assert_not_contains "$(cat "$ROOT/docs/component-graphs.md")" "## Component References" \
+    "component-graphs.md no longer has the Component References section" || return 1
+
+  local readme_section
+  readme_section="$(awk '/^### Components and graphs$/{f=1; next} /^#/{f=0} f' "$ROOT/README.md")"
+  assert_contains "$readme_section" "](docs/product.md)" \
+    "README Components and graphs section links docs/product.md" || return 1
+}
+
 test_versions_lists_newest_first() {
   local tmp="$1"
   _build_versions "$tmp"
@@ -3472,6 +3501,37 @@ test_readme_documents_version_selection() {
     "Component identity section links to version-selection" || return 1
 }
 
+
+test_docs_versions_page() {
+  local page="$ROOT/docs/versions.md" content check
+  [[ -f "$page" ]] || { echo "  docs/versions.md is missing" >&2; return 1; }
+  [[ "$(head -n 1 "$page")" == "# Version selection" ]] || \
+    { echo "  docs/versions.md must start with '# Version selection'" >&2; return 1; }
+
+  content="$(cat "$page")"
+  local checks=(
+    "make versions"
+    "scripts/versions.sh"
+    "components/versions/component-constructor.yaml"
+    "components/versions/versioning.ocmconfig"
+    "--constraint"
+    "--latest"
+    "build-number"
+    "0.19.0"
+  )
+  for check in "${checks[@]}"; do
+    assert_contains "$content" "$check" "docs/versions.md contains: $check" || return 1
+  done
+
+  # Moved, not copied: component-graphs.md must no longer carry the section.
+  assert_not_contains "$(cat "$ROOT/docs/component-graphs.md")" "## Version selection" \
+    "component-graphs.md no longer has the Version selection section" || return 1
+
+  local readme_section
+  readme_section="$(awk '/^### Components and graphs$/{f=1; next} /^#/{f=0} f' "$ROOT/README.md")"
+  assert_contains "$readme_section" "](docs/versions.md)" \
+    "README Components and graphs section links docs/versions.md" || return 1
+}
 
 test_helm_chart_resource_metadata() {
   local tmp="$1"
@@ -6897,6 +6957,14 @@ test_readme_documents_none_access() {
   }
 }
 
+test_readme_intro_lists_demos() {
+  local intro
+  intro="$(awk '/^# /{f=1; next} /^## Quick start$/{f=0} f' "$ROOT/README.md")"
+  [[ -n "$intro" ]] || { echo "  README has no text between the H1 and '## Quick start'" >&2; return 1; }
+  assert_contains "$intro" "product component" || return 1
+  assert_contains "$intro" "version selection" || return 1
+}
+
 test_readme_is_docs_index() {
   local line_count doc name heading
   [[ -d "$ROOT/docs" ]] || { echo "  docs/ directory is missing" >&2; return 1; }
@@ -7320,6 +7388,7 @@ run_test "recursive transfer enforces reference digest" test_recursive_transfer_
 run_test "product requires resolvable reference" test_product_requires_resolvable_reference
 run_test "make product target" test_make_product_target
 run_test "readme documents component references" test_readme_documents_component_references
+run_test "docs product page" test_docs_product_page
 run_test "versions lists newest first" test_versions_lists_newest_first
 run_test "versions constraint filters" test_versions_constraint_filters
 run_test "versions latest includes prereleases by default" test_versions_latest_includes_prereleases_by_default
@@ -7330,6 +7399,7 @@ run_test "versions requires ocm 0.19" test_versions_requires_ocm_019
 run_test "versions show reports selection" test_versions_show_reports_selection
 run_test "make versions target" test_make_versions_target
 run_test "readme documents version selection" test_readme_documents_version_selection
+run_test "docs versions page" test_docs_versions_page
 run_test "helm chart resource metadata" test_helm_chart_resource_metadata
 run_test "helm chart is oci artifact" test_helm_chart_is_oci_artifact
 run_test "helm transformer extracts chart" test_helm_transformer_extracts_chart
@@ -7539,6 +7609,7 @@ run_test "none-access transfer keeps none" test_none_access_transfer_keeps_none
 run_test "none-access copy resources keeps none" test_none_access_copy_resources_keeps_none
 run_test "make none-access target" test_make_none_access_target
 run_test "readme documents none access" test_readme_documents_none_access
+run_test "readme intro lists demos" test_readme_intro_lists_demos
 run_test "readme is a docs index" test_readme_is_docs_index
 run_test "docs links resolve" test_docs_links_resolve
 

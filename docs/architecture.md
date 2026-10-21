@@ -81,7 +81,7 @@ organization URL where the owner controls the namespace.
 
 **Component version** is relaxed SemVer: the `v` prefix is optional, pre-release and build
 metadata are allowed, and `latest` is rejected. `release.yaml` strips the tag's `v` prefix, so
-Git tag `v0.1.0` becomes component version `0.1.0`. This is OCM's default `loose-semver` scheme; see [Version selection](component-graphs.md#version-selection) for constraints and custom schemes.
+Git tag `v0.1.0` becomes component version `0.1.0`. This is OCM's default `loose-semver` scheme; see [Version selection](versions.md#version-selection) for constraints and custom schemes.
 
 **Reference syntax** is `[<type>::]<repository>//<name>[:<version>]`. For this component:
 
