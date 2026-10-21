@@ -134,6 +134,7 @@ Tests include:
 - S3 resources: `s3 image pinned by digest`, `s3 docker skip without docker`, `s3 seed uploads object`, `s3 access records endpoint`, `s3 access v1 uses bucket key fields`, `s3 access v2 uses bucket name fields`, `s3 unversioned build warns no pin`, `s3 versioned bucket pins version`, `s3 input becomes local blob`, `s3 download v1 and v2`, `s3 download rejects overwritten object`, `s3 pinned version survives overwrite`, `s3 input works offline`, `s3 credentials required`, `s3 glob star matches`, `s3 doublestar not matched`, `s3 transfer copies v2 only`, `s3 stop removes container`, `make s3 target`, `readme documents s3 resources` (these report SKIP without Docker, except the static checks)
 - Resources without access (None): `none-access sha256 matches constructor label`, `none-access resource has no digest in descriptor`, `none-access build warns no digest processor`, `none-access control resource downloads`, `none-access download fails gracefully`, `none-access sign and verify`, `none-access digest not signed`, `none-access digest triggers warning`, `none-access lowercase warns missing digest`, `none-access versioned type is not none`, `none-access identity is signed`, `none-access label is signed`, `none-access audit passes`, `none-access audit detects tamper`, `none-access transfer keeps none`, `none-access copy resources keeps none`, `make none-access target`, `readme documents none access`
 - README index: `readme intro lists demos`
+- Repository metadata: `license is apache 2.0`, `contributing guide covers workflow`
 
 ## CI
 

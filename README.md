@@ -4,6 +4,8 @@ A minimal HelloWorld application built with the [Open Component Model](https://o
 
 The repository also contains demos for individual OCM concepts (component graphs, the product component, version selection, GitHub access, signing normalisation, S3 resources, and resources without access). Each has a `make` target and a documentation page under [`docs/`](docs/).
 
+Licensed under [Apache 2.0](LICENSE).
+
 ## Quick start
 
 The `.devcontainer/` directory provides all required tools when used with Docker Desktop or a compatible Docker host and devcontainers CLI.
@@ -58,3 +60,4 @@ make lint      # lint shell scripts
 ### Development
 
 - [Development](docs/development.md): prerequisites, lifecycle, end-to-end testing, running tests, CI, version management, and notes
+- [Contributing](CONTRIBUTING.md): devcontainer, branch naming, lint and tests, pull requests, and commit messages

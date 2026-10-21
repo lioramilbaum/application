@@ -7000,8 +7000,27 @@ test_docs_links_resolve() {
       echo "  ${file#"$ROOT"/} links to missing anchor: $target" >&2
       failed=1
     fi
-  done < <(awk '/^(```|~~~)/{ if(!c){c=1; m=substr($0,1,3)} else if(substr($0,1,3)==m){c=0}; next } !c { line=$0; while (match(line, /!?\[[^]]*\]\([^)]*\)/)) { tok=substr(line, RSTART, RLENGTH); if (substr(tok,1,1) != "!") { i=index(tok,"]("); print FILENAME "\t" substr(tok, i+2, length(tok)-i-2) }; line=substr(line, RSTART+RLENGTH) } }' "${DOC_FILES[@]}")
+  done < <(awk '/^(```|~~~)/{ if(!c){c=1; m=substr($0,1,3)} else if(substr($0,1,3)==m){c=0}; next } !c { line=$0; while (match(line, /!?\[[^]]*\]\([^)]*\)/)) { tok=substr(line, RSTART, RLENGTH); if (substr(tok,1,1) != "!") { i=index(tok,"]("); print FILENAME "\t" substr(tok, i+2, length(tok)-i-2) }; line=substr(line, RSTART+RLENGTH) } }' "${DOC_FILES[@]}" "$ROOT/CONTRIBUTING.md")
   return "$failed"
+}
+
+test_license_is_apache_2() {
+  local tmp="$1"
+  [[ -f "$ROOT/LICENSE" ]] || { echo "  LICENSE is missing" >&2; return 1; }
+  # Restore the placeholder so the hash matches the canonical Apache 2.0 text.
+  sed 's/^   Copyright [0-9]\{4\} Liora Milbaum$/   Copyright [yyyy] [name of copyright owner]/' "$ROOT/LICENSE" > "$tmp/LICENSE"
+  assert_eq "$(sha256 "$tmp/LICENSE")" "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30" "LICENSE is Apache 2.0 text" || return 1
+  grep -q '^   Copyright [0-9]\{4\} Liora Milbaum$' "$ROOT/LICENSE" || { echo "  LICENSE copyright line is not filled in" >&2; return 1; }
+}
+
+test_contributing_guide_covers_workflow() {
+  local guide="$ROOT/CONTRIBUTING.md" text needle
+  [[ -f "$guide" ]] || { echo "  CONTRIBUTING.md is missing" >&2; return 1; }
+  [[ "$(head -n 1 "$guide")" == "# Contributing" ]] || { echo "  CONTRIBUTING.md does not start with '# Contributing'" >&2; return 1; }
+  text="$(cat "$guide")"
+  for needle in ".devcontainer" "make lint" "make test" "feat/<name>" "lioramilbaum/application" "--draft" "Conventional Commits" "Squash" "Co-Authored-By:" "](LICENSE)"; do
+    assert_contains "$text" "$needle" "CONTRIBUTING.md" || return 1
+  done
 }
 
 test_flux_artifact_is_reproducible() {
@@ -7612,6 +7631,8 @@ run_test "readme documents none access" test_readme_documents_none_access
 run_test "readme intro lists demos" test_readme_intro_lists_demos
 run_test "readme is a docs index" test_readme_is_docs_index
 run_test "docs links resolve" test_docs_links_resolve
+run_test "license is apache 2.0" test_license_is_apache_2
+run_test "contributing guide covers workflow" test_contributing_guide_covers_workflow
 
 run_test "flux artifact is reproducible" test_flux_artifact_is_reproducible
 run_test "flux artifact resource is flux oci layout" test_flux_artifact_resource_is_flux_oci_layout
