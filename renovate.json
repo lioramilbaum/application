@@ -5,19 +5,6 @@
     "group:all"
   ],
   "separateMajorMinor": false,
-  "packageRules": [
-    {
-      "description": "Bump OCM CLI version and both linux SHA256 pins in one PR",
-      "matchDepNames": ["open-component-model/open-component-model"],
-      "matchFileNames": [".devcontainer/Dockerfile"],
-      "groupName": "OCM CLI"
-    },
-    {
-      "description": "Bump Flux version in Dockerfile and controller.sh together",
-      "matchDepNames": ["fluxcd/flux2"],
-      "groupName": "Flux"
-    }
-  ],
   "customManagers": [
     {
       "customType": "regex",
