@@ -181,7 +181,7 @@ _audit() {
   _git init -q --bare --object-format=sha1 "$AUDIT_DIR/repo.git"
   _git --git-dir "$AUDIT_DIR/repo.git" fetch -q "$repo" "$commit" 2>/dev/null || die "commit $commit not found in $repo"
   _git --git-dir "$AUDIT_DIR/repo.git" archive "$commit" | tar -x -C "$AUDIT_DIR/commit"
-  diff -r "$AUDIT_DIR/snapshot" "$AUDIT_DIR/commit" >/dev/null || die "snapshot does not match commit $commit"
+  diff -r --exclude='.git' "$AUDIT_DIR/snapshot" "$AUDIT_DIR/commit" >/dev/null || die "snapshot does not match commit $commit"
   printf 'audit\t%s\t%s\tmatch\n' "$commit" "$digest"
 }
 

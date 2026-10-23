@@ -121,11 +121,11 @@ To verify only the GPG signature, pass `--signature gpg`. OCM 0.19.1 applies eve
 |---|---|---|---|---|---|
 | `valid` | signer key | signer public key | ok | ok | - |
 | `rotated-key` | second valid key | keyring with signer and second key | ok | ok | - |
-| `concatenated-keyring` | second key | signer and second public keys concatenated | ok | fail | `unknown-key` |
+| `concatenated-keyring` | second key | signer and second public keys concatenated | ok | ok | - |
 | `wrong-key` | key not in the verifier | signer public key | ok | fail | `unknown-key` |
-| `verifier-pins-other-key` | signer key | keyring, pinned to the second key's fingerprint | ok | fail | `unknown-key` |
-| `pinned-subkey` | signing subkey as `keyFingerprint` | signer public key | fail | - | `no-matching-key` |
-| `expired-key` | key that expired in 2020 | its public key | fail | - | `no-signing-key` |
+| `verifier-pins-other-key` | signer key | keyring, pinned to the second key's fingerprint | ok | fail | `error` |
+| `pinned-subkey` | signing subkey as `keyFingerprint` | signer public key | ok | ok | - |
+| `expired-key` | key that expired in 2020 | its public key | fail | - | `error` |
 | `expired-after-signing` | key without expiry at signing time; expiry set later | its public key | ok | fail | `key-expired` |
 | `revoked-key` | key revoked after export | its public key | ok | fail | `revoked` |
 | `protected-key` | passphrase-protected key, `passphrase: secret` | its public key | ok | ok | - |
@@ -133,7 +133,7 @@ To verify only the GPG signature, pass `--signature gpg`. OCM 0.19.1 applies eve
 | `sha512-signature` | signer key, `hashAlgorithm: SHA-512` | signer public key | ok | ok | - |
 | `default-verifier` | signer key | GPG credentials without a `verifier` entry | ok | fail | `media-type` |
 
-The `concatenated-keyring` row shows that only the first armored key in a file loads. `pinned-subkey` fails on OCM 0.19.1, which cannot pin a signing subkey fingerprint, so `keyFingerprint` names the primary key.
+The `concatenated-keyring` row shows that a full keyring (all keys readable) verifies in OCM 0.21.0. `pinned-subkey` works in OCM ≥ v0.21.0-rc.1 (#3858), which added support for pinning signing subkey fingerprints.
 
 ### Own keys
 
@@ -153,8 +153,8 @@ The signature is stored in the descriptor, so `ocm transfer cv` carries it to th
 
 - Expiry and revocation are checked at verify time, not at signing time. A signature made while the key was valid fails once it expires (`expired-after-signing`) or is revoked (`revoked-key`).
 - A concatenated armored file loads only its first key (`concatenated-keyring`).
-- Pinning a signing subkey fingerprint (`pinned-subkey`) needs OCM ≥ v0.21.0-rc.1 (#3858).
-- v0.20.0-rc.1 (#3691) and v0.21.0-rc.1 (#3858) change error messages. The reasons in the table are the ones OCM 0.19.1 prints; `_classify` in `scripts/gpg.sh` maps them.
+- Pinning a signing subkey fingerprint (`pinned-subkey`) requires OCM ≥ v0.21.0-rc.1 (#3858).
+- When no more specific reason is classifiable, the reason is `error`; this is a catch-all for unrecognised OCM error messages.
 - A passphrase-protected key needs `passphrase` in the credentials of the signer config. Without it, signing fails with `passphrase-required`.
 
 Related: [Signing and verification](signing.md#signing-and-verification) · [Certificate-chain signing](certificate-chain-signing.md#certificate-chain-signing) · [Transfer and transport](transfer.md#transfer-and-transport) · [Credential system](credentials.md#credential-system)
