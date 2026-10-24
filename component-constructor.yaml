@@ -22,7 +22,7 @@ components:
         version: ${VERSION}
         access:
           type: OCIImage/v1
-          imageReference: docker.io/library/nginx:1.31-alpine@sha256:138af827713b7671ef4ee2deea73bc6f08ae265130ce350307e3e7b52cd4b51b
+          imageReference: docker.io/library/nginx:1.31-alpine@sha256:2db7d28517d1fba17c2da3210395f7be11a11b419246ad0da2edf782af72f367
       - name: hello-world-image
         extraIdentity:
           architecture: arm64
@@ -30,7 +30,7 @@ components:
         version: ${VERSION}
         access:
           type: OCIImage/v1
-          imageReference: docker.io/library/nginx:1.31-alpine@sha256:2d829ce6bc998fecd1cd72204c358c0c0614bab5edd9471dfcf8b92a49f4d323
+          imageReference: docker.io/library/nginx:1.31-alpine@sha256:41c8801e327f9c60c47aa700390ea5cf1862a6852bd27d103ba2cac41a7d6ec7
       - name: hello-world-manifests
         type: blob
         version: ${VERSION}
