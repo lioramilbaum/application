@@ -133,7 +133,7 @@ To verify only the GPG signature, pass `--signature gpg`. OCM 0.19.1 applies eve
 | `sha512-signature` | signer key, `hashAlgorithm: SHA-512` | signer public key | ok | ok | - |
 | `default-verifier` | signer key | GPG credentials without a `verifier` entry | ok | fail | `media-type` |
 
-The `concatenated-keyring` row shows that a full keyring (all keys readable) verifies in OCM 0.21.0. `pinned-subkey` works in OCM ≥ v0.21.0-rc.1 (#3858), which added support for pinning signing subkey fingerprints.
+The `concatenated-keyring` row shows that a full keyring (all keys readable) verifies in OCM 0.21.0. `pinned-subkey` works in OCM ≥ v0.21.0-rc.1 (#3858), which added support for pinning signing subkey fingerprints. OCM 0.21.0 (#3691) changed GPG signing to invoke the system `gpg` binary instead of a pure-Go implementation; the `default-verifier` scenario fails with `media-type` because a credentials-only GPG entry no longer acts as a catch-all verifier.
 
 ### Own keys
 

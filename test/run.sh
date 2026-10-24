@@ -1532,12 +1532,9 @@ test_renovate_groups_flux_updates() {
   echo "$flux_managers" | jq -e '[.[].managerFilePatterns[] | test("controller")] | any' > /dev/null \
     || { echo "  no Flux manager targets controller.sh" >&2; return 1; }
 
-  # Exactly one packageRule groups fluxcd/flux2
-  local flux_rules; flux_rules=$(jq '[.packageRules[] | select((.matchDepNames // []) | index("fluxcd/flux2"))]' "$ROOT/renovate.json")
-  local rule_count; rule_count=$(echo "$flux_rules" | jq 'length')
-  [[ "$rule_count" -eq 1 ]] || { echo "  expected 1 packageRule for flux, got $rule_count" >&2; return 1; }
-  local gname; gname=$(echo "$flux_rules" | jq -r '.[0].groupName')
-  [[ -n "$gname" && "$gname" != "null" ]] || { echo "  flux packageRule missing groupName" >&2; return 1; }
+  # group:all ensures all updates, including both Flux managers, land in one PR
+  jq -e '(.extends // []) | index("group:all") != null' "$ROOT/renovate.json" > /dev/null \
+    || { echo "  group:all not in extends — Flux updates will not be grouped" >&2; return 1; }
 
   # The two Flux captures must agree (Dockerfile == controller.sh)
   local re_df; re_df=$(_renovate_manager "Dockerfile" "fluxcd/flux2") || return 1
@@ -1552,16 +1549,13 @@ test_renovate_groups_flux_updates() {
 test_renovate_ocm_cli_rule_scoped() {
   local tmp="$1"
 
-  # OCM CLI packageRule must be scoped to the Dockerfile so chart bumps in controller.sh are not grouped with it
-  local ocm_rule; ocm_rule=$(jq '[.packageRules[] | select(.matchDepNames | index("open-component-model/open-component-model"))] | .[0]' "$ROOT/renovate.json")
-  [[ "$ocm_rule" != "null" && -n "$ocm_rule" ]] || { echo "  OCM CLI packageRule not found" >&2; return 1; }
-  local mfn; mfn=$(echo "$ocm_rule" | jq -r '.matchFileNames // empty')
-  [[ -n "$mfn" ]] || { echo "  OCM CLI packageRule missing matchFileNames — chart bumps will be grouped with CLI" >&2; return 1; }
-  echo "$ocm_rule" | jq -e '.matchFileNames | any(test("Dockerfile"))' > /dev/null \
-    || { echo "  OCM CLI packageRule matchFileNames does not include Dockerfile" >&2; return 1; }
-  if echo "$ocm_rule" | jq -e '.matchFileNames | any(test("controller\\.sh"))' > /dev/null; then
-    echo "  OCM CLI packageRule matchFileNames should not match controller.sh" >&2; return 1
-  fi
+  # The controller chart manager in controller.sh must use a different depName from the OCM CLI
+  # managers in Dockerfile, so chart and CLI updates are tracked as distinct dependencies.
+  local chart_depname; chart_depname=$(jq -r '[.customManagers[] | select((.managerFilePatterns // []) | any(test("controller"))) | select((.matchStrings // []) | any(test("OCM_CONTROLLER_CHART_VERSION")))] | .[0].depNameTemplate' "$ROOT/renovate.json")
+  local cli_depname; cli_depname=$(jq -r '[.customManagers[] | select((.managerFilePatterns // []) | any(test("Dockerfile"))) | select((.matchStrings // []) | any(test("OCM_CLI_VERSION")))] | .[0].depNameTemplate' "$ROOT/renovate.json")
+  [[ -n "$chart_depname" && "$chart_depname" != "null" ]] || { echo "  OCM controller chart manager not found in controller.sh" >&2; return 1; }
+  [[ -n "$cli_depname" && "$cli_depname" != "null" ]] || { echo "  OCM CLI manager not found in Dockerfile" >&2; return 1; }
+  [[ "$chart_depname" != "$cli_depname" ]] || { echo "  OCM CLI and chart share depName '$cli_depname' — they cannot be tracked independently" >&2; return 1; }
 }
 
 test_renovate_updates_ocm_sha256() {
@@ -1595,11 +1589,8 @@ test_renovate_updates_ocm_sha256() {
       | length == 3 and all(range(1; $s | length); $s[.][0] >= $s[. - 1][1])
     ' "$df" > /dev/null || die "OCM Renovate matches overlap or are missing"
   fi
-  jq -e '
-    [ .packageRules[]?
-      | select((.matchDepNames // []) | index("open-component-model/open-component-model"))
-      | .groupName // empty ] | length == 1
-  ' "$rv" > /dev/null || die "OCM dependencies are not grouped into one PR"
+  jq -e '(.extends // []) | index("group:all") != null' "$rv" > /dev/null \
+    || die "OCM dependencies are not grouped into one PR"
 }
 
 test_e2e_workflow_isolates_deploy() {
@@ -7124,9 +7115,12 @@ test_controller_sh_installs_stack() {
   _stub_controller_tools "$tmp"
   PATH="$tmp:$PATH" HELM="$tmp/helm" FLUX="$tmp/flux" KUBECTL="$tmp/kubectl" \
     bash "$ROOT/scripts/controller.sh" install || return 1
-  grep -q "upgrade --install ocm-k8s-toolkit oci://ghcr.io/open-component-model/kubernetes/controller/chart --version 0.19.1 --namespace ocm-k8s-toolkit-system" "$tmp/helm.log" || return 1
-  grep -q "upgrade --install kro oci://registry.k8s.io/kro/charts/kro --version v0.9.4 --namespace kro-system" "$tmp/helm.log" || return 1
-  grep -q "install --version v2.9.6" "$tmp/flux.log" || return 1
+  local ocm_ver; ocm_ver=$(sed -n 's/^OCM_CONTROLLER_CHART_VERSION="\([^"]*\)"/\1/p' "$ROOT/scripts/controller.sh")
+  local kro_ver; kro_ver=$(sed -n 's/^KRO_CHART_VERSION="\([^"]*\)"/\1/p' "$ROOT/scripts/controller.sh")
+  local flux_ver; flux_ver=$(sed -n 's/^FLUX_VERSION="\([^"]*\)"/\1/p' "$ROOT/scripts/controller.sh")
+  grep -q "upgrade --install ocm-k8s-toolkit oci://ghcr.io/open-component-model/kubernetes/controller/chart --version $ocm_ver --namespace ocm-k8s-toolkit-system" "$tmp/helm.log" || return 1
+  grep -q "upgrade --install kro oci://registry.k8s.io/kro/charts/kro --version $kro_ver --namespace kro-system" "$tmp/helm.log" || return 1
+  grep -q "install --version $flux_ver" "$tmp/flux.log" || return 1
 }
 
 test_controller_sh_applies_bootstrap_and_checks_app() {
