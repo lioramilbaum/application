@@ -18,6 +18,10 @@ REGISTRY_DEMO_CTF="${REGISTRY_DEMO_CTF:-$BUILD_DIR/registry-ctf}"
 REGISTRY_DEMO_OUT="${REGISTRY_DEMO_OUT:-$BUILD_DIR/registry}"
 REGISTRY_REPO="oci::http://${REGISTRY_HOST}:${REGISTRY_PORT}/${REGISTRY_PATH}"
 REGISTRY_DEMO_CONSTRUCTOR="$REGISTRY_DEMO_OUT/component-constructor.yaml"
+REGISTRY_LAYER_COMPONENT="github.com/lioramilbaum/registry-layer-demo"
+REGISTRY_LAYER_REPO="${REGISTRY_PATH}/layers/release-notes"
+REGISTRY_LAYER_CTF="${REGISTRY_LAYER_CTF:-$BUILD_DIR/registry-layer-ctf}"
+REGISTRY_LAYER_CONSTRUCTOR="$REGISTRY_DEMO_OUT/layer-constructor.yaml"
 
 _docker_available() {
   command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1
@@ -162,10 +166,146 @@ _show() {
 
 mkdir -p "$REGISTRY_DEMO_OUT"
 
-# TODO: extend with an OCIImageLayer/v1 (ociBlob) sub-demo once OCM >= v0.21.0 is used.
-# OCIImageLayer/v1 references a single OCI layer blob by digest in a registry.
-# ocm add cv fails with "unsupported access type OCIImageLayer/v1: expected OCI image" in 0.19.1.
-# Fixed in upstream PR #3215 (commit cbba70f), released in v0.21.0-rc.1.
+# _blob_push <repo> <file> <digest> — upload a blob with the OCI distribution API
+_blob_push() {
+  local repo="$1" file="$2" digest="$3" base location sep
+  base="http://$REGISTRY_HOST:$REGISTRY_PORT"
+  location="$(curl -fsS -o /dev/null -D - -X POST "$base/v2/$repo/blobs/uploads/" \
+    | tr -d '\r' | awk -F': ' 'tolower($1)=="location"{print $2}')"
+  [[ -n "$location" ]] || die "registry returned no upload location for $repo"
+  case "$location" in
+    /*) location="$base$location" ;;
+  esac
+  sep='?'
+  [[ "$location" != *\?* ]] || sep='&'
+  curl -fsS -o /dev/null -X PUT -H 'Content-Type: application/octet-stream' \
+    --data-binary "@$file" "${location}${sep}digest=$digest"
+}
+
+# _layer_push — push the config and layer blobs and an image manifest; prints the layer digest
+_layer_push() {
+  local dir="$REGISTRY_DEMO_OUT/layer" base layer_size cfg_size layer_digest cfg_digest
+  base="http://$REGISTRY_HOST:$REGISTRY_PORT"
+  mkdir -p "$dir"
+  printf 'github.com/lioramilbaum/registry-demo %s (layer)\n' "$VERSION" > "$dir/release-notes.txt"
+  printf '{}' > "$dir/config.json"
+  layer_digest="sha256:$(sha256 "$dir/release-notes.txt")"
+  layer_size="$(wc -c < "$dir/release-notes.txt" | tr -d ' ')"
+  cfg_digest="sha256:$(sha256 "$dir/config.json")"
+  cfg_size="$(wc -c < "$dir/config.json" | tr -d ' ')"
+
+  _blob_push "$REGISTRY_LAYER_REPO" "$dir/config.json" "$cfg_digest"
+  _blob_push "$REGISTRY_LAYER_REPO" "$dir/release-notes.txt" "$layer_digest"
+
+  # Without a manifest the repository has no tags, so it would not look like an image repository.
+  jq -n --arg cd "$cfg_digest" --argjson cs "$cfg_size" --arg ld "$layer_digest" --argjson ls "$layer_size" '{
+    schemaVersion: 2,
+    mediaType: "application/vnd.oci.image.manifest.v1+json",
+    config: {mediaType: "application/vnd.oci.empty.v1+json", digest: $cd, size: $cs},
+    layers: [{mediaType: "text/plain", digest: $ld, size: $ls}]
+  }' > "$dir/manifest.json"
+  curl -fsS -o /dev/null -X PUT -H 'Content-Type: application/vnd.oci.image.manifest.v1+json' \
+    --data-binary "@$dir/manifest.json" "$base/v2/$REGISTRY_LAYER_REPO/manifests/$VERSION"
+
+  echo "$layer_digest"
+}
+
+_layer_ctf_ref() {
+  echo "ctf::${REGISTRY_LAYER_CTF}//${REGISTRY_LAYER_COMPONENT}:${VERSION}"
+}
+
+_write_layer_constructor() {
+  cat > "$REGISTRY_LAYER_CONSTRUCTOR" <<'REGISTRY_LAYER_CONSTRUCTOR_EOF'
+# Layer demo: the resource references one OCI layer blob by digest; OCM fills in size.
+name: github.com/lioramilbaum/registry-layer-demo
+version: ${VERSION}
+provider:
+  name: github.com/lioramilbaum
+resources:
+  - name: release-notes-layer
+    type: blob
+    version: ${VERSION}
+    access:
+      type: OCIImageLayer/v1
+      ref: ${REGISTRY_LAYER_REF}
+      mediaType: text/plain
+      digest: ${REGISTRY_LAYER_DIGEST}
+REGISTRY_LAYER_CONSTRUCTOR_EOF
+}
+
+_layer() {
+  _wait_ready
+  REGISTRY_LAYER_DIGEST="$(_layer_push)"
+  export REGISTRY_LAYER_DIGEST
+  export REGISTRY_LAYER_REF="http://$REGISTRY_HOST:$REGISTRY_PORT/$REGISTRY_LAYER_REPO"
+  local layer_size
+  layer_size="$(wc -c < "$REGISTRY_DEMO_OUT/layer/release-notes.txt" | tr -d ' ')"
+
+  rm -rf "${REGISTRY_LAYER_CTF:?}"
+  _write_layer_constructor
+  "$OCM" add cv \
+    --repository "ctf::$REGISTRY_LAYER_CTF" \
+    --constructor "$REGISTRY_LAYER_CONSTRUCTOR" \
+    --config "$BUILD_DIR/verify.ocmconfig" </dev/null >/dev/null
+  "$OCM" sign cv --config "$BUILD_DIR/sign.ocmconfig" --signature default \
+    "$(_layer_ctf_ref)" </dev/null >/dev/null
+  "$OCM" verify cv --config "$BUILD_DIR/verify.ocmconfig" "$(_layer_ctf_ref)" </dev/null >/dev/null
+
+  # Download the layer and check its bytes against the descriptor digest.
+  local out desc_json desc_digest actual_digest acc_type acc_digest acc_size
+  out="$REGISTRY_DEMO_OUT/layer-download"
+  rm -rf "${out:?}"
+  mkdir -p "$out"
+  "$OCM" download resource \
+    --identity name=release-notes-layer \
+    --output "$out/release-notes-layer" \
+    "$(_layer_ctf_ref)" </dev/null >/dev/null
+  desc_json="$("$OCM" get cv "$(_layer_ctf_ref)" -o json </dev/null \
+    | jq -c '.[0].component.resources[] | select(.name=="release-notes-layer")')"
+  desc_digest="$(jq -r '.digest.value' <<<"$desc_json")"
+  actual_digest="$(sha256 "$out/release-notes-layer")"
+  [[ "$desc_digest" == "$actual_digest" ]] || die "digest mismatch: expected $desc_digest got $actual_digest"
+  acc_type="$(jq -r '.access.type' <<<"$desc_json")"
+  acc_digest="$(jq -r '.access.digest' <<<"$desc_json")"
+  acc_size="$(jq -r '.access.size' <<<"$desc_json")"
+
+  # Copy into a CTF with the localblob uploader, which inlines the layer as LocalBlob/v1.
+  local cfg="$REGISTRY_DEMO_OUT/layer-transfer.ocmconfig" copied="$REGISTRY_DEMO_OUT/layer-copied-ctf"
+  cat > "$cfg" <<'EOF'
+type: generic.config.ocm.software/v1
+configurations:
+  - type: localblob.uploader.transfer.config.ocm.software/v1alpha1
+    match: resource.access.isType("OCIImageLayer")
+EOF
+  rm -rf "${copied:?}"
+  "$OCM" --config "$cfg" transfer cv "$(_layer_ctf_ref)" "ctf::$copied" </dev/null >/dev/null
+  "$OCM" verify cv --config "$BUILD_DIR/verify.ocmconfig" --signature default \
+    "ctf::$copied//$REGISTRY_LAYER_COMPONENT:$VERSION" </dev/null >/dev/null
+  local copied_type
+  copied_type="$("$OCM" get cv "ctf::$copied//$REGISTRY_LAYER_COMPONENT:$VERSION" -o json </dev/null \
+    | jq -r '.[0].component.resources[] | select(.name=="release-notes-layer") | .access.type')"
+
+  # A digest the registry does not hold must fail to resolve.
+  local fake err_file reason
+  fake="sha256:$(printf '0%.0s' {1..64})"
+  err_file="$(mktemp)"
+  rm -rf "${REGISTRY_DEMO_OUT:?}/layer-missing-ctf"
+  if REGISTRY_LAYER_DIGEST="$fake" "$OCM" add cv \
+      --repository "ctf::$REGISTRY_DEMO_OUT/layer-missing-ctf" \
+      --constructor "$REGISTRY_LAYER_CONSTRUCTOR" \
+      --config "$BUILD_DIR/verify.ocmconfig" </dev/null >/dev/null 2>"$err_file"; then
+    rm -f "$err_file"
+    die "ocm add cv accepted a layer digest the registry does not hold"
+  fi
+  if grep -q 'does not exist' "$err_file"; then reason=not-found; else reason=error; fi
+  rm -f "$err_file"
+
+  printf 'layer\t%s\t%s\t%s\n' "$REGISTRY_LAYER_REPO" "$REGISTRY_LAYER_DIGEST" "$layer_size"
+  printf 'resource\trelease-notes-layer\t%s\t%s\t%s\n' "$acc_type" "$acc_digest" "$acc_size"
+  printf 'download\trelease-notes-layer\tok\n'
+  printf 'copied\trelease-notes-layer\t%s\n' "$copied_type"
+  printf 'missing-layer\trelease-notes-layer\t%s\n' "$reason"
+}
 
 case "${1:-}" in
   start)   _start ;;
@@ -176,5 +316,6 @@ case "${1:-}" in
   verify)  _verify ;;
   pull)    _pull ;;
   show)    _show ;;
-  *)       _require_docker; _start >/dev/null; _build; _push >/dev/null; _sign; _verify >/dev/null; _pull >/dev/null; _show ;;
+  layer)   _layer ;;
+  *)       _require_docker; _start >/dev/null; _build; _push >/dev/null; _sign; _verify >/dev/null; _pull >/dev/null; _layer >/dev/null; _show ;;
 esac

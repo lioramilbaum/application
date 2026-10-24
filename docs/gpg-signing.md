@@ -149,6 +149,68 @@ Setting only one of them fails. The primary fingerprint is read from the secret 
 
 The signature is stored in the descriptor, so `ocm transfer cv` carries it to the target, and the copy verifies with the same `verify.ocmconfig`. See [Transfer and transport](transfer.md#transfer-and-transport).
 
+### Trusted timestamps (RFC 3161)
+
+`bash scripts/gpg.sh timestamp` signs a copy of the demo component with a timestamp from a local RFC 3161 time-stamp authority (TSA), stops the TSA, and verifies the stored token three ways. It needs OCM ≥ 0.21.0 (open-component-model#3636), `python3` and `openssl`.
+
+OCM 0.21.0 adds `--tsa` and `--tsa-url` to `ocm sign cv`. The demo passes `--tsa-url` with the local TSA:
+
+```sh
+ocm sign cv --config build/gpg/sign.ocmconfig --signature gpg \
+  --tsa-url http://127.0.0.1:18461/ ctf::build/gpg/timestamp-ctf//github.com/lioramilbaum/gpg-demo:0.1.0
+```
+
+The TSA is `scripts/tsa-server.py`, a stdlib-only HTTP server bound to `127.0.0.1:18461` (override with `GPG_TSA_PORT`). It answers each request with `openssl ts -reply`. Every run regenerates its certificates in `build/gpg/tsa/`:
+
+- `root.crt`: the TSA root certificate
+- `tsa.crt`: the TSA certificate, issued by the root with `extendedKeyUsage=critical,timeStamping`
+- `rogue-root.crt`: an unrelated root certificate, used as a negative check
+- `tsa.cnf`: the `openssl ts` configuration, with sha256 digests and policy `1.2.3.4.1`
+- `tsa.log`: one line per request the TSA received
+
+The token is stored in the GPG signature's `timestamp` field, which holds the token (`-----BEGIN TIMESTAMP TOKEN-----`) and its time. The TSA URL is stored as the component label `url.tsa.ocm.software/gpg`. Because the token is part of the descriptor, the copy verifies after the TSA has stopped.
+
+Verification needs the TSA root in a `TSA/v1alpha1` consumer. `build/gpg/verify-tsa.ocmconfig` holds that consumer next to the GPG verifier:
+
+```yaml
+type: generic.config.ocm.software/v1
+configurations:
+  - type: credentials.config.ocm.software
+    consumers:
+      - identity:
+          type: GPG/v1alpha1
+          signature: gpg
+        credentials:
+          - type: GPGCredentials/v1alpha1
+            publicKeyPGPFile: /abs/path/build/gpg/keys/signer.pub.asc
+      - identity:
+          type: TSA/v1alpha1
+        credentials:
+          - type: TSACredentials/v1alpha1
+            rootCertsPEMFile: /abs/path/build/gpg/tsa/root.crt
+  - type: signing.config.ocm.software/v1alpha1
+    verifier:
+      type: GPGSigningConfiguration/v1alpha1
+      signature: gpg
+```
+
+The script prints one row per check:
+
+```text
+timestamp	gpg	<time>	http://127.0.0.1:18461/
+verify	no-tsa-root	ok	untrusted
+verify	tsa-root	ok	trusted
+verify	rogue-tsa-root	fail	tsa-untrusted
+```
+
+The trust levels are:
+
+- `trusted`: the token chains to the root in `rootCertsPEMFile`, so OCM reports `trusted=true`.
+- `untrusted`: the signature verifies, but no TSA root is configured, so the signing time is not trusted (`trusted=false`).
+- `tsa-untrusted`: the token does not chain to the configured root (the rogue root), so verification fails.
+
+Sigstore limitation: this demo timestamps only the GPG signature. The `--tsa-url` check does not cover the Sigstore signing path in `scripts/sigstore.sh`.
+
 ### Limitations
 
 - Expiry and revocation are checked at verify time, not at signing time. A signature made while the key was valid fails once it expires (`expired-after-signing`) or is revoked (`revoked-key`).

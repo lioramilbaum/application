@@ -79,6 +79,62 @@ build/registry/download/release-notes
 ctf::build/registry/pulled-ctf
 ```
 
+### Image layers (OCIImageLayer/v1)
+
+`bash scripts/registry.sh layer` references a single OCI layer blob in the registry from a component, without copying its bytes into the component. It needs OCM ≥ 0.21.0 (#3215). `make registry` runs it after the pull step.
+
+The script pushes a small image to the repository `ocm/layers/release-notes`:
+
+- the layer `build/registry/layer/release-notes.txt`, media type `text/plain`
+- an empty config blob `{}`, media type `application/vnd.oci.empty.v1+json`
+- an OCI image manifest at tag `0.1.0` that lists the layer
+
+The manifest is pushed alongside the blob. A repository that holds only blobs has no tags, so the manifest makes it an ordinary image repository that tools can list and inspect.
+
+The layer constructor, `build/registry/layer-constructor.yaml`:
+
+```yaml
+# Layer demo: the resource references one OCI layer blob by digest; OCM fills in size.
+name: github.com/lioramilbaum/registry-layer-demo
+version: ${VERSION}
+provider:
+  name: github.com/lioramilbaum
+resources:
+  - name: release-notes-layer
+    type: blob
+    version: ${VERSION}
+    access:
+      type: OCIImageLayer/v1
+      ref: ${REGISTRY_LAYER_REF}
+      mediaType: text/plain
+      digest: ${REGISTRY_LAYER_DIGEST}
+```
+
+- `ref` is the repository without a tag, `http://127.0.0.1:PORT/ocm/layers/release-notes`. The `http://` scheme is required for the local registry, which serves plain HTTP. The layer is addressed by `digest`, so no tag is needed.
+- `size` is not set. OCM reads the layer when the component is added and fills in the size.
+- OCM also accepts the legacy alias `ociBlob/v1` for `OCIImageLayer/v1`. This demo uses the canonical name.
+
+`scripts/registry.sh` exports `REGISTRY_LAYER_REF` and `REGISTRY_LAYER_DIGEST` and runs `ocm add cv` with this constructor. The command then signs, verifies and downloads the layer, and checks its sha256 against the descriptor digest. The output is one tab-separated row per step:
+
+```text
+layer	ocm/layers/release-notes	sha256:<hex>	<size>
+resource	release-notes-layer	OCIImageLayer/v1	sha256:<hex>	<size>
+download	release-notes-layer	ok
+copied	release-notes-layer	LocalBlob/v1
+missing-layer	release-notes-layer	not-found
+```
+
+The copy uses the `localblob` uploader, which stores the layer inside the target CTF as `LocalBlob/v1` and keeps the digest as its `localReference`. The copy no longer needs the registry:
+
+```yaml
+type: generic.config.ocm.software/v1
+configurations:
+  - type: localblob.uploader.transfer.config.ocm.software/v1alpha1
+    match: resource.access.isType("OCIImageLayer")
+```
+
+If `REGISTRY_LAYER_DIGEST` names a digest that the registry does not hold, `ocm add cv` fails with `does not exist`. The script reports that failure as `missing-layer … not-found`.
+
 ### Cleanup
 
 `bash scripts/registry.sh stop` removes the container and the registry data. The next `start` begins with an empty registry.

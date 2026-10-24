@@ -242,6 +242,7 @@ _stub_ocm_record() {
   cat > "$dir/stub-bin/ocm" <<'EOF'
 #!/usr/bin/env bash
 printf '%s\n' "$*" >> "$(dirname "$0")/../ocm-args.log"
+printf 'OCM_CONFIG=%s\n' "${OCM_CONFIG:-}" >> "$(dirname "$0")/../ocm-env.log"
 cat >> "$(dirname "$0")/../ocm-stdin.log"
 EOF
   chmod 0755 "$dir/stub-bin/ocm"
@@ -1645,7 +1646,7 @@ _run_publish_stubbed() {
   local tmp="$1"
   shift
   _stub_ocm_record "$tmp"
-  env -u OCM_REGISTRY_USERNAME -u OCM_REGISTRY_PASSWORD -u OCM_REGISTRY_HOST \
+  env -u OCM_REGISTRY_USERNAME -u OCM_REGISTRY_PASSWORD -u OCM_REGISTRY_HOST -u OCM_CONFIG \
     OCM=ocm PATH="$tmp/stub-bin:$PATH" OCM_REPO=oci://ghcr.io/example/ocm "$@" \
     bash "$ROOT/scripts/publish.sh" < /dev/null
 }
@@ -1941,8 +1942,9 @@ test_readme_documents_resource_access_types() {
   assert_contains "$section" "OCIImage/v1" || return 1
   assert_contains "$section" "LocalBlob/v1" || return 1
   assert_contains "$section" "GitHub/v1" || return 1
-  assert_contains "$section" "--copy-resources" || return 1
-  assert_contains "$section" "--upload-as ociArtifact" || return 1
+  assert_contains "$section" "uploaders.ocmconfig" || return 1
+  assert_contains "$section" "oci.uploader.transfer.config.ocm.software/v1alpha1" || return 1
+  assert_contains "$section" "deprecated" || return 1
 }
 
 test_publish_copies_resources_as_oci_artifacts() {
@@ -1953,9 +1955,44 @@ test_publish_copies_resources_as_oci_artifacts() {
 
   for mode in cred disc; do
     args="$(cat "$tmp/$mode/ocm-args.log")"
-    assert_contains "$args" "--copy-resources" || { echo "  $mode mode: --copy-resources missing" >&2; return 1; }
-    assert_contains "$args" "--upload-as ociArtifact" || { echo "  $mode mode: --upload-as ociArtifact missing" >&2; return 1; }
+    assert_not_contains "$args" "--copy-resources" || { echo "  $mode mode: --copy-resources must not be passed" >&2; return 1; }
+    assert_not_contains "$args" "--upload-as" || { echo "  $mode mode: --upload-as must not be passed" >&2; return 1; }
   done
+
+  # Credential mode: the uploader config is the last argument, after any TRANSFER_CONFIG.
+  args="$(cat "$tmp/cred/ocm-args.log")"
+  [[ "$args" == *" --config $ROOT/uploaders.ocmconfig" ]] || {
+    echo "  credential mode: args must end with --config $ROOT/uploaders.ocmconfig: $args" >&2
+    return 1
+  }
+
+  # Discovery mode: no --config flag; OCM_CONFIG carries the uploader config and ~/.ocmconfig still merges.
+  args="$(cat "$tmp/disc/ocm-args.log")"
+  assert_not_contains "$args" "--config" || { echo "  discovery mode: --config must not be passed" >&2; return 1; }
+  grep -qxF "OCM_CONFIG=$ROOT/uploaders.ocmconfig" "$tmp/disc/ocm-env.log" || {
+    echo "  discovery mode: ocm-env.log does not show OCM_CONFIG=$ROOT/uploaders.ocmconfig" >&2
+    return 1
+  }
+}
+
+test_publish_uploaders_match_deprecated_flags() {
+  local tmp="$1" home="$1/home" ours expected
+  mkdir -p "$home"
+  _build
+
+  # publish.sh in discovery mode with the real ocm and a hermetic HOME must plan the same transfer
+  # as the deprecated flags did.
+  env -u OCM_REGISTRY_USERNAME -u OCM_REGISTRY_PASSWORD -u OCM_CONFIG -u XDG_CONFIG_HOME \
+    HOME="$home" OCM="$OCM" TRANSFER_PLAN=1 OCM_REPO="oci::http://localhost:5001" \
+    TRANSFER_PLAN_FILE="$tmp/publish-plan.json" \
+    bash "$ROOT/scripts/publish.sh" </dev/null >/dev/null 2>&1 || {
+    echo "  publish.sh TRANSFER_PLAN=1 failed" >&2
+    return 1
+  }
+  ours="$(jq -S . "$tmp/publish-plan.json")" || return 1
+
+  expected="$( (export HOME="$home"; unset XDG_CONFIG_HOME OCM_CONFIG; _transfer_plan "oci::http://localhost:5001" --recursive --copy-resources --upload-as ociArtifact) | jq -S . )" || return 1
+  assert_eq "$ours" "$expected" "publish uploaders plan equals deprecated flags plan"
 }
 
 test_transfer_without_copy_resources_keeps_external_reference() {
@@ -5148,6 +5185,54 @@ test_gpg_show_reports_key() {
   assert_contains "$out" $'signed-by\t'
 }
 
+# Port 18462 keeps the tests off the demo's default TSA port (18461).
+_gpg_tsa_env() {
+  export GPG_TSA_PORT=18462
+}
+
+test_gpg_timestamp_rfc3161() {
+  local tmp="$1" out ref desc label
+  _gpg_env "$tmp"
+  _gpg_tsa_env
+  _build_gpg "$tmp" >/dev/null 2>&1 || return 1
+  out="$(bash "$ROOT/scripts/gpg.sh" timestamp 2>"$tmp/timestamp.err")" || { cat "$tmp/timestamp.err" >&2; return 1; }
+  assert_contains "$out" $'verify\tno-tsa-root\tok\tuntrusted' || return 1
+  assert_contains "$out" $'verify\ttsa-root\tok\ttrusted' || return 1
+  assert_contains "$out" $'verify\trogue-tsa-root\tfail\ttsa-untrusted' || return 1
+
+  ref="$(_gpg_ref "$tmp/gpg/timestamp-ctf")"
+  desc="$("$OCM" get cv "$ref" -o json </dev/null | jq -c '.[0].signatures[]? | select(.name=="gpg")')" || return 1
+  [[ "$(jq -r '.timestamp.value // ""' <<<"$desc")" == "-----BEGIN TIMESTAMP TOKEN-----"* ]] || {
+    echo "  gpg signature has no RFC 3161 token" >&2
+    return 1
+  }
+  [[ -n "$(jq -r '.timestamp.time // empty' <<<"$desc")" ]] || { echo "  gpg signature has no timestamp time" >&2; return 1; }
+
+  label="$("$OCM" get cv "$ref" -o json </dev/null \
+    | jq -r '.[0].component.labels[]? | select(.name=="url.tsa.ocm.software/gpg") | .value')" || return 1
+  assert_eq "$label" "http://127.0.0.1:18462/" "TSA label" || return 1
+
+  assert_contains "$(cat "$tmp/gpg/tsa/tsa.log")" "POST / application/timestamp-query" "TSA received the query"
+}
+
+test_gpg_timestamp_survives_transfer() {
+  local tmp="$1" err
+  _gpg_env "$tmp"
+  _gpg_tsa_env
+  bash "$ROOT/scripts/gpg.sh" timestamp >/dev/null 2>&1 || return 1
+  # The timestamp script stops the TSA; the copy must verify with it stopped.
+  assert_fails curl -fsS -o /dev/null --max-time 2 "http://127.0.0.1:18462/-/ready" || return 1
+
+  "$OCM" transfer cv --config "$tmp/gpg/verify-tsa.ocmconfig" \
+    "$(_gpg_ref "$tmp/gpg/timestamp-ctf")" "ctf::$tmp/gpg-timestamp-transferred" </dev/null >/dev/null 2>&1 || return 1
+  err="$("$OCM" verify cv --config "$tmp/gpg/verify-tsa.ocmconfig" --signature gpg \
+    "$(_gpg_ref "$tmp/gpg-timestamp-transferred")" </dev/null 2>&1 >/dev/null)" || {
+    echo "  transferred copy does not verify with the TSA root" >&2
+    return 1
+  }
+  assert_contains "$err" "trusted=true" "transferred copy is trusted"
+}
+
 test_make_gpg_target() {
   local dry_run help_out
   dry_run="$(make -s --dry-run -C "$ROOT" gpg 2>/dev/null)"
@@ -5778,6 +5863,7 @@ _docker_available() { command -v docker >/dev/null 2>&1 && docker info >/dev/nul
 _registry_env() {
   export REGISTRY_DEMO_CTF="$1/registry-ctf" \
          REGISTRY_DEMO_OUT="$1/registry" \
+         REGISTRY_LAYER_CTF="$1/registry-layer-ctf" \
          OCM="$REGISTRY_OCM" \
          REGISTRY_NAME=ocm-demo-registry-test \
          REGISTRY_HOST=127.0.0.1 \
@@ -6030,6 +6116,51 @@ test_registry_oci_url_format() {
   fi
 }
 
+_registry_layer_ctf_ref() {
+  echo "ctf::${REGISTRY_LAYER_CTF}//github.com/lioramilbaum/registry-layer-demo:${VERSION:-0.1.0}"
+}
+
+test_registry_layer_resolves_blob_by_digest() {
+  local tmp="$1" out digest want desc
+  _registry_fresh "$tmp" || return $?
+  out="$(bash "$ROOT/scripts/registry.sh" layer 2>"$tmp/layer.err")" || { cat "$tmp/layer.err" >&2; return 1; }
+
+  digest="$(awk -F'\t' '$1=="layer"{print $3}' <<<"$out")"
+  want="sha256:$(shasum -a 256 "$REGISTRY_DEMO_OUT/layer/release-notes.txt" | cut -d' ' -f1)"
+  assert_eq "$digest" "$want" "layer row digest" || return 1
+
+  desc="$("$OCM" get cv "$(_registry_layer_ctf_ref)" -o json </dev/null \
+    | jq -c '.[0].component.resources[] | select(.name=="release-notes-layer")')" || return 1
+  assert_eq "$(jq -r '.access.type' <<<"$desc")" "OCIImageLayer/v1" "access type" || return 1
+  assert_eq "$(jq -r '.access.digest' <<<"$desc")" "sha256:$(jq -r '.digest.value' <<<"$desc")" "access digest" || return 1
+  [[ "$(jq -r '.access.size // empty' <<<"$desc")" =~ ^[0-9]+$ ]] || { echo "  access.size is not set" >&2; return 1; }
+  assert_eq "$(jq -r '.digest.normalisationAlgorithm' <<<"$desc")" "genericBlobDigest/v1" "digest algorithm" || return 1
+  assert_contains "$out" $'missing-layer\trelease-notes-layer\tnot-found' "missing digest row"
+}
+
+test_registry_layer_copy_becomes_local_blob() {
+  local tmp="$1" out layer_digest copied access content
+  _registry_fresh "$tmp" || return $?
+  out="$(bash "$ROOT/scripts/registry.sh" layer 2>"$tmp/layer.err")" || { cat "$tmp/layer.err" >&2; return 1; }
+  layer_digest="$(awk -F'\t' '$1=="layer"{print $3}' <<<"$out")"
+  copied="ctf::$REGISTRY_DEMO_OUT/layer-copied-ctf//github.com/lioramilbaum/registry-layer-demo:${VERSION:-0.1.0}"
+
+  access="$("$OCM" get cv "$copied" -o json </dev/null \
+    | jq -c '.[0].component.resources[] | select(.name=="release-notes-layer") | .access')" || return 1
+  assert_eq "$(jq -r '.type' <<<"$access")" "LocalBlob/v1" "copied access type" || return 1
+  assert_eq "$(jq -r '.localReference' <<<"$access")" "$layer_digest" "localReference is the layer digest" || return 1
+
+  "$OCM" verify cv --config "$BUILD_DIR/verify.ocmconfig" --signature default "$copied" </dev/null >/dev/null 2>&1 || {
+    echo "  copied layer CTF does not verify" >&2
+    return 1
+  }
+
+  "$OCM" download resource --identity name=release-notes-layer \
+    --output "$tmp/copied-release-notes" "$copied" </dev/null >/dev/null 2>&1 || return 1
+  content="$(cat "$tmp/copied-release-notes")"
+  assert_eq "$content" "github.com/lioramilbaum/registry-demo ${VERSION:-0.1.0} (layer)" "downloaded layer content"
+}
+
 test_make_registry_target() {
   local dry_run help_out
   dry_run="$(make -s --dry-run -C "$ROOT" registry 2>/dev/null)" || return 1
@@ -6058,6 +6189,11 @@ test_readme_documents_local_oci_registry() {
     "make registry"
     "scripts/registry.sh stop"
     "already exists"
+    "OCIImageLayer/v1"
+    "ociBlob/v1"
+    "scripts/registry.sh layer"
+    "#3215"
+    "localblob.uploader.transfer.config.ocm.software/v1alpha1"
     "#credential-system)"
   )
   for check in "${checks[@]}"; do
@@ -6069,6 +6205,15 @@ test_readme_documents_local_oci_registry() {
   constructor_yaml="$(sed -n "/<<'REGISTRY_CONSTRUCTOR_EOF'/,/^REGISTRY_CONSTRUCTOR_EOF\$/p" "$ROOT/scripts/registry.sh" | sed '1d;$d')"
   [[ "$readme_yaml" == "$constructor_yaml" ]] || {
     echo "  README yaml block differs from the constructor in scripts/registry.sh" >&2
+    return 1
+  }
+
+  # Drift guard: the second yaml block (the layer constructor) must match the layer heredoc.
+  readme_yaml="$(awk '/^```yaml/{n++; f=(n==2); next} /^```/{f=0} f' <<<"$section")"
+  constructor_yaml="$(sed -n "/<<'REGISTRY_LAYER_CONSTRUCTOR_EOF'/,/^REGISTRY_LAYER_CONSTRUCTOR_EOF\$/p" "$ROOT/scripts/registry.sh" | sed '1d;$d')"
+  [[ -n "$constructor_yaml" ]] || { echo "  scripts/registry.sh has no REGISTRY_LAYER_CONSTRUCTOR_EOF heredoc" >&2; return 1; }
+  [[ "$readme_yaml" == "$constructor_yaml" ]] || {
+    echo "  README layer yaml block differs from the REGISTRY_LAYER_CONSTRUCTOR_EOF heredoc in scripts/registry.sh" >&2
     return 1
   }
 }
@@ -6681,7 +6826,7 @@ test_s3_glob_star_matches() {
   assert_eq "$(_s3_row glob-star notes)" "ok"
 }
 
-test_s3_doublestar_not_matched() {
+test_s3_glob_doublestar_matches() {
   _s3_docker_available || { echo "  skip: Docker not available"; return 77; }
   _s3_scenarios "$1"
   assert_eq "$(_s3_row glob-doublestar notes)" "ok"
@@ -7343,6 +7488,7 @@ run_test "resolvers honour version constraint and order" test_resolvers_honour_v
 run_test "resource access types" test_resource_access_types
 run_test "readme documents resource access types" test_readme_documents_resource_access_types
 run_test "publish copies resources as OCI artifacts" test_publish_copies_resources_as_oci_artifacts
+run_test "publish uploaders match deprecated flags" test_publish_uploaders_match_deprecated_flags
 run_test "transfer without copy-resources keeps external reference" test_transfer_without_copy_resources_keeps_external_reference
 run_test "transfer copy-resources inlines image as local blob" test_transfer_copy_resources_inlines_image_as_local_blob
 run_test "transfer copy-resources uploads OCI artifact" test_transfer_copy_resources_uploads_oci_artifact
@@ -7498,6 +7644,8 @@ run_test "gpg own keys require both vars" test_gpg_own_keys_require_both_vars
 run_test "gpg own keys use supplied files" test_gpg_own_keys_use_supplied_files
 run_test "gpg show reports key" test_gpg_show_reports_key
 run_test "make gpg target" test_make_gpg_target
+run_test "gpg timestamp rfc3161" test_gpg_timestamp_rfc3161
+run_test "gpg timestamp survives transfer" test_gpg_timestamp_survives_transfer
 run_test "readme documents gpg signing" test_readme_documents_gpg_signing
 run_test "credentials build creates ctf" test_credentials_build_creates_ctf
 run_test "credentials show lists consumer types" test_credentials_show_lists_consumer_types
@@ -7535,6 +7683,8 @@ run_test "registry push idempotent" test_registry_push_idempotent
 run_test "registry transfer preserves resources" test_registry_transfer_preserves_resources
 run_test "registry unsigned verify fails" test_registry_unsigned_verify_fails
 run_test "registry oci url format" test_registry_oci_url_format
+run_test "registry layer resolves blob by digest" test_registry_layer_resolves_blob_by_digest
+run_test "registry layer copy becomes local blob" test_registry_layer_copy_becomes_local_blob
 run_test "make registry target" test_make_registry_target
 run_test "readme documents local oci registry" test_readme_documents_local_oci_registry
 run_test "graph references span three repositories" test_graph_references_span_three_repositories
@@ -7581,7 +7731,7 @@ run_test "s3 pinned version survives overwrite" test_s3_pinned_version_survives_
 run_test "s3 input works offline" test_s3_input_works_offline
 run_test "s3 credentials required" test_s3_credentials_required
 run_test "s3 glob star matches" test_s3_glob_star_matches
-run_test "s3 doublestar not matched" test_s3_doublestar_not_matched
+run_test "s3 glob doublestar matches" test_s3_glob_doublestar_matches
 run_test "s3 transfer copies v2 only" test_s3_transfer_copies_v2_only
 run_test "s3 stop removes container" test_s3_stop_removes_container
 run_test "make s3 target" test_make_s3_target

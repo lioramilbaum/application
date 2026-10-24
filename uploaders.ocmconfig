@@ -1,0 +1,6 @@
+# Replaces deprecated --copy-resources --upload-as ociArtifact flags (deprecated in OCM 0.21.0).
+# Must be loaded last: uploader entries are matched in order and the first match wins.
+type: generic.config.ocm.software/v1
+configurations:
+  - type: oci.uploader.transfer.config.ocm.software/v1alpha1
+  - type: localblob.uploader.transfer.config.ocm.software/v1alpha1

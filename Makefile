@@ -27,7 +27,7 @@ manifests: ## Download and render app manifests from the OCM component
 deploy: build sign ## Deploy the application to the current cluster (requires KUBECONFIG)
 	@bash scripts/deploy.sh
 
-publish: ## Transfer the CTF and copy external resources (--copy-resources) to an OCI registry (requires OCM_REPO=...; optional OCM_REGISTRY_USERNAME/OCM_REGISTRY_PASSWORD)
+publish: ## Transfer the CTF and copy external resources (uploaders.ocmconfig) to an OCI registry (requires OCM_REPO=...; optional OCM_REGISTRY_USERNAME/OCM_REGISTRY_PASSWORD)
 	@bash scripts/publish.sh
 
 transfer-plan: ## Dry-run the publish transfer and write build/transfer-plan.json (requires OCM_REPO=...; optional TRANSFER_CONFIG=transfer.ocmconfig)
@@ -57,7 +57,7 @@ pki: ## Create a demo CA, build, sign (PEM certificate chain) and verify the PKI
 git: ## Create a demo Git repository, build, sign, verify and audit the Git source demo (Git/v1 source, access and input); offline (requires OCM CLI >= 0.19.0, git)
 	@bash scripts/git.sh
 
-gpg: ## Create throwaway GPG keys, build, sign (OpenPGP), verify and download the GPG signing demo (GPG/v1alpha1 signature); offline (requires gpg 2.2 or newer, jq)
+gpg: ## Create throwaway GPG keys, build, sign (OpenPGP), verify and download the GPG signing demo (GPG/v1alpha1 signature); offline (requires gpg 2.2 or newer, jq). The timestamp subcommand (bash scripts/gpg.sh timestamp) signs with an RFC 3161 timestamp from a local TSA and needs OCM >= 0.21.0, python3 and openssl
 	@bash scripts/gpg.sh
 
 oci: ## Build, sign, verify and download the OCI image demo (ociImage from local OCI layout, multi-arch index); offline
@@ -69,7 +69,7 @@ credentials: ## Build the credentials demo and show consumer identity matching (
 plugin: ## Install the demo-store Python plugin, build the plugin demo (demo-store/v1alpha1 access type served by an external plugin), download through it and show its capabilities; offline (requires python3, curl)
 	@bash scripts/plugin.sh
 
-registry: ## Start a local registry:2 on 127.0.0.1:5055, push (ocm transfer cv), sign, verify, pull and show the registry demo; requires Docker (skips without it); stop with: bash scripts/registry.sh stop
+registry: ## Start a local registry:2 on 127.0.0.1:5055, push (ocm transfer cv), sign, verify, pull and show the registry demo, then the OCIImageLayer/v1 layer demo (OCM >= 0.21.0); requires Docker (skips without it); stop with: bash scripts/registry.sh stop
 	@bash scripts/registry.sh
 
 controller: ## Create or reuse the ocm-controller kind cluster, install OCM controllers, kro and Flux, deploy the published component (OCM_CONTROLLER_REPO=ghcr.io/lioramilbaum/ocm) via NamespacedDeployer + kro + Flux and check the pod answers; KEEP_CLUSTER=1 keeps it (requires docker, helm, flux, kind; stop with: bash scripts/controller.sh down)

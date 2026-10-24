@@ -1,6 +1,7 @@
 # Routes each hello-world-image architecture variant to its own tag during transfer.
-# Without this, --copy-resources --upload-as ociArtifact pushes both variants to the
-# same tag (last write wins). Apply with: TRANSFER_CONFIG=transfer.ocmconfig
+# Without this file, the catch-all oci uploader in uploaders.ocmconfig pushes both variants
+# to the same tag (last write wins). publish.sh loads this file before uploaders.ocmconfig,
+# so this more specific entry matches first. Apply with: TRANSFER_CONFIG=transfer.ocmconfig
 type: generic.config.ocm.software/v1
 configurations:
   - type: oci.uploader.transfer.config.ocm.software/v1alpha1

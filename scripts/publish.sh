@@ -9,11 +9,12 @@ require "$OCM"
 
 [[ -n "${OCM_REPO:-}" ]] || die "OCM_REPO must be set (e.g. ghcr.io/lioramilbaum/ocm)"
 
-# --copy-resources downloads each external resource (e.g. the Docker Hub image)
-# and re-uploads it to the target, making the published component self-contained.
-# ociArtifact keeps the image pullable by kubelet; localBlob would bury it inside
-# the component version.
-transfer_flags=(--recursive --copy-resources --upload-as ociArtifact)
+# Each external resource (e.g. the Docker Hub image) is downloaded and re-uploaded
+# to the target, making the published component self-contained. uploaders.ocmconfig
+# routes images to OCI artifacts, which kubelet can pull; localBlob would bury them
+# inside the component version.
+transfer_flags=(--recursive)
+UPLOADER_CONFIG="$ROOT/uploaders.ocmconfig"
 
 # Validate mutually-exclusive modes
 [[ -n "${TRANSFER_PLAN:-}" && -n "${TRANSFER_SPEC:-}" ]] && \
@@ -32,7 +33,7 @@ if [[ -n "${TRANSFER_PLAN:-}" ]]; then
   transfer_args+=(--dry-run -o json)
 fi
 
-# TRANSFER_CONFIG adds an explicit uploader-routing source; OCM merges it with the default config. Registry credentials still come from OCM_REGISTRY_USERNAME/OCM_REGISTRY_PASSWORD.
+# TRANSFER_CONFIG adds an explicit uploader-routing source. Passing --config turns off OCM's merge with the default config, so only the files passed here are loaded. Registry credentials still come from OCM_REGISTRY_USERNAME/OCM_REGISTRY_PASSWORD.
 global_config_args=()
 if [[ -n "${TRANSFER_CONFIG:-}" ]]; then
   [[ -f "${TRANSFER_CONFIG}" ]] || die "TRANSFER_CONFIG file not found: ${TRANSFER_CONFIG}"
@@ -43,10 +44,16 @@ run_transfer() {
   if [[ -n "${OCM_REGISTRY_USERNAME:-}" || -n "${OCM_REGISTRY_PASSWORD:-}" ]]; then
     [[ -n "${OCM_REGISTRY_USERNAME:-}" ]] || die "OCM_REGISTRY_USERNAME is required when OCM_REGISTRY_PASSWORD is set"
     [[ -n "${OCM_REGISTRY_PASSWORD:-}" ]] || die "OCM_REGISTRY_PASSWORD is required when OCM_REGISTRY_USERNAME is set"
-    render_registry_ocmconfig | "$OCM" --config - "${global_config_args[@]}" transfer cv "${transfer_args[@]}"
+    # The uploader config goes last: uploader entries are matched in order and the first match wins.
+    render_registry_ocmconfig | "$OCM" --config - "${global_config_args[@]}" transfer cv "${transfer_args[@]}" --config "$UPLOADER_CONFIG"
   else
     echo "note: no OCM_REGISTRY_USERNAME/OCM_REGISTRY_PASSWORD set; using OCM config discovery" >&2
-    "$OCM" "${global_config_args[@]}" transfer cv "${transfer_args[@]}"
+    if [[ -n "${OCM_CONFIG:-}" ]]; then
+      "$OCM" "${global_config_args[@]}" transfer cv "${transfer_args[@]}" --config "$OCM_CONFIG" --config "$UPLOADER_CONFIG"
+    else
+      # OCM_CONFIG keeps the default config (~/.ocmconfig) merged in; --config would turn that merge off.
+      OCM_CONFIG="$UPLOADER_CONFIG" "$OCM" "${global_config_args[@]}" transfer cv "${transfer_args[@]}"
+    fi
   fi
 }
 
