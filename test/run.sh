@@ -1533,9 +1533,10 @@ test_renovate_groups_flux_updates() {
   echo "$flux_managers" | jq -e '[.[].managerFilePatterns[] | test("controller")] | any' > /dev/null \
     || { echo "  no Flux manager targets controller.sh" >&2; return 1; }
 
-  # group:all ensures all updates, including both Flux managers, land in one PR
-  jq -e '(.extends // []) | index("group:all") != null' "$ROOT/renovate.json" > /dev/null \
-    || { echo "  group:all not in extends — Flux updates will not be grouped" >&2; return 1; }
+  # Verifies only that the global preset github>lioramilbaum/renovate-config is referenced in extends.
+  # The grouping behavior (all updates in one PR) is provided by that external preset and is not verified locally.
+  jq -e '(.extends // []) | index("github>lioramilbaum/renovate-config") != null' "$ROOT/renovate.json" > /dev/null \
+    || { echo "  github>lioramilbaum/renovate-config not in extends — Flux updates will not be grouped" >&2; return 1; }
 
   # The two Flux captures must agree (Dockerfile == controller.sh)
   local re_df; re_df=$(_renovate_manager "Dockerfile" "fluxcd/flux2") || return 1
@@ -1590,7 +1591,7 @@ test_renovate_updates_ocm_sha256() {
       | length == 3 and all(range(1; $s | length); $s[.][0] >= $s[. - 1][1])
     ' "$df" > /dev/null || die "OCM Renovate matches overlap or are missing"
   fi
-  jq -e '(.extends // []) | index("group:all") != null' "$rv" > /dev/null \
+  jq -e '(.extends // []) | index("github>lioramilbaum/renovate-config") != null' "$rv" > /dev/null \
     || die "OCM dependencies are not grouped into one PR"
 }
 
