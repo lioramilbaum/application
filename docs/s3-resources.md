@@ -84,7 +84,7 @@ The consumer identity of an S3 access is `bucketName/objectKey` (for `S3/v1`, `b
 | `port` | `"19000"` | Quoted string |
 | `path` | optional, for example `ocm-demo/releases/*` | `path.Match` pattern on `bucket/key`; `*` stays within one segment |
 
-Credentials are the top-level fields `accessKeyId` and `secretAccessKey` of `S3Credentials/v1`. `path: ocm-demo/**` does not match in OCM 0.19.1, because `**` is not supported until 0.21.0. Use one `*` per segment instead.
+Credentials are the top-level fields `accessKeyId` and `secretAccessKey` of `S3Credentials/v1`. `path: ocm-demo/**` matches across segments only in OCM 0.21.0 and later (#3746); in OCM 0.19.1 it does not match, so use one `*` per segment there.
 
 ### Object versioning
 
@@ -109,7 +109,7 @@ An S3 object has no digest in its descriptor unless OCM computes one at build ti
 | `overwritten-input` | the object in `ocm-demo` is replaced | `ok` for `notes-input`: the embedded bytes are not fetched |
 | `no-credentials` | the config has no consumer entry | `credentials-missing` |
 | `glob-star` | consumer `path: ocm-demo/releases/*` | `ok` |
-| `glob-doublestar` | consumer `path: ocm-demo/**` | `credentials-missing` |
+| `glob-doublestar` | consumer `path: ocm-demo/**` | `ok` (\*\* crosses / since OCM 0.21.0, #3746) |
 | `copied-v2` | `ocm transfer cv --copy-resources` | `LocalBlob/v1` for `notes` |
 | `copied-v1` | the same transfer | `S3/v1` for `notes-v1` (the transfer leaves it as it is) |
 | `server-down` | the container is stopped | `connection-refused` for `notes`; `ok` for `notes-input` |

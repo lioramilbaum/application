@@ -94,7 +94,7 @@ ocm get cv ctf::./build/ctf//github.com/lioramilbaum/application:0.1.0 -o json \
 | `--copy-resources` | inlined as `LocalBlob/v1` in the component layer | yes (carry the archive) |
 | `--copy-resources --upload-as ociArtifact` | pushed as its own artifact (`ociArtifact/v1`), pullable by kubelet | yes (push to registry) |
 
-`make publish` uses `--copy-resources --upload-as ociArtifact` so the published component doesn't depend on Docker Hub and the image remains pullable.
+`make publish` routes external resources through `uploaders.ocmconfig` (`oci.uploader.transfer.config.ocm.software/v1alpha1` entries) so the published component doesn't depend on Docker Hub and the image remains pullable. `--copy-resources --upload-as ociArtifact` is the deprecated equivalent of this config, still accepted in OCM 0.21.0.
 
 Sources (`GitHub/v1`) are never copied by any transfer mode.
 

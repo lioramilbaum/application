@@ -315,7 +315,7 @@ configurations:
 EOF
   printf 'glob-star\tnotes\t%s\n' "$(_try_download notes "$tmp_config")"
 
-  # glob-doublestar: ** not supported in 0.19.1
+  # glob-doublestar: ** matches across path segments (OCM >= 0.21.0, #3746)
   cat > "$tmp_config" <<EOF
 type: generic.config.ocm.software/v1
 configurations:

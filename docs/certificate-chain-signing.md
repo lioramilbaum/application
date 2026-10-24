@@ -113,7 +113,7 @@ The signature, including the chain, lives in the descriptor, so `ocm transfer cv
 
 ### Limitations
 
-- Verification checks the leaf against the current time, not the signing time. A signature made while the leaf was valid stops verifying once it expires (`expired-leaf`). Upstream added RFC 3161 timestamps (`ocm sign cv --tsa` or `--tsa-url`, open-component-model#3636), which let verification use a trusted signing time; they first ship in v0.21.0-rc.1 and are not in OCM 0.19.1. Until then, re-sign before the leaf expires.
+- Verification checks the leaf against the current time, not the signing time. A signature made while the leaf was valid stops verifying once it expires (`expired-leaf`). RFC 3161 timestamps (`ocm sign cv --tsa` or `--tsa-url`, open-component-model#3636) let verification use a trusted signing time. They are available in OCM 0.21.0; see [trusted timestamps](gpg-signing.md#trusted-timestamps-rfc-3161). On older versions, re-sign before the leaf expires.
 - OCM does not check revocation (CRL or OCSP). A revoked leaf verifies until it expires; to distrust a CA, remove it from the verifier's file.
 - A PEM signature cannot be verified with a bare public key (`pinned-public-key`); the verifier's file must hold certificates.
 - PEM encoding is early access. OCM logs `signing with PEM encoding is experimental` and `verifying signatures with PEM encoding is experimental` as warnings.

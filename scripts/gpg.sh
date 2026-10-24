@@ -12,6 +12,7 @@ GPG_SIGNATURE="gpg"
 GPG_DEMO_CTF="${GPG_DEMO_CTF:-$BUILD_DIR/gpg-ctf}"
 GPG_DEMO_OUT="${GPG_DEMO_OUT:-$BUILD_DIR/gpg}"
 GPG_DEMO_CONSTRUCTOR="$ROOT/components/gpg/component-constructor.yaml"
+GPG_TSA_PORT="${GPG_TSA_PORT:-18461}"
 KEYS="$GPG_DEMO_OUT/keys"
 
 # Bring your own keys: set all or none.
@@ -656,6 +657,150 @@ _show() {
   printf 'signed-by\t%s\t%s\n' "$signing_fpr" "$alg_name"
 }
 
+# _tsa_ca <basename> <cn> — self-signed CA written to $GPG_DEMO_OUT/tsa/<basename>.{key,crt}
+_tsa_ca() {
+  local d="$GPG_DEMO_OUT/tsa" name="$1"
+  openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 -out "$d/$name.key" 2>/dev/null
+  chmod 0600 "$d/$name.key"
+  openssl req -new -key "$d/$name.key" -subj "/CN=$2" -out "$d/$name.csr"
+  openssl x509 -req -in "$d/$name.csr" -signkey "$d/$name.key" -days 3650 \
+    -extfile "$d/ca.ext" -out "$d/$name.crt"
+}
+
+# _tsa_certs — regenerate $GPG_DEMO_OUT/tsa: the TSA root, a TSA certificate issued by it,
+# an unrelated rogue root, the openssl ts config and its serial file
+_tsa_certs() {
+  local d="$GPG_DEMO_OUT/tsa"
+  rm -rf "${d:?}"
+  mkdir -p "$d"
+  printf 'basicConstraints=critical,CA:TRUE\nkeyUsage=critical,keyCertSign,cRLSign\n' > "$d/ca.ext"
+  printf 'basicConstraints=critical,CA:FALSE\nkeyUsage=critical,digitalSignature\nextendedKeyUsage=critical,timeStamping\n' > "$d/tsa.ext"
+  _tsa_ca root "OCM Demo TSA Root"
+  _tsa_ca rogue-root "OCM Demo Rogue Root"
+
+  openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 -out "$d/tsa.key" 2>/dev/null
+  chmod 0600 "$d/tsa.key"
+  openssl req -new -key "$d/tsa.key" -subj "/CN=OCM Demo TSA" -out "$d/tsa.csr"
+  openssl x509 -req -in "$d/tsa.csr" -CA "$d/root.crt" -CAkey "$d/root.key" -CAcreateserial \
+    -days 365 -extfile "$d/tsa.ext" -out "$d/tsa.crt"
+
+  printf '01\n' > "$d/tsaserial"
+  cat > "$d/tsa.cnf" <<EOF
+[ tsa ]
+default_tsa = tsa_config1
+
+[ tsa_config1 ]
+dir = $d
+serial = $d/tsaserial
+signer_cert = $d/tsa.crt
+signer_key = $d/tsa.key
+signer_digest = sha256
+certs = $d/tsa.crt
+default_policy = 1.2.3.4.1
+digests = sha256
+accuracy = secs:1
+ordering = no
+tsa_name = yes
+ess_cert_id_alg = sha256
+EOF
+}
+
+# _tsa_stop — stop the TSA started by _timestamp (kill and reap; no-op when already stopped)
+_tsa_stop() {
+  if [[ -n "${_TSA_PID:-}" ]]; then
+    kill "$_TSA_PID" 2>/dev/null || true
+    wait "$_TSA_PID" 2>/dev/null || true
+  fi
+}
+
+# _write_tsa_verify_config <tsa-root-pem> <outfile> — GPG verifier plus the TSA root for the stored token
+_write_tsa_verify_config() {
+  local root="$1" out="$2"
+  cat > "$out" <<EOF
+type: generic.config.ocm.software/v1
+configurations:
+  - type: credentials.config.ocm.software
+    consumers:
+      - identity:
+          type: GPG/v1alpha1
+          signature: ${GPG_SIGNATURE}
+        credentials:
+          - type: GPGCredentials/v1alpha1
+            publicKeyPGPFile: $PUBLIC_KEY
+      - identity:
+          type: TSA/v1alpha1
+        credentials:
+          - type: TSACredentials/v1alpha1
+            rootCertsPEMFile: $root
+  - type: signing.config.ocm.software/v1alpha1
+    verifier:
+      type: GPGSigningConfiguration/v1alpha1
+      signature: ${GPG_SIGNATURE}
+EOF
+}
+
+# _tsa_verify <config> <ctf-ref> — prints "ok <trust>" or "fail <reason>" for the gpg signature
+_tsa_verify() {
+  local config="$1" ref="$2" err status detail
+  err="$(mktemp)"
+  if "$OCM" verify cv --config "$config" --signature "$GPG_SIGNATURE" "$ref" </dev/null >/dev/null 2>"$err"; then
+    status=ok
+    # OCM >= 0.21.0 emits "trusted=true" / "trusted=false" on stderr for TSA trust status
+    if grep -q 'trusted=true' "$err"; then detail=trusted
+    elif grep -q 'trusted=false' "$err"; then detail=untrusted
+    else detail=-
+    fi
+  else
+    status=fail
+    if grep -qiE 'tsa|timestamp' "$err"; then detail=tsa-untrusted; else detail=error; fi
+  fi
+  rm -f "$err"
+  printf '%s\t%s\n' "$status" "$detail"
+}
+
+# _timestamp — sign a copy with an RFC 3161 timestamp from the local TSA, stop the TSA, then verify
+# the stored token with no TSA root, the right root and a rogue root. A subshell keeps its EXIT trap
+# away from the GNUPGHOME cleanup trap of the main script.
+_timestamp() (
+  require openssl python3 curl
+  [[ "$GPG_TSA_PORT" =~ ^[0-9]+$ ]] || die "GPG_TSA_PORT must be numeric: $GPG_TSA_PORT"
+  local d="$GPG_DEMO_OUT/tsa" out="$GPG_DEMO_OUT/timestamp-ctf" ready="http://127.0.0.1:$GPG_TSA_PORT/-/ready"
+  local ref cv_json sig_json tsa_time tsa_url _
+
+  _tsa_certs
+  trap _tsa_stop EXIT
+  python3 -I "$ROOT/scripts/tsa-server.py" --port "$GPG_TSA_PORT" --config "$d/tsa.cnf" \
+    --section tsa_config1 --log "$d/tsa.log" </dev/null >"$d/tsa-server.out" 2>&1 &
+  _TSA_PID=$!
+  for _ in $(seq 1 40); do
+    curl -fsS -o /dev/null "$ready" 2>/dev/null && break
+    sleep 0.25
+  done
+  curl -fsS -o /dev/null "$ready" 2>/dev/null || die "TSA not reachable at $ready; see $d/tsa-server.out"
+
+  [[ -d "$GPG_DEMO_CTF" ]] || _build
+  rm -rf "${out:?}"
+  cp -R "$GPG_DEMO_CTF" "$out"
+  ref="$(_gpg_ref "$out")"
+  "$OCM" sign cv --config "$GPG_DEMO_OUT/sign.ocmconfig" --signature "$GPG_SIGNATURE" \
+    --tsa-url "http://127.0.0.1:$GPG_TSA_PORT/" "$ref" </dev/null >/dev/null
+
+  # The token is embedded in the descriptor, so verification must work with the TSA stopped.
+  _tsa_stop
+
+  _write_tsa_verify_config "$d/root.crt" "$GPG_DEMO_OUT/verify-tsa.ocmconfig"
+  _write_tsa_verify_config "$d/rogue-root.crt" "$GPG_DEMO_OUT/verify-tsa-rogue.ocmconfig"
+
+  cv_json="$("$OCM" get cv "$ref" -o json </dev/null)"
+  sig_json="$(jq -c --arg s "$GPG_SIGNATURE" '.[0].signatures[]? | select(.name==$s)' <<<"$cv_json")"
+  tsa_time="$(jq -r '.timestamp.time // "-"' <<<"$sig_json")"
+  tsa_url="$(jq -r --arg l "url.tsa.ocm.software/$GPG_SIGNATURE" '.[0].component.labels[]? | select(.name==$l) | .value' <<<"$cv_json")"
+  printf 'timestamp\t%s\t%s\t%s\n' "$GPG_SIGNATURE" "$tsa_time" "$tsa_url"
+  printf 'verify\tno-tsa-root\t%s\n' "$(_tsa_verify "$GPG_DEMO_OUT/verify.ocmconfig" "$ref")"
+  printf 'verify\ttsa-root\t%s\n' "$(_tsa_verify "$GPG_DEMO_OUT/verify-tsa.ocmconfig" "$ref")"
+  printf 'verify\trogue-tsa-root\t%s\n' "$(_tsa_verify "$GPG_DEMO_OUT/verify-tsa-rogue.ocmconfig" "$ref")"
+)
+
 mkdir -p "$GPG_DEMO_OUT"
 if [[ -n "${GPG_PRIVATE_KEY:-}" ]]; then
   mkdir -p "$KEYS"
@@ -674,6 +819,7 @@ case "${1:-}" in
   crosscheck)  _crosscheck ;;
   multi)       _multi ;;
   scenarios)   _scenarios ;;
+  timestamp)   _timestamp ;;
   show)        _show ;;
   *)           _build; _sign; _verify; _download; echo ""; _show ;;
 esac
