@@ -1389,7 +1389,7 @@ test_renovate_captures_pinned_versions() {
   _expect_renovate_match "$re_kind" "$(cat "$ROOT/.devcontainer/Dockerfile")" "$expected_kind" || return 1
 
   # Flux version in Dockerfile
-  local re_flux_df; re_flux_df=$(_renovate_manager "Dockerfile" "fluxcd/flux2") || return 1
+  local re_flux_df; re_flux_df=$(_renovate_manager "Dockerfile" "fluxcd/flux2" "FLUX_VERSION") || return 1
   local expected_flux_df; expected_flux_df=$(sed -n 's/^ARG FLUX_VERSION=//p' "$ROOT/.devcontainer/Dockerfile" | head -1)
   [[ -n "$expected_flux_df" ]] || { echo "  FLUX_VERSION not found in Dockerfile" >&2; return 1; }
   _expect_renovate_match "$re_flux_df" "$(cat "$ROOT/.devcontainer/Dockerfile")" "$expected_flux_df" || return 1
@@ -1449,7 +1449,7 @@ test_renovate_regexes_reject_invalid_input() {
   _expect_renovate_match "$re" "ARG KIND_SHA256_LINUX_AMD64=$h64"  || return 1
 
   # Flux in Dockerfile
-  re=$(_renovate_manager "Dockerfile" "fluxcd/flux2") || return 1
+  re=$(_renovate_manager "Dockerfile" "fluxcd/flux2" "FLUX_VERSION") || return 1
   _expect_renovate_match "$re" "ARG FLUX_VERSION=v2.9.6" "v2.9.6" || return 1
   _expect_renovate_match "$re" 'FLUX_VERSION="v2.9.6"'            || return 1   # controller.sh form
   _expect_renovate_match "$re" "ARG FLUX_VERSION=2.9.6"          || return 1
@@ -1520,32 +1520,52 @@ test_renovate_extract_version_templates() {
 
 
 test_renovate_groups_flux_updates() {
-  local tmp="$1"
+  local rv="$ROOT/renovate.json"
+  local df="$ROOT/.devcontainer/Dockerfile"
+  local cs_sh="$ROOT/scripts/controller.sh"
 
-  # Exactly 2 managers track fluxcd/flux2
-  local flux_managers; flux_managers=$(jq '[.customManagers[] | select(.depNameTemplate == "fluxcd/flux2")]' "$ROOT/renovate.json")
-  local flux_count; flux_count=$(echo "$flux_managers" | jq 'length')
-  [[ "$flux_count" -eq 2 ]] || { echo "  expected 2 flux managers, got $flux_count" >&2; return 1; }
+  # Verify renovate.json is valid JSON
+  jq empty "$rv" || die "renovate.json is not valid JSON"
 
-  # One must target Dockerfile, one must target controller.sh
-  echo "$flux_managers" | jq -e '[.[].managerFilePatterns[] | test("Dockerfile")] | any' > /dev/null \
-    || { echo "  no Flux manager targets Dockerfile" >&2; return 1; }
-  echo "$flux_managers" | jq -e '[.[].managerFilePatterns[] | test("controller")] | any' > /dev/null \
-    || { echo "  no Flux manager targets controller.sh" >&2; return 1; }
+  # Verify the global preset that groups all deps is still present
+  jq -e '[.extends[] | select(startswith("github>lioramilbaum/renovate-config"))] | length >= 1' "$rv" > /dev/null \
+    || die "renovate.json no longer extends github>lioramilbaum/renovate-config"
 
-  # Verifies only that the global preset github>lioramilbaum/renovate-config is referenced in extends.
-  # The grouping behavior (all updates in one PR) is provided by that external preset and is not verified locally.
-  jq -e '(.extends // []) | index("github>lioramilbaum/renovate-config") != null' "$ROOT/renovate.json" > /dev/null \
-    || { echo "  github>lioramilbaum/renovate-config not in extends — Flux updates will not be grouped" >&2; return 1; }
+  # Collect all fluxcd/flux2 managers
+  local flux_managers
+  flux_managers=$(jq '[.customManagers[] | select(.depNameTemplate == "fluxcd/flux2" or (.matchStrings // [] | any(contains("fluxcd/flux2"))))]' "$rv")
+  # Also count managers by depNameTemplate only (the standard way they're defined)
+  flux_managers=$(jq '[.customManagers[] | select(.depNameTemplate == "fluxcd/flux2")]' "$rv")
+  local count
+  count=$(echo "$flux_managers" | jq 'length')
+  [[ "$count" -eq 4 ]] || die "expected 4 fluxcd/flux2 managers, got $count"
 
-  # The two Flux captures must agree (Dockerfile == controller.sh)
-  local re_df; re_df=$(_renovate_manager "Dockerfile" "fluxcd/flux2") || return 1
-  local re_sh; re_sh=$(_renovate_manager "controller" "fluxcd/flux2") || return 1
-  local ver_df; ver_df=$(_renovate_captures "$re_df" "$(cat "$ROOT/.devcontainer/Dockerfile")" | jq -r '.[0].currentValue // empty')
-  local ver_sh; ver_sh=$(_renovate_captures "$re_sh" "$(cat "$ROOT/scripts/controller.sh")" | jq -r '.[0].currentValue // empty')
-  [[ -n "$ver_df" ]] || { echo "  Flux version not found in Dockerfile" >&2; return 1; }
-  [[ -n "$ver_sh" ]] || { echo "  Flux version not found in controller.sh" >&2; return 1; }
-  [[ "$ver_df" == "$ver_sh" ]] || { echo "  Flux version drift: Dockerfile=$ver_df controller.sh=$ver_sh" >&2; return 1; }
+  # Verify exactly 2 use github-release-attachments (the digest managers)
+  local digest_count
+  digest_count=$(echo "$flux_managers" | jq '[.[] | select(.datasourceTemplate == "github-release-attachments")] | length')
+  [[ "$digest_count" -eq 2 ]] || die "expected 2 Flux digest managers (github-release-attachments), got $digest_count"
+
+  # Grouping of all fluxcd/flux2 updates into one PR is provided by the
+  # external "group:all" preset in github>lioramilbaum/renovate-config.
+  # It cannot be verified locally without running Renovate against the repo.
+
+  # Verify each of the 2 github-releases managers targets the expected files
+  local df_managers
+  df_managers=$(echo "$flux_managers" | jq '[.[] | select(.datasourceTemplate == "github-releases") | select((.managerFilePatterns // []) | any(test("Dockerfile")))]')
+  [[ $(echo "$df_managers" | jq 'length') -eq 1 ]] \
+    || die "expected exactly 1 github-releases manager targeting Dockerfile"
+
+  local cs_managers
+  cs_managers=$(echo "$flux_managers" | jq '[.[] | select(.datasourceTemplate == "github-releases") | select((.managerFilePatterns // []) | any(test("controller")))]')
+  [[ $(echo "$cs_managers" | jq 'length') -eq 1 ]] \
+    || die "expected exactly 1 github-releases manager targeting controller.sh"
+
+  # Check for version drift between Dockerfile and controller.sh
+  local df_version cs_version
+  df_version=$(sed -n 's/^ARG FLUX_VERSION=//p' "$df")
+  cs_version=$(sed -n 's/^FLUX_VERSION="\(v[^"]*\)".*/\1/p' "$cs_sh" | head -1)
+  [[ "$df_version" == "$cs_version" ]] \
+    || die "Flux version drift: Dockerfile has $df_version, controller.sh has $cs_version"
 }
 
 test_renovate_ocm_cli_rule_scoped() {
@@ -1593,6 +1613,37 @@ test_renovate_updates_ocm_sha256() {
   fi
   jq -e '(.extends // []) | index("github>lioramilbaum/renovate-config") != null' "$rv" > /dev/null \
     || die "OCM dependencies are not grouped into one PR"
+}
+
+test_renovate_updates_flux_sha256() {
+  local df="$ROOT/.devcontainer/Dockerfile" rv="$ROOT/renovate.json"
+  local flux_version arch sha
+  flux_version=$(sed -n 's/^ARG FLUX_VERSION=//p' "$df")
+  [[ -n "$flux_version" ]] || die "FLUX_VERSION not found in Dockerfile"
+  for arch in AMD64 ARM64; do
+    sha=$(sed -n "s/^ARG FLUX_SHA256_LINUX_${arch}=//p" "$df")
+    [[ -n "$sha" ]] || die "FLUX_SHA256_LINUX_${arch} not found in Dockerfile"
+    jq -e -Rs --slurpfile cfg "$rv" --arg arch "$arch" --arg v "$flux_version" --arg sha "$sha" '
+      . as $df
+      | [ $cfg[0].customManagers[]
+          | select(.datasourceTemplate == "github-release-attachments"
+                   and .depNameTemplate == "fluxcd/flux2"
+                   and (.matchStrings[0] | contains("FLUX_SHA256_LINUX_" + $arch + "=(?<currentDigest>"))) ]
+      | length == 1
+        and (.[0].matchStrings[0] as $re
+             | [ $df | capture($re; "g") ]
+             | length == 1 and .[0].currentValue == $v and .[0].currentDigest == $sha)
+    ' "$df" > /dev/null || die "renovate.json does not track FLUX_SHA256_LINUX_${arch} at ${flux_version}"
+  done
+  jq -e -Rs --slurpfile cfg "$rv" '
+    . as $df
+    | [ $cfg[0].customManagers[]
+        | select(.depNameTemplate == "fluxcd/flux2" and ((.managerFilePatterns // []) | any(test("Dockerfile"))))
+        | .matchStrings[] as $re
+        | $df | match($re; "g") | [.offset, .offset + .length] ]
+    | sort | . as $s
+    | length == 3 and all(range(1; $s | length); $s[.][0] >= $s[. - 1][1])
+  ' "$df" > /dev/null || die "Flux Renovate matches overlap or are missing"
 }
 
 test_e2e_workflow_isolates_deploy() {
@@ -7468,6 +7519,7 @@ run_test "make e2e-run skips build and sign" test_make_e2e_run_skips_build_sign
 run_test "devcontainer config is valid" test_devcontainer_config_is_valid
 run_test "devcontainer pins tools" test_devcontainer_pins_tools
 run_test "renovate updates OCM SHA256 ARGs" test_renovate_updates_ocm_sha256
+run_test "renovate updates Flux SHA256 ARGs" test_renovate_updates_flux_sha256
 run_test "renovate managers match their targets"   test_renovate_managers_match_targets
 run_test "renovate captures pinned versions"        test_renovate_captures_pinned_versions
 run_test "renovate regexes reject invalid input"    test_renovate_regexes_reject_invalid_input

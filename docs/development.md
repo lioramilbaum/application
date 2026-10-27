@@ -86,6 +86,8 @@ The `e2e.sh` script automatically detects whether the cluster existed before thi
 
 Renovate bumps `OCM_CLI_VERSION` together with both `OCM_SHA256_LINUX_AMD64` and `OCM_SHA256_LINUX_ARM64` in a single PR, using the `github-release-attachments` datasource and `# renovate: ocm-linux-<arch> <version>` marker comments in the Dockerfile.
 
+Renovate likewise bumps `FLUX_VERSION` in the Dockerfile and `scripts/controller.sh` together with both `FLUX_SHA256_LINUX_AMD64` and `FLUX_SHA256_LINUX_ARM64`, using `github-release-attachments` and `# renovate: flux-linux-<arch> <version>` markers in the Dockerfile.
+
 `KIND_SHA256_*` ARGs are still updated by hand when Renovate bumps `KIND_VERSION`.
 
 ## Running tests
@@ -112,7 +114,7 @@ Tests include:
 - Canonical component repositories (CTF): `ctf layout is canonical`, `ctf archive is portable and signed`, `readme documents canonical component repositories`
 - Kubernetes controller: `readme documents kubernetes controller`
 - Controller stack script (`make controller`): `controller.sh run deletes cluster it created`, `controller.sh run keeps cluster with KEEP_CLUSTER`, `controller.sh run reuses existing cluster`, `controller.sh down deletes cluster`, `controller.sh rejects unknown subcommand`, `controller.sh apply sets target architecture`, `controller.sh check fails without answer`, `controller.sh install requires tools`
-- Renovate configuration: `renovate updates OCM SHA256 ARGs`, `renovate managers match their targets`, `renovate captures pinned versions`, `renovate regexes reject invalid input`, `renovate extractVersion maps release tags`, `renovate groups Flux updates`
+- Renovate configuration: `renovate updates OCM SHA256 ARGs`, `renovate updates Flux SHA256 ARGs`, `renovate managers match their targets`, `renovate captures pinned versions`, `renovate regexes reject invalid input`, `renovate extractVersion maps release tags`, `renovate groups Flux updates`
 - Kubernetes deployer: `readme documents kubernetes deployer`
 - Plugin system: `builtin plugins serve component types`, `readme documents plugin system`, demo plugin: `plugin capabilities returns access type`, `plugin healthz responds`, `plugin build registers access type`, `plugin download returns blob`, `plugin identity endpoint`, `plugin missing plugin fails gracefully`, `plugin show lists capabilities`, `plugin scenarios correct response`, `plugin scenarios malformed response`, `plugin loglevel debug shows registration`, `make plugin target`, `readme documents plugin demo`
 - Signing and verification: `signature covers normalized descriptor`, `readme documents signing and verification`
