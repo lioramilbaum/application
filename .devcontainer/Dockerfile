@@ -34,15 +34,15 @@ RUN set -eux; arch="$(dpkg --print-architecture)"; \
     ocm version; \
     kind version
 
-ARG FLUX_VERSION=v2.9.6
+ARG FLUX_VERSION=v2.10.0
 # Renovate bumps FLUX_VERSION (here and in scripts/controller.sh) and both
 # FLUX_SHA256_* ARGs in one PR (see renovate.json). Each
 # "# renovate: flux-linux-<arch> <version>" marker must sit directly above its
 # ARG and equal FLUX_VERSION.
-# renovate: flux-linux-amd64 v2.9.6
-ARG FLUX_SHA256_LINUX_AMD64=b4d22673e9246cbd628881f1a9ef3b090085dced291e42d804555cee8e8d42c5
-# renovate: flux-linux-arm64 v2.9.6
-ARG FLUX_SHA256_LINUX_ARM64=6663c154755b732f43dc993d72321f71c2fc1ff0bcb94b2696e0a8638fa562b4
+# renovate: flux-linux-amd64 v2.10.0
+ARG FLUX_SHA256_LINUX_AMD64=208dd7012c04fedeed5b2d0b6e63df3b15b1c34a381527811685c098bc9f8659
+# renovate: flux-linux-arm64 v2.10.0
+ARG FLUX_SHA256_LINUX_ARM64=c3c435052e5e18156858bc73f26bcadb62821a6e30951b4b302beb4e65a532c2
 
 RUN set -eux; \
     arch="$(dpkg --print-architecture)"; \
