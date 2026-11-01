@@ -102,7 +102,7 @@ _algorithms() {
     --dry-run --normalisation "jsonNormalisation/v1" \
     "ctf::$NORM_DEMO_OUT/base-ctf//github.com/lioramilbaum/normalisation-demo:${VERSION}" \
     </dev/null 2>&1 || true)"
-  printf 'jsonNormalisation/v1\trejected\t%s\n' "$(echo "$err" | grep -o 'unknown normalisation.*' | head -1)"
+  printf 'jsonNormalisation/v1\trejected\t%s\n' "$(echo "$err" | grep -o 'supported for verification only.*' | head -1)"
 }
 
 mkdir -p "$NORM_DEMO_OUT"

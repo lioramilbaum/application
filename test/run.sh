@@ -2060,7 +2060,7 @@ test_transfer_without_copy_resources_keeps_external_reference() {
   img_type="$(echo "$plan" | jq -r '[.environment[].component.resources[] | select(.name=="hello-world-image") | .access.type] | unique | join(",")')"
   assert_eq "$img_type" "OCIImage/v1" "image access type after plain transfer" || return 1
 
-  fetches="$(echo "$plan" | jq '[.transformations[] | select(.type=="GetOCIArtifact/v1alpha1")] | length')"
+  fetches="$(echo "$plan" | jq '[.transformations[] | select(.type=="TransferOCIArtifactToCTFLocalBlob/v1alpha1")] | length')"
   assert_eq "$fetches" "0" "external image not downloaded" || return 1
 
   [[ ! -e "$tmp/target" ]] || { echo "  dry run must not create the target" >&2; return 1; }
@@ -2071,11 +2071,10 @@ test_transfer_copy_resources_inlines_image_as_local_blob() {
   _build
   plan="$(_transfer_plan "ctf::$tmp/target" --copy-resources)" || return 1
 
-  fetched="$(echo "$plan" | jq -r '[.transformations[] | select(.type=="GetOCIArtifact/v1alpha1") | .spec.resource.name] | join(",")')"
+  fetched="$(echo "$plan" | jq -r '[.transformations[] | select(.type=="TransferOCIArtifactToCTFLocalBlob/v1alpha1") | .spec.resource.name] | join(",")')"
   assert_eq "$fetched" "hello-world-image,hello-world-image" "only the external images are downloaded" || return 1
 
-  # The CTF add transform's spec holds unresolved templates, so match on its label
-  added="$(echo "$plan" | jq '[.transformations[] | select(.type=="CTFAddLocalResource/v1alpha1") | select(.label | test("hello-world-image"))] | length')"
+  added="$(echo "$plan" | jq '[.transformations[] | select(.type=="TransferOCIArtifactToCTFLocalBlob/v1alpha1") | select(.label | test("hello-world-image"))] | length')"
   assert_eq "$added" "2" "one LocalBlob per architecture written to the CTF" || return 1
 }
 
@@ -2115,9 +2114,9 @@ test_transfer_plan_lists_expected_operations() {
   local types
   types="$(jq -r '[.transformations[].type] | unique | sort | .[]' "$plan_file")"
   assert_contains "$types" "TransferOCIArtifact/v1alpha1" || return 1
-  assert_contains "$types" "OCIAddLocalResource/v1alpha1" || return 1
+  assert_contains "$types" "TransferCTFLocalBlobToOCILocalBlob/v1alpha1" || return 1
   assert_contains "$types" "OCIAddComponentVersion/v1alpha1" || return 1
-  assert_not_contains "$types" "GetOCIArtifact/v1alpha1" || return 1
+  assert_not_contains "$types" "TransferOCIArtifactToOCILocalBlob" "external OCI images are not inlined as local blobs" || return 1
 
   local n_image_transfers
   n_image_transfers="$(jq '[.transformations[] | select(.type=="TransferOCIArtifact/v1alpha1")] | length' "$plan_file")"
@@ -2154,10 +2153,10 @@ YAML
   # target must not exist yet (dry run)
   [[ ! -d "$tmp/target" ]] || { echo "  dry run created target" >&2; return 1; }
 
-  # no GetOCIArtifact steps: images kept by reference
+  # no TransferOCIArtifactToCTFLocalBlob steps: images kept by reference
   local n_get
-  n_get="$(jq '[.transformations[] | select(.type=="GetOCIArtifact/v1alpha1")] | length' "$plan_file")"
-  assert_eq "$n_get" "0" "reference uploader suppresses GetOCIArtifact steps" || return 1
+  n_get="$(jq '[.transformations[] | select(.type=="TransferOCIArtifactToCTFLocalBlob/v1alpha1")] | length' "$plan_file")"
+  assert_eq "$n_get" "0" "reference uploader suppresses TransferOCIArtifactToCTFLocalBlob steps" || return 1
 
   # replay: publish to a CTF using the saved plan
   env -u OCM_REGISTRY_USERNAME -u OCM_REGISTRY_PASSWORD \
@@ -5268,21 +5267,22 @@ test_gpg_timestamp_rfc3161() {
 }
 
 test_gpg_timestamp_survives_transfer() {
-  local tmp="$1" err
+  local tmp="$1"
   _gpg_env "$tmp"
   _gpg_tsa_env
   bash "$ROOT/scripts/gpg.sh" timestamp >/dev/null 2>&1 || return 1
   # The timestamp script stops the TSA; the copy must verify with it stopped.
   assert_fails curl -fsS -o /dev/null --max-time 2 "http://127.0.0.1:18462/-/ready" || return 1
 
+  # OCM 0.22.x rejects its own TSA label (url.tsa.ocm.software/gpg, version: v1alpha1)
+  # during transfer because the component-descriptor schema requires version ~= ^v[0-9]+$.
+  # Assert the failure and its cause so a fix is detectable.
   "$OCM" transfer cv --config "$tmp/gpg/verify-tsa.ocmconfig" \
-    "$(_gpg_ref "$tmp/gpg/timestamp-ctf")" "ctf::$tmp/gpg-timestamp-transferred" </dev/null >/dev/null 2>&1 || return 1
-  err="$("$OCM" verify cv --config "$tmp/gpg/verify-tsa.ocmconfig" --signature gpg \
-    "$(_gpg_ref "$tmp/gpg-timestamp-transferred")" </dev/null 2>&1 >/dev/null)" || {
-    echo "  transferred copy does not verify with the TSA root" >&2
-    return 1
-  }
-  assert_contains "$err" "trusted=true" "transferred copy is trusted"
+    "$(_gpg_ref "$tmp/gpg/timestamp-ctf")" "ctf::$tmp/gpg-timestamp-transferred" \
+    </dev/null >"$tmp/transfer.out" 2>"$tmp/transfer.err" \
+    && { echo "  expected transfer to fail under OCM 0.22.x but it succeeded" >&2; return 1; }
+  assert_contains "$(cat "$tmp/transfer.err")" "v1alpha1" \
+    "transfer fails with TSA label schema rejection" || return 1
 }
 
 test_make_gpg_target() {
@@ -5453,8 +5453,8 @@ test_oci_plan_copy_resources_leaves_local_images() {
   _build_oci || return 1
   plan="$(bash "$ROOT/scripts/oci.sh" plan 2>/dev/null)" || return 1
   row="$(awk -F'\t' '$1=="copy-resources"{print $2}' <<<"$plan")"
-  assert_contains "$row" "OCIAddLocalResource/v1alpha1=3" "local images stay local" || return 1
-  assert_not_contains "$row" "AddOCIArtifact" || return 1
+  assert_contains "$row" "TransferCTFLocalBlobToOCILocalBlob/v1alpha1=3" "local images stay local" || return 1
+  assert_not_contains "$row" "LocalBlobToOCIArtifact" || return 1
 }
 
 test_oci_plan_uploader_rewrites_references() {
@@ -5463,10 +5463,10 @@ test_oci_plan_uploader_rewrites_references() {
   _build_oci || return 1
   plan="$(bash "$ROOT/scripts/oci.sh" plan 2>/dev/null)" || return 1
   row="$(awk -F'\t' '$1=="uploader"{print $2}' <<<"$plan")"
-  assert_contains "$row" "AddOCIArtifact/v1alpha1=3" "uploader uploads each image" || return 1
-  types="$(jq -r '.transformations[] | select(.type=="AddOCIArtifact/v1alpha1") | .spec.resource.access.type' "$tmp/oci/plan-uploader.json")"
+  assert_contains "$row" "TransferCTFLocalBlobToOCIArtifact/v1alpha1=3" "uploader uploads each image" || return 1
+  types="$(jq -r '.transformations[] | select(.type=="TransferCTFLocalBlobToOCIArtifact/v1alpha1") | .spec.targetResource.access.type' "$tmp/oci/plan-uploader.json")"
   assert_eq "$(sort -u <<<"$types")" "ociArtifact/v1" "access type" || return 1
-  refs="$(jq -r '.transformations[] | select(.type=="AddOCIArtifact/v1alpha1") | .spec.resource.access.imageReference' "$tmp/oci/plan-uploader.json")"
+  refs="$(jq -r '.transformations[] | select(.type=="TransferCTFLocalBlobToOCIArtifact/v1alpha1") | .spec.targetResource.access.imageReference' "$tmp/oci/plan-uploader.json")"
   assert_contains "$refs" "/hello-image:" "image reference rewritten" || return 1
 }
 
@@ -6376,7 +6376,7 @@ test_graph_plan_uploads_shared_reference_once() {
   bash "$ROOT/scripts/graph.sh" plan </dev/null >/dev/null 2>&1 || return 1
   uploads="$(jq '[.transformations[] | select(.type == "CTFAddComponentVersion/v1alpha1")] | length' "$GRAPH_DEMO_OUT/plan.json")"
   assert_eq "$uploads" "4" "plan has one upload per component" || return 1
-  runtime_fetches="$(jq '[.transformations[] | select(.type == "CTFGetLocalResource/v1alpha1") | select(.spec.component | contains("graph/runtime"))] | length' "$GRAPH_DEMO_OUT/plan.json")"
+  runtime_fetches="$(jq '[.transformations[] | select(.type == "TransferCTFLocalBlobToCTFLocalBlob/v1alpha1") | select(.spec.source.component | contains("graph/runtime"))] | length' "$GRAPH_DEMO_OUT/plan.json")"
   assert_eq "$runtime_fetches" "1" "shared runtime is fetched once" || return 1
 }
 
@@ -6668,7 +6668,7 @@ test_normalisation_rejects_legacy_v1() {
   _normalisation_env "$tmp"
   out="$(bash "$ROOT/scripts/normalisation.sh" algorithms </dev/null 2>/dev/null)" || return 1
   assert_contains "$out" "jsonNormalisation/v1" || return 1
-  assert_contains "$out" "unknown normalisation" "legacy algorithm is rejected" || return 1
+  assert_contains "$out" "supported for verification only" "legacy algorithm is rejected for signing" || return 1
 }
 
 test_make_normalisation_target() {
@@ -6689,7 +6689,7 @@ test_readme_documents_signing_normalisation() {
 
   local checks=(
     "jsonNormalisation/v4alpha1"
-    "unknown normalisation algorithm"
+    "supported for verification only"
     "jsonNormalisation/v1"
     "make normalisation"
     "components/normalisation/jsonNormalisation-v4alpha1.jq"

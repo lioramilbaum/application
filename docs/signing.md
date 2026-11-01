@@ -111,7 +111,7 @@ ocm sign cv --config build/sign.ocmconfig --dry-run -o json \
   ctf::./build/ctf//github.com/lioramilbaum/application:0.1.0 | jq -r '.digest.value'
 ```
 
-Only `jsonNormalisation/v4alpha1` is available in this OCM CLI. The older `jsonNormalisation/v1` is rejected: `ocm sign cv --normalisation jsonNormalisation/v1` fails with `unknown normalisation algorithm`. A signature made with that algorithm cannot be produced or verified here.
+`jsonNormalisation/v4alpha1` is the algorithm used for signing. Since OCM 0.22.0, the older `jsonNormalisation/v1` (gardener/cc-utils format) is verify-only: `ocm sign cv --normalisation jsonNormalisation/v1` fails with `normalisation algorithm is supported for verification only, not signing`, but existing signatures made with it can still be verified.
 
 The rules are described in [Signing and verification](#signing-and-verification): unsigned labels, access and `srcRefs` are outside the signature, and so is anything the signature table there lists as "no".
 
