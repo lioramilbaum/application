@@ -41,8 +41,8 @@ make publish OCM_REPO=oci::http://localhost:5001 TRANSFER_SPEC=build/transfer-pl
 ```
 
 The plan is a `TransformationGraphDefinition` JSON document. Each entry has a `type`
-(for example `TransferOCIArtifact/v1alpha1`, `OCIAddLocalResource/v1alpha1`,
-`OCIAddComponentVersion/v1alpha1`, `CTFGetLocalResource/v1alpha1`) and a `label`. The plan
+(for example `TransferOCIArtifact/v1alpha1`, `TransferCTFLocalBlobToOCILocalBlob/v1alpha1`,
+`OCIAddComponentVersion/v1alpha1`, `TransferOCIArtifactToCTFLocalBlob/v1alpha1`) and a `label`. The plan
 is a routing graph — OCM reads the actual component descriptor from the source CTF during
 replay, not from the plan JSON. Signature protection is enforced on the target CTF or
 registry; `make verify` on the target will report `digest mismatch` if the component was

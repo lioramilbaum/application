@@ -174,16 +174,15 @@ _relocate() {
     printf 'before\t%s\n' "$line"
   done <<<"$before"
 
-  while IFS=$'\t' read -r name arch _; do
-    node="$(jq -c --arg n "$name" '[.transformations[] | select(.type == "AddOCIArtifact/v1alpha1" and (.label | contains("Add \($n) as OCIArtifact")))] | .[0]' "$plan")"
-    jq -e --arg n "$name" '.label | contains("Add \($n) as OCIArtifact")' <<<"$node" >/dev/null \
+  while IFS=$'\t' read -r name arch _ _ digest; do
+    node="$(jq -c --arg n "$name" --arg a "$arch" '[.transformations[] | select(.type == "TransferCTFLocalBlobToOCIArtifact/v1alpha1" and .spec.targetResource.name == $n and ((.spec.targetResource.extraIdentity.architecture // "multiarch") == $a))] | .[0]' "$plan")"
+    jq -e --arg n "$name" '.label | contains("Transfer \($n) as OCIArtifact")' <<<"$node" >/dev/null \
       || die "relocate plan has no uploader transfer for $name"
-    # The plan takes the digest from the source resource; it is not recomputed on upload.
-    jq -e '.spec.resource.digest | contains("output.resource.digest")' <<<"$node" >/dev/null \
+    jq -e --arg d "${digest#sha256:}" '.spec.targetResource.digest.value == $d' <<<"$node" >/dev/null \
       || die "relocate plan does not pass through the source digest for $name"
     printf 'after\t%s\t%s\t%s\t%s\n' "$name" "$arch" \
-      "$(jq -r '.spec.resource.access.type' <<<"$node")" \
-      "$(jq -r '.spec.resource.access.imageReference' <<<"$node")"
+      "$(jq -r '.spec.targetResource.access.type' <<<"$node")" \
+      "$(jq -r '.spec.targetResource.access.imageReference' <<<"$node")"
   done <<<"$before"
 }
 

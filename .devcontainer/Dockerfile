@@ -9,11 +9,11 @@ SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 # renovate.json). Each "# renovate: ocm-linux-<arch> <version>" marker must sit
 # directly above its ARG and equal OCM_CLI_VERSION. KIND_SHA256_* ARGs are still
 # updated by hand.
-ARG OCM_CLI_VERSION=v0.21.0
-# renovate: ocm-linux-amd64 v0.21.0
-ARG OCM_SHA256_LINUX_AMD64=c82d79f9f2679408d7daf41fc6ba327e6e253e444697db63cbe78ce5088ec4c6
-# renovate: ocm-linux-arm64 v0.21.0
-ARG OCM_SHA256_LINUX_ARM64=ca7676288993af5fe71593d5747deec44bcacf99bb3d2fde04754433bca12b69
+ARG OCM_CLI_VERSION=v0.22.1
+# renovate: ocm-linux-amd64 v0.22.1
+ARG OCM_SHA256_LINUX_AMD64=15532daec120686519dc3d122e078820114f2bd090b1ed3091e9bea6704339ca
+# renovate: ocm-linux-arm64 v0.22.1
+ARG OCM_SHA256_LINUX_ARM64=658de2950727006761a2f8c830c927fa6bc3cf32200d13a74e1df54c285ccd52
 ARG KIND_VERSION=v0.33.0
 ARG KIND_SHA256_LINUX_AMD64=aee6151561422756b764a4ae28e7f44cda5af5a9eead3cc9985112b1de8d8e0d
 ARG KIND_SHA256_LINUX_ARM64=20022bee6cfcd5086cb7234d218e3454e6090022f2a8f55d1fa7fcf42c3867a2
