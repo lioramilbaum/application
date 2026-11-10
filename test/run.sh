@@ -1401,7 +1401,7 @@ test_renovate_captures_pinned_versions() {
   _expect_renovate_match "$re_ocm_cli" "$(cat "$ROOT/.devcontainer/Dockerfile")" "$expected_ocm" || return 1
 
   # KIND version
-  local re_kind; re_kind=$(_renovate_manager "Dockerfile" "kubernetes-sigs/kind") || return 1
+  local re_kind; re_kind=$(_renovate_manager "Dockerfile" "kubernetes-sigs/kind" "KIND_VERSION") || return 1
   local expected_kind; expected_kind=$(sed -n 's/^ARG KIND_VERSION=//p' "$ROOT/.devcontainer/Dockerfile" | head -1)
   [[ -n "$expected_kind" ]] || { echo "  KIND_VERSION not found in Dockerfile" >&2; return 1; }
   _expect_renovate_match "$re_kind" "$(cat "$ROOT/.devcontainer/Dockerfile")" "$expected_kind" || return 1
@@ -1461,7 +1461,7 @@ test_renovate_regexes_reject_invalid_input() {
   _expect_renovate_match "$re" "ARG OCM_CLI_VERSION=v1.2"          || return 1
 
   # KIND
-  re=$(_renovate_manager "Dockerfile" "kubernetes-sigs/kind") || return 1
+  re=$(_renovate_manager "Dockerfile" "kubernetes-sigs/kind" "KIND_VERSION") || return 1
   _expect_renovate_match "$re" "ARG KIND_VERSION=v0.1.0" "v0.1.0" || return 1
   _expect_renovate_match "$re" "ARG KIND_VERSION=0.1.0"           || return 1
   _expect_renovate_match "$re" "ARG KIND_SHA256_LINUX_AMD64=$h64"  || return 1
@@ -1787,6 +1787,37 @@ test_renovate_updates_flux_sha256() {
     | sort | . as $s
     | length == 3 and all(range(1; $s | length); $s[.][0] >= $s[. - 1][1])
   ' "$df" > /dev/null || die "Flux Renovate matches overlap or are missing"
+}
+
+test_renovate_updates_kind_sha256() {
+  local df="$ROOT/.devcontainer/Dockerfile" rv="$ROOT/renovate.json"
+  local kind_version arch sha
+  kind_version=$(sed -n 's/^ARG KIND_VERSION=//p' "$df")
+  [[ -n "$kind_version" ]] || die "KIND_VERSION not found in Dockerfile"
+  for arch in AMD64 ARM64; do
+    sha=$(sed -n "s/^ARG KIND_SHA256_LINUX_${arch}=//p" "$df")
+    [[ -n "$sha" ]] || die "KIND_SHA256_LINUX_${arch} not found in Dockerfile"
+    jq -e -Rs --slurpfile cfg "$rv" --arg arch "$arch" --arg v "$kind_version" --arg sha "$sha" '
+      . as $df
+      | [ $cfg[0].customManagers[]
+          | select(.datasourceTemplate == "github-release-attachments"
+                   and .depNameTemplate == "kubernetes-sigs/kind"
+                   and (.matchStrings[0] | contains("KIND_SHA256_LINUX_" + $arch + "=(?<currentDigest>"))) ]
+      | length == 1
+        and (.[0].matchStrings[0] as $re
+             | [ $df | capture($re; "g") ]
+             | length == 1 and .[0].currentValue == $v and .[0].currentDigest == $sha)
+    ' "$df" > /dev/null || die "renovate.json does not track KIND_SHA256_LINUX_${arch} at ${kind_version}"
+  done
+  jq -e -Rs --slurpfile cfg "$rv" '
+    . as $df
+    | [ $cfg[0].customManagers[]
+        | select(.depNameTemplate == "kubernetes-sigs/kind" and ((.managerFilePatterns // []) | any(test("Dockerfile"))))
+        | .matchStrings[] as $re
+        | $df | match($re; "g") | [.offset, .offset + .length] ]
+    | sort | . as $s
+    | length == 3 and all(range(1; $s | length); $s[.][0] >= $s[. - 1][1])
+  ' "$df" > /dev/null || die "kind Renovate matches overlap or are missing"
 }
 
 test_e2e_workflow_isolates_deploy() {
@@ -7692,6 +7723,7 @@ run_test "devcontainer config is valid" test_devcontainer_config_is_valid
 run_test "devcontainer pins tools" test_devcontainer_pins_tools
 run_test "renovate updates OCM SHA256 ARGs" test_renovate_updates_ocm_sha256
 run_test "renovate updates Flux SHA256 ARGs" test_renovate_updates_flux_sha256
+run_test "renovate updates kind SHA256 ARGs" test_renovate_updates_kind_sha256
 run_test "renovate managers match their targets"   test_renovate_managers_match_targets
 run_test "renovate captures pinned versions"        test_renovate_captures_pinned_versions
 run_test "renovate regexes reject invalid input"    test_renovate_regexes_reject_invalid_input
