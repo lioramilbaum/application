@@ -1,6 +1,15 @@
 {
   "$schema": "https://docs.renovatebot.com/renovate-schema.json",
   "extends": ["github>lioramilbaum/renovate-config"],
+  "packageRules": [
+    {
+      "description": "OCM CLI bumps need a row in test/ocm-versions.tsv (docs/development.md#ocm-version-validation)",
+      "matchDepNames": ["open-component-model/open-component-model"],
+      "prBodyNotes": [
+        "**OCM CLI bump:** the `ocm-version-validated` check stays red, and the version-specific tests SKIP, until `test/ocm-versions.tsv` has a row for the new version. Add the row in a separate PR, not on this branch. See docs/development.md#ocm-version-validation."
+      ]
+    }
+  ],
   "customManagers": [
     {
       "customType": "regex",

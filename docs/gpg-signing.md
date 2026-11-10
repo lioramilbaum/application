@@ -90,7 +90,7 @@ signed-by	<signing subkey fingerprint>	SHA-256
 
 ### What the signature covers
 
-The signature covers the same descriptor digest as the RSA signature: `jsonNormalisation/v4alpha3` (`jsonNormalisation/v4alpha1` before OCM 0.23.0) over the descriptor, hashed with SHA-256. The `hashAlgorithm` in the signer config changes only the OpenPGP hash applied to that digest. The OCM digest does not change. The `sha512-signature` scenario signs with `hashAlgorithm: SHA-512`; its digest is identical to the default one, and `show` reports `SHA-512` in `signed-by`.
+The signature covers the same descriptor digest as the RSA signature: `jsonNormalisation/v4alpha3` over the descriptor, hashed with SHA-256. The `hashAlgorithm` in the signer config changes only the OpenPGP hash applied to that digest. The OCM digest does not change. The `sha512-signature` scenario signs with `hashAlgorithm: SHA-512`; its digest is identical to the default one, and `show` reports `SHA-512` in `signed-by`.
 
 ### Cross-check with gpg
 

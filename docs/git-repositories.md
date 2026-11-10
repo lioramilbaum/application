@@ -56,7 +56,7 @@ The source content is recorded without a digest and is not verifiable: OCM never
 
 ### Pinned commits and digests
 
-The `ref` in the tracked resource is resolved to a commit when the component is built. A branch that moves later does not change what the resource downloads (`branch-moved` below). The downloaded archive must match the digest recorded in the descriptor; otherwise the download fails (OCM 0.23.0: `digest mismatch: expected sha256:<hex>, got sha256:<hex>`; older releases: `git archive digest mismatch`).
+The `ref` in the tracked resource is resolved to a commit when the component is built. A branch that moves later does not change what the resource downloads (`branch-moved` below). The downloaded archive must match the digest recorded in the descriptor; otherwise the download fails with `digest mismatch: expected sha256:<hex>, got sha256:<hex>`.
 
 The digest covers the tree, not the commit. Two commits with the same tree have the same digest, so the commit named in an access can be replaced with another commit of the same tree without failing a download. A different tree fails with a digest mismatch.
 
