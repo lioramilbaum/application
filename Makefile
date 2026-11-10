@@ -81,7 +81,7 @@ graph: ## Build a three-level component graph across three CTFs (platform → fr
 github: ## Build, sign, verify, download and transfer the GitHub/v1 access demo against a local GitHub REST API emulator; offline (requires python3, curl). GITHUB_DEMO_ONLINE=1 bash scripts/github.sh online uses github.com
 	@bash scripts/github.sh
 
-normalisation: build ## Print the jsonNormalisation/v4alpha1 form of the application descriptor, compare it against ocm sign --dry-run, and show resource/component digest changes across label and blob mutations; offline
+normalisation: build ## Print the jsonNormalisation/v4alpha3 form (v4alpha1 before OCM 0.23.0) of the application descriptor, compare it against ocm sign --dry-run, and show resource/component digest changes across label and blob mutations; offline
 	@bash scripts/normalisation.sh
 
 s3: ## Start a local S3-compatible server (rustfs) on 127.0.0.1:19000, seed buckets, build, sign, verify and download the S3/v1 and S3/v2 access demo (version pinning, digest mismatch, input vs access, --copy-resources); requires Docker (skips without it) and curl >= 7.75; stop with: bash scripts/s3.sh stop

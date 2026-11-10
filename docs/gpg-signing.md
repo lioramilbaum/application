@@ -83,14 +83,14 @@ GPG must be selected explicitly. Unlike RSA, OCM has no default GPG verifier: a 
 
 ```text
 signature	gpg	GPG	application/vnd.ocm.signature.gpg
-digest	jsonNormalisation/v4alpha1	SHA-256	<hex>
+digest	jsonNormalisation/v4alpha3	SHA-256	<hex>
 key	<primary fingerprint>	OCM Demo Signer <signer@gpg-demo.lioramilbaum.github.com>
 signed-by	<signing subkey fingerprint>	SHA-256
 ```
 
 ### What the signature covers
 
-The signature covers the same descriptor digest as the RSA signature: `jsonNormalisation/v4alpha1` over the descriptor, hashed with SHA-256. The `hashAlgorithm` in the signer config changes only the OpenPGP hash applied to that digest. The OCM digest does not change. The `sha512-signature` scenario signs with `hashAlgorithm: SHA-512`; its digest is identical to the default one, and `show` reports `SHA-512` in `signed-by`.
+The signature covers the same descriptor digest as the RSA signature: `jsonNormalisation/v4alpha3` (`jsonNormalisation/v4alpha1` before OCM 0.23.0) over the descriptor, hashed with SHA-256. The `hashAlgorithm` in the signer config changes only the OpenPGP hash applied to that digest. The OCM digest does not change. The `sha512-signature` scenario signs with `hashAlgorithm: SHA-512`; its digest is identical to the default one, and `show` reports `SHA-512` in `signed-by`.
 
 ### Cross-check with gpg
 
@@ -168,7 +168,7 @@ The TSA is `scripts/tsa-server.py`, a stdlib-only HTTP server bound to `127.0.0.
 - `tsa.cnf`: the `openssl ts` configuration, with sha256 digests and policy `1.2.3.4.1`
 - `tsa.log`: one line per request the TSA received
 
-The token is stored in the GPG signature's `timestamp` field, which holds the token (`-----BEGIN TIMESTAMP TOKEN-----`) and its time. The TSA URL is stored as the component label `url.tsa.ocm.software/gpg`. Because the token is part of the descriptor, the copy verifies after the TSA has stopped. Since OCM 0.22.0, transferring a TSA-timestamped component fails because the component-descriptor schema rejects the `url.tsa.ocm.software/gpg` label's `version: v1alpha1` value (pattern `^v[0-9]+$` required); this is an upstream bug in open-component-model.
+The token is stored in the GPG signature's `timestamp` field, which holds the token (`-----BEGIN TIMESTAMP TOKEN-----`) and its time. The TSA URL is stored as the component label `url.tsa.ocm.software/gpg`. Because the token is part of the descriptor, the copy verifies after the TSA has stopped. Since OCM 0.22.0 (and still in 0.23.0), transferring a TSA-timestamped component fails because the component-descriptor schema rejects the `url.tsa.ocm.software/gpg` label's `version: v1alpha1` value (pattern `^v[0-9]+$` required); this is an upstream bug in open-component-model.
 
 Verification needs the TSA root in a `TSA/v1alpha1` consumer. `build/gpg/verify-tsa.ocmconfig` holds that consumer next to the GPG verifier:
 

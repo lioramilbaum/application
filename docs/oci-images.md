@@ -76,7 +76,7 @@ Each single-architecture resource carries `extraIdentity.architecture`, so it ca
 
 `scripts/oci.sh plan` dry-runs `ocm transfer cv` to `oci::http://registry.example.invalid/mirror` in three modes and prints the transformation count for each type. The plan, review and replay workflow is described in [Transfer and transport](transfer.md#transfer-and-transport):
 
-| Mode | Flags | Result with OCM 0.22.1 |
+| Mode | Flags | Result with OCM 0.22.1 and 0.23.0 |
 |---|---|---|
 | `plain` | none | three `TransferCTFLocalBlobToOCILocalBlob/v1alpha1`: the images stay `LocalBlob/v1` |
 | `copy-resources` | `--copy-resources` | same as `plain`: the images are local blobs, not external resources, so nothing is copied |

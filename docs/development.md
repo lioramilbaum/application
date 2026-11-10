@@ -54,7 +54,7 @@ make plugin     # install the demo-store plugin, build, download through it and 
 make registry   # start a local registry, push, sign, verify, pull and show the demo component, then the OCIImageLayer/v1 layer demo (OCM >= 0.21.0); requires Docker
 make graph      # build a three-level component graph (platform, frontend and backend, runtime) across three CTFs; show get cv --recursive, resolver order, flat vs recursive transfer and tamper detection; offline
 make github     # build, sign, verify, download and transfer the GitHub/v1 demo against a local GitHub REST API emulator; offline, requires python3 and curl
-make normalisation   # show the jsonNormalisation/v4alpha1 form of the application descriptor, compare it with ocm sign --dry-run, and show digest changes for label and blob variants; offline
+make normalisation   # show the jsonNormalisation/v4alpha3 form (v4alpha1 before OCM 0.23.0) of the application descriptor, compare it with ocm sign --dry-run, and show digest changes for label and blob variants; offline
 make s3          # start a local S3-compatible server, build, sign, verify and download the S3/v1 and S3/v2 demo; requires Docker (stop with: bash scripts/s3.sh stop)
 make none-access # build, sign and verify a component with a None-access resource; show that its digest is not signed, that download fails gracefully and how the signed label binds the external bytes; offline
 ```

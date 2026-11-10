@@ -99,6 +99,21 @@ _heading_slugs() {
   awk '/^(```|~~~)/{ if(!c){c=1; m=substr($0,1,3)} else if(substr($0,1,3)==m){c=0}; next } !c && /^#+ /{t=$0; sub(/^#+ /,"",t); s=tolower(t); gsub(/[^a-z0-9 _-]/,"",s); gsub(/ /,"-",s); print s}' "$1"
 }
 
+# _ocm_minor: minor version of $OCM for 0.x releases; 999 for 1.x and source builds.
+_ocm_minor() {
+  local v major minor rest
+  v="$("$OCM" version 2>/dev/null | sed -n 's/^[[:space:]]*Version:[[:space:]]*//p' | head -n1)"
+  v="${v#v}"
+  IFS=. read -r major minor rest <<<"$v"
+  if [[ "$major" == 0 && "$minor" =~ ^[0-9]+$ ]]; then echo "$minor"; else echo 999; fi
+}
+
+# _default_norm: normalisation OCM uses for new signatures and component reference
+# digests. OCM 0.23.0 switched it to jsonNormalisation/v4alpha3 (open-component-model#4006).
+_default_norm() {
+  if (( $(_ocm_minor) >= 23 )); then echo jsonNormalisation/v4alpha3; else echo jsonNormalisation/v4alpha1; fi
+}
+
 _build_golden() {
   if [[ ! -d "$GOLDEN_DIR/ctf" ]]; then
     mkdir -p "$GOLDEN_DIR"
@@ -2518,7 +2533,7 @@ test_readme_documents_signing_and_verification() {
   section="$(doc_section "Signing and verification")"
   [[ -n "$section" ]] || { echo "  README has no '## Signing and verification' section" >&2; return 1; }
   assert_contains "$section" "https://ocm.software/docs/concepts/signing-and-verification/" || return 1
-  assert_contains "$section" "jsonNormalisation/v4alpha1" || return 1
+  assert_contains "$section" "jsonNormalisation/v4alpha3" || return 1
   assert_contains "$section" "SHA-256" || return 1
   assert_contains "$section" "RSASSA-PSS" || return 1
   assert_contains "$section" "genericBlobDigest/v1" || return 1
@@ -3138,7 +3153,7 @@ test_product_references_application() {
   digest_norm="$(echo "$ref_json" | jq -r '.digest.normalisationAlgorithm')"
   digest_hash="$(echo "$ref_json" | jq -r '.digest.hashAlgorithm')"
   digest_value="$(echo "$ref_json" | jq -r '.digest.value')"
-  assert_eq "$digest_norm" "jsonNormalisation/v4alpha1" "digest normalisationAlgorithm" || return 1
+  assert_eq "$digest_norm" "$(_default_norm)" "digest normalisationAlgorithm" || return 1
   assert_eq "$digest_hash" "SHA-256" "digest hashAlgorithm" || return 1
   [[ -n "$digest_value" && "$digest_value" != "null" ]] || \
     { echo "  reference digest.value is empty" >&2; return 1; }
@@ -3255,7 +3270,7 @@ test_readme_documents_component_references() {
   local checks=(
     "https://ocm.software/docs/how-to/model-products/"
     "componentReferences"
-    "jsonNormalisation/v4alpha1"
+    "jsonNormalisation/v4alpha3"
     "make product"
     "build/product-ctf"
     "--recursive"
@@ -4343,7 +4358,7 @@ test_pki_signature_is_pem_encoded() {
   [[ -n "$sig" ]] || { echo "  no 'pki' signature on the component" >&2; return 1; }
   assert_eq "$(jq -r '.signature.mediaType' <<<"$sig")" "application/x-pem-file" "signature mediaType" || return 1
   assert_eq "$(jq -r '.signature.algorithm' <<<"$sig")" "RSASSA-PSS" "signature algorithm" || return 1
-  assert_eq "$(jq -r '.digest.normalisationAlgorithm' <<<"$sig")" "jsonNormalisation/v4alpha1" "normalisation" || return 1
+  assert_eq "$(jq -r '.digest.normalisationAlgorithm' <<<"$sig")" "$(_default_norm)" "normalisation" || return 1
 
   value="$(jq -r '.signature.value' <<<"$sig")"
   assert_eq "$(head -n1 <<<"$value")" "-----BEGIN SIGNATURE-----" "first PEM block" || return 1
@@ -4506,7 +4521,7 @@ test_pki_show_reports_chain() {
   out="$(bash "$ROOT/scripts/pki.sh" show 2>/dev/null)" || return 1
   assert_eq "$(wc -l <<<"$out" | tr -d ' ')" "4" "show prints 4 lines" || return 1
   assert_contains "$out" $'signature\tpki\tRSASSA-PSS\tapplication/x-pem-file' || return 1
-  assert_contains "$out" $'digest\tjsonNormalisation/v4alpha1\tSHA-256\t' || return 1
+  assert_contains "$out" $'digest\t'"$(_default_norm)"$'\tSHA-256\t' || return 1
   assert_contains "$out" $'cert\t0\tCN=OCM Demo Signer\tCN=OCM Demo Intermediate CA' || return 1
   assert_contains "$out" $'cert\t1\tCN=OCM Demo Intermediate CA\tCN=OCM Demo Root CA'
 }
@@ -4700,9 +4715,13 @@ test_git_digest_covers_tree_not_commit() {
     echo "  a commit with a different tree should fail to download" >&2
     return 1
   fi
-  # Either OCM reports the mismatch internally (archive-mismatch) or our SHA256
-  # check catches it (archive does not match the signed digest).
-  assert_contains "$out" "archive" || return 1
+  # OCM >= 0.23.0 binds the download to the descriptor digest and fails with
+  # "digest mismatch" (digest-mismatch). Older OCM reported "git archive digest
+  # mismatch" (archive-mismatch), or our own SHA-256 check caught it.
+  grep -qE 'download failed \((digest|archive)-mismatch\)|archive does not match the signed digest' <<<"$out" || {
+    echo "  download did not fail with a digest mismatch: $out" >&2
+    return 1
+  }
 }
 
 test_git_signature_binds_commit_label() {
@@ -4932,7 +4951,7 @@ test_readme_documents_git_repositories() {
     "application/x-tgz"
     "signing: true"
     "source content is recorded without a digest and is not verifiable"
-    "git archive digest mismatch"
+    "digest mismatch"
     "GitCredentials/v1"
     "localblob.uploader.transfer.config.ocm.software/v1alpha1"
     "cannot copy access type Git/v1"
@@ -4988,7 +5007,7 @@ test_gpg_signature_is_openpgp() {
   [[ -n "$sig" ]] || { echo "  no 'gpg' signature on the component" >&2; return 1; }
   assert_eq "$(jq -r '.signature.mediaType' <<<"$sig")" "application/vnd.ocm.signature.gpg" "signature mediaType" || return 1
   assert_eq "$(jq -r '.signature.algorithm' <<<"$sig")" "GPG" "signature algorithm" || return 1
-  assert_eq "$(jq -r '.digest.normalisationAlgorithm' <<<"$sig")" "jsonNormalisation/v4alpha1" "normalisation" || return 1
+  assert_eq "$(jq -r '.digest.normalisationAlgorithm' <<<"$sig")" "$(_default_norm)" "normalisation" || return 1
   assert_eq "$(jq -r '.digest.hashAlgorithm' <<<"$sig")" "SHA-256" "digest algorithm" || return 1
 
   value="$(jq -r '.signature.value' <<<"$sig")"
@@ -5231,7 +5250,7 @@ test_gpg_show_reports_key() {
   out="$(bash "$ROOT/scripts/gpg.sh" show 2>/dev/null)" || return 1
   assert_eq "$(wc -l <<<"$out" | tr -d ' ')" "4" "show prints 4 lines" || return 1
   assert_contains "$out" $'signature\tgpg\tGPG\tapplication/vnd.ocm.signature.gpg' || return 1
-  assert_contains "$out" $'digest\tjsonNormalisation/v4alpha1\tSHA-256\t' || return 1
+  assert_contains "$out" $'digest\t'"$(_default_norm)"$'\tSHA-256\t' || return 1
   assert_contains "$out" $'key\t' || return 1
   assert_contains "$out" $'signed-by\t'
 }
@@ -5274,13 +5293,13 @@ test_gpg_timestamp_survives_transfer() {
   # The timestamp script stops the TSA; the copy must verify with it stopped.
   assert_fails curl -fsS -o /dev/null --max-time 2 "http://127.0.0.1:18462/-/ready" || return 1
 
-  # OCM 0.22.x rejects its own TSA label (url.tsa.ocm.software/gpg, version: v1alpha1)
+  # OCM >= 0.22.0 (still in 0.23.0) rejects its own TSA label (url.tsa.ocm.software/gpg, version: v1alpha1)
   # during transfer because the component-descriptor schema requires version ~= ^v[0-9]+$.
   # Assert the failure and its cause so a fix is detectable.
   "$OCM" transfer cv --config "$tmp/gpg/verify-tsa.ocmconfig" \
     "$(_gpg_ref "$tmp/gpg/timestamp-ctf")" "ctf::$tmp/gpg-timestamp-transferred" \
     </dev/null >"$tmp/transfer.out" 2>"$tmp/transfer.err" \
-    && { echo "  expected transfer to fail under OCM 0.22.x but it succeeded" >&2; return 1; }
+    && { echo "  expected transfer to fail (OCM >= 0.22.0 TSA label bug) but it succeeded" >&2; return 1; }
   assert_contains "$(cat "$tmp/transfer.err")" "v1alpha1" \
     "transfer fails with TSA label schema rejection" || return 1
 }
@@ -5849,8 +5868,11 @@ test_plugin_scenarios_correct_response() {
 }
 
 test_plugin_scenarios_malformed_response() {
-  local tmp="$1" out expected
+  local tmp="$1" out expected tampered=$'tampered-content\tok\tfail\tdigest-mismatch'
   _plugin_env "$tmp"
+  # OCM 0.23.0 checks plugin-served bytes against the descriptor digest itself
+  # (open-component-model#4085), so the download fails before the script's own check.
+  if (( $(_ocm_minor) >= 23 )); then tampered=$'tampered-content\tfail\t-\tdigest-mismatch'; fi
   out="$(bash "$ROOT/scripts/plugin.sh" scenarios malformed-capabilities malformed-response \
     plugin-error unsupported-location tampered-content)" || return 1
   expected="$(printf '%s\n' \
@@ -5858,7 +5880,7 @@ test_plugin_scenarios_malformed_response() {
     $'malformed-response\tfail\t-\tmalformed-response' \
     $'plugin-error\tfail\t-\tplugin-error' \
     $'unsupported-location\tfail\t-\tunsupported-location' \
-    $'tampered-content\tok\tfail\tdigest-mismatch')"
+    "$tampered")"
   assert_eq "$out" "$expected" "scenario rows"
 }
 
@@ -6668,7 +6690,13 @@ test_normalisation_rejects_legacy_v1() {
   _normalisation_env "$tmp"
   out="$(bash "$ROOT/scripts/normalisation.sh" algorithms </dev/null 2>/dev/null)" || return 1
   assert_contains "$out" "jsonNormalisation/v1" || return 1
-  assert_contains "$out" "supported for verification only" "legacy algorithm is rejected for signing" || return 1
+  assert_contains "$out" "$(_default_norm)"$'\tsupported' "default algorithm is listed" || return 1
+  local reason want="supported for verification only"
+  # OCM 0.23.0 rejects jsonNormalisation/v1 while parsing --normalisation.
+  if (( $(_ocm_minor) >= 23 )); then want="expected one of"; fi
+  reason="$(awk -F'\t' '$1 == "jsonNormalisation/v1" && $2 == "rejected" { print $3 }' <<<"$out")"
+  [[ -n "$reason" ]] || { echo "  jsonNormalisation/v1 was not rejected for signing" >&2; return 1; }
+  assert_contains "$reason" "$want" "legacy algorithm is rejected for signing" || return 1
 }
 
 test_make_normalisation_target() {
@@ -6688,11 +6716,12 @@ test_readme_documents_signing_normalisation() {
   section="$(doc_section "Signing normalisation")"
 
   local checks=(
-    "jsonNormalisation/v4alpha1"
+    "jsonNormalisation/v4alpha3"
     "supported for verification only"
+    "expected one of"
     "jsonNormalisation/v1"
     "make normalisation"
-    "components/normalisation/jsonNormalisation-v4alpha1.jq"
+    "components/normalisation/jsonNormalisation-v4alpha3.jq"
     "ocm sign cv --dry-run"
     "jq-matches-ocm"
     "| \`unsigned-label\` |"
@@ -7106,7 +7135,7 @@ test_readme_documents_none_access() {
     "None/v1"
     "not signed"
     "#signing-normalisation)"
-    "jsonNormalisation/v4alpha1"
+    "jsonNormalisation/v4alpha3"
     "not allowed"
     "missing digest"
     "signing: true"
