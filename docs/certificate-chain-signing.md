@@ -67,7 +67,7 @@ The verifier config (`build/pki/verify.ocmconfig`) holds only the root CA, in `p
 
 ```text
 signature	pki	RSASSA-PSS	application/x-pem-file
-digest	jsonNormalisation/v4alpha1	SHA-256	<hex>
+digest	jsonNormalisation/v4alpha3	SHA-256	<hex>
 cert	0	CN=OCM Demo Signer	CN=OCM Demo Intermediate CA
 cert	1	CN=OCM Demo Intermediate CA	CN=OCM Demo Root CA
 ```

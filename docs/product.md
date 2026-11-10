@@ -15,7 +15,7 @@ componentReferences:
     version: ${VERSION}
 ```
 
-When `ocm add cv` builds the product, it resolves the reference and computes a `digest` from the application's normalized descriptor (`jsonNormalisation/v4alpha1`, SHA-256). The product's own signature then covers that digest, so `ocm verify` detects any change to the product descriptor — including any change to `references[0].digest`, `name`, `componentName`, or `version`.
+When `ocm add cv` builds the product, it resolves the reference and computes a `digest` from the application's normalized descriptor (`jsonNormalisation/v4alpha3` since OCM 0.23.0, `jsonNormalisation/v4alpha1` before; SHA-256). The product's own signature then covers that digest, so `ocm verify` detects any change to the product descriptor — including any change to `references[0].digest`, `name`, `componentName`, or `version`.
 
 ```sh
 make product   # runs make build → make sign → scripts/product.sh (build, sign, verify, tree)

@@ -4,7 +4,7 @@
 
 The [OCM signing and verification](https://ocm.software/docs/concepts/signing-and-verification/)
 model signs the component descriptor, not the artifact bytes directly. `ocm sign cv` normalizes
-the descriptor with `jsonNormalisation/v4alpha1` (JSON canonicalization after dropping excluded
+the descriptor with `jsonNormalisation/v4alpha3` (`jsonNormalisation/v4alpha1` before OCM 0.23.0; JSON canonicalization after dropping excluded
 fields), hashes the result with `SHA-256`, and signs the hash with `RSASSA-PSS`. The signature
 is stored in the descriptor's `signatures` list under the name `default` (or `sigstore` for
 keyless signing). `ocm verify cv` recomputes the digest from the normalized descriptor and
@@ -65,7 +65,7 @@ OIDC token from the CI environment.
 
 ## Signing normalisation
 
-`ocm sign cv` does not hash the descriptor as stored. It first normalises it with `jsonNormalisation/v4alpha1` and signs the SHA-256 of the result. The normalised form keeps the fields that are meant to be signed and drops the rest:
+`ocm sign cv` does not hash the descriptor as stored. It first normalises it with `jsonNormalisation/v4alpha3` (`jsonNormalisation/v4alpha1` before OCM 0.23.0) and signs the SHA-256 of the result. The normalised form keeps the fields that are meant to be signed and drops the rest:
 
 - Kept: component `name`, `version`, `provider`, and labels with `signing: true`; for each resource its `name`, `version`, `type`, `relation` and `digest`; for each source and component reference the same kind of fields.
 - Dropped: `meta`, `signatures`, `nestedDigests`, `repositoryContexts`, every `access` block, `srcRefs`, and every label without `signing: true`.
@@ -102,7 +102,7 @@ resources:
 | `signed-label` | `channel` label changed (`signing: true`) | no | yes | a signed label is part of the component digest, but not of any resource digest |
 | `blob` | `payload` text changed | yes | yes | the resource digest changes, and the component digest follows it |
 
-The reimplementation in `components/normalisation/jsonNormalisation-v4alpha1.jq` reproduces the OCM digest for every variant: the `jq-matches-ocm` column is `yes` on each row. The jq filter is a reading aid, not a second source of truth. When OCM changes the rules, the `make normalisation` check fails.
+The reimplementation in `components/normalisation/jsonNormalisation-v4alpha3.jq` reproduces the OCM digest for every variant: the `jq-matches-ocm` column is `yes` on each row. The jq filter is a reading aid, not a second source of truth. When OCM changes the rules, the `make normalisation` check fails.
 
 Inspect the digest OCM computes without signing:
 
@@ -111,7 +111,7 @@ ocm sign cv --config build/sign.ocmconfig --dry-run -o json \
   ctf::./build/ctf//github.com/lioramilbaum/application:0.1.0 | jq -r '.digest.value'
 ```
 
-`jsonNormalisation/v4alpha1` is the algorithm used for signing. Since OCM 0.22.0, the older `jsonNormalisation/v1` (gardener/cc-utils format) is verify-only: `ocm sign cv --normalisation jsonNormalisation/v1` fails with `normalisation algorithm is supported for verification only, not signing`, but existing signatures made with it can still be verified.
+`jsonNormalisation/v4alpha3` is the default for new signatures since OCM 0.23.0; earlier releases signed with `jsonNormalisation/v4alpha1`. The two differ only in label handling: v4alpha3 also signs the `version` of a label with `signing: true`, and it drops component-reference labels without `signing: true` (v4alpha1 keeps them). The jq filter follows v4alpha3. For the demo descriptors, which have no versioned or reference labels, both algorithms give the same digest. With OCM 0.23.0, `--normalisation jsonNormalisation/v4alpha1` still works, but OCM warns `signing with an older normalisation algorithm`. Existing v4alpha1 signatures still verify. The older `jsonNormalisation/v1` (gardener/cc-utils format) is verify-only: `ocm sign cv --normalisation jsonNormalisation/v1` fails. OCM 0.22.x reports `normalisation algorithm is supported for verification only, not signing`. OCM 0.23.0 rejects the flag value with `expected one of ["jsonNormalisation/v4alpha3" "jsonNormalisation/v4alpha2" "jsonNormalisation/v4alpha1"]`. Existing signatures made with v1 can still be verified.
 
 The rules are described in [Signing and verification](#signing-and-verification): unsigned labels, access and `srcRefs` are outside the signature, and so is anything the signature table there lists as "no".
 

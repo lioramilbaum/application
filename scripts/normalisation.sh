@@ -8,7 +8,7 @@ source "$(dirname "$0")/keys.sh"
 require "$OCM" jq
 
 NORM_DEMO_OUT="${NORM_DEMO_OUT:-$BUILD_DIR/normalisation}"
-NORM_JQ="$ROOT/components/normalisation/jsonNormalisation-v4alpha1.jq"
+NORM_JQ="$ROOT/components/normalisation/jsonNormalisation-v4alpha3.jq"
 CTF="${CTF:-$BUILD_DIR/ctf}"
 APP_COMPONENT="github.com/lioramilbaum/application"
 APP_REF="ctf::${CTF}//${APP_COMPONENT}:${VERSION}"
@@ -95,14 +95,18 @@ _compare() {
   done <<<"$rows"
 }
 
+# Prints the algorithm OCM signs with by default (jsonNormalisation/v4alpha3 since
+# OCM 0.23.0, v4alpha1 before) and the rejection of the verify-only jsonNormalisation/v1.
 _algorithms() {
-  printf 'jsonNormalisation/v4alpha1\tsupported\n'
-  local err
+  local ref="ctf::$NORM_DEMO_OUT/base-ctf//github.com/lioramilbaum/normalisation-demo:${VERSION}" err
+  printf '%s\tsupported\n' "$("$OCM" sign cv --config "$BUILD_DIR/sign.ocmconfig" \
+    --dry-run -o json "$ref" </dev/null 2>/dev/null | jq -r '.digest.normalisationAlgorithm')"
   err="$("$OCM" sign cv --config "$BUILD_DIR/sign.ocmconfig" \
-    --dry-run --normalisation "jsonNormalisation/v1" \
-    "ctf::$NORM_DEMO_OUT/base-ctf//github.com/lioramilbaum/normalisation-demo:${VERSION}" \
+    --dry-run --normalisation "jsonNormalisation/v1" "$ref" \
     </dev/null 2>&1 || true)"
-  printf 'jsonNormalisation/v1\trejected\t%s\n' "$(echo "$err" | grep -o 'supported for verification only.*' | head -1)"
+  # OCM 0.22.x: "supported for verification only"; 0.23.0 rejects the flag value: "expected one of".
+  printf 'jsonNormalisation/v1\trejected\t%s\n' \
+    "$(echo "$err" | grep -oE 'expected one of.*|supported for verification only.*' | head -1)"
 }
 
 mkdir -p "$NORM_DEMO_OUT"
