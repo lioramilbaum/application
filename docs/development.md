@@ -19,6 +19,8 @@
 - `flux` CLI v2.9.6 (required for `make controller` only; the devcontainer installs it)
 - Docker Hub access for `make build` and `make test` (to resolve `nginx:1.31-alpine`)
 
+The tests are validated against the OCM CLI versions listed in `test/ocm-versions.tsv`; on any other version the version-specific tests SKIP (see [OCM version validation](#ocm-version-validation)).
+
 OCM CLI and kind are provided by the devcontainer image. Outside the devcontainer, put `ocm` and `kind` on your PATH.
 
 The `.devcontainer/` directory provides all required tools when used with Docker Desktop or a compatible Docker host and devcontainers CLI.
@@ -54,7 +56,7 @@ make plugin     # install the demo-store plugin, build, download through it and 
 make registry   # start a local registry, push, sign, verify, pull and show the demo component, then the OCIImageLayer/v1 layer demo (OCM >= 0.21.0); requires Docker
 make graph      # build a three-level component graph (platform, frontend and backend, runtime) across three CTFs; show get cv --recursive, resolver order, flat vs recursive transfer and tamper detection; offline
 make github     # build, sign, verify, download and transfer the GitHub/v1 demo against a local GitHub REST API emulator; offline, requires python3 and curl
-make normalisation   # show the jsonNormalisation/v4alpha3 form (v4alpha1 before OCM 0.23.0) of the application descriptor, compare it with ocm sign --dry-run, and show digest changes for label and blob variants; offline
+make normalisation   # show the jsonNormalisation/v4alpha3 form of the application descriptor, compare it with ocm sign --dry-run, and show digest changes for label and blob variants; offline
 make s3          # start a local S3-compatible server, build, sign, verify and download the S3/v1 and S3/v2 demo; requires Docker (stop with: bash scripts/s3.sh stop)
 make none-access # build, sign and verify a component with a None-access resource; show that its digest is not signed, that download fails gracefully and how the signed label binds the external bytes; offline
 ```
@@ -89,6 +91,37 @@ Renovate bumps `OCM_CLI_VERSION` together with both `OCM_SHA256_LINUX_AMD64` and
 Renovate likewise bumps `FLUX_VERSION` in the Dockerfile and `scripts/controller.sh` together with both `FLUX_SHA256_LINUX_AMD64` and `FLUX_SHA256_LINUX_ARM64`, using `github-release-attachments` and `# renovate: flux-linux-<arch> <version>` markers in the Dockerfile.
 
 `KIND_SHA256_*` ARGs are still updated by hand when Renovate bumps `KIND_VERSION`.
+
+## OCM version validation
+
+The tests are validated against the OCM CLI versions in `test/ocm-versions.tsv`, one row per version. A row records the behaviour that has changed between OCM releases and that the tests assert:
+
+| Column | Behaviour | Tests |
+|---|---|---|
+| `default_norm` | normalisation algorithm of new signatures and component-reference digests | `readme documents signing and verification`, `product references application`, `pki signature is pem encoded`, `pki show reports chain`, `gpg signature is openpgp`, `gpg show reports key`, `normalisation rejects legacy v1` |
+| `v1_sign_rejection` | error text of `ocm sign cv --normalisation jsonNormalisation/v1` | `normalisation rejects legacy v1` |
+| `plugin_tampered` | `<ocm>,<check>` columns of the plugin `tampered-content` scenario | `plugin scenarios malformed response` |
+| `git_tree_mismatch` | `scripts/git.sh download` reason for a commit with a different tree | `git digest covers tree not commit` |
+| `tsa_label_transfer` | `ok` or `fail`: transfer of a TSA-timestamped GPG component (upstream label bug) | `gpg timestamp survives transfer` |
+
+A row's `version` must equal the string `ocm version` prints exactly (after stripping a leading `v`), including any pre-release or build suffix: a release candidate such as `0.24.0-rc.1` needs its own row.
+
+These tests read their expectation from the row of the installed `ocm version` (`_ocm_expect` in `test/run.sh`). On a version without a row:
+
+- the version-specific tests report SKIP (`skip: OCM <version> not validated`), and `make test` prints `NOTE: OCM <version> not validated` above the results;
+- all other tests run as usual, so the `test` CI job stays green unless something else broke;
+- `make ocm-version-check` fails with `OCM <version> not validated: add expectations to test/ocm-versions.tsv`. CI runs it in the separate `ocm-version-validated` job, which turns red on the pull request.
+
+`ocm-version-validated` is informational and must not be a required status check. `main` has no branch protection or rulesets today, so no check is required. If you add them, require `test` and the E2E jobs, not `ocm-version-validated`.
+
+When Renovate bumps `OCM_CLI_VERSION` to a version without a row:
+
+1. Do not push to the Renovate branch. Check it out locally and run `make test` in its devcontainer.
+2. For each column, check the behaviour of the new version in the tests listed above, and add a row for it to `test/ocm-versions.tsv`. Keep the existing rows: `main` still runs the old version until the Renovate PR merges. If OCM changed something else, fix that test. If behaviour that a test asserts differs between versions, add a column and read it with `_ocm_expect` at the top of the test.
+3. `make ocm-version-check lint test` must pass with the new version and report no `not validated` note.
+4. Commit the row (and any test or doc changes) on a branch from `main` and open a separate PR. After it merges, Renovate rebases its PR and `ocm-version-validated` turns green.
+
+Rows for older versions can stay. Remove a row when a new column would need a value that you can no longer check.
 
 ## Running tests
 
@@ -138,12 +171,13 @@ Tests include:
 - Resources without access (None): `none-access sha256 matches constructor label`, `none-access resource has no digest in descriptor`, `none-access build warns no digest processor`, `none-access control resource downloads`, `none-access download fails gracefully`, `none-access sign and verify`, `none-access digest not signed`, `none-access digest triggers warning`, `none-access lowercase warns missing digest`, `none-access versioned type is not none`, `none-access identity is signed`, `none-access label is signed`, `none-access audit passes`, `none-access audit detects tamper`, `none-access transfer keeps none`, `none-access copy resources keeps none`, `make none-access target`, `readme documents none access`
 - README index: `readme intro lists demos`
 - Repository metadata: `license is apache 2.0`, `contributing guide covers workflow`
+- OCM version validation: `ocm versions table is well formed`, `ocm version check rejects unlisted`, `ocm version check accepts validated`, `ocm version-specific tests skip unlisted`, `ci checks ocm version separately`, `docs document ocm version validation`
 
 ## CI
 
 CI runs on `ubuntu-latest` (linux/amd64) inside the devcontainer across three workflows:
 
-- **`ci.yaml`** — runs on every push and pull request to `main`: lint and unit tests.
+- **`ci.yaml`** — runs on every push and pull request to `main`: lint and unit tests (`test` job), and the non-blocking `ocm-version-validated` job (`make ocm-version-check`, see [OCM version validation](#ocm-version-validation)).
 - **`release.yaml`** — triggered by a `v*.*.*` tag or `workflow_dispatch` with a semver `version` input. Runs tests, then builds and signs the OCM component with `OCM_SIGNING_KEY`, uploads a `application-ctf` artifact, and on tags publishes the component to `ghcr.io/<owner>/ocm` and creates a GitHub release.
 - **`e2e.yaml`** — runs on every push and pull request to `main`. A `package` job builds and signs the component with an auto-generated dev key and uploads it. A `deploy` job downloads it, verifies the signature, and runs the e2e in isolation: it creates the kind cluster and pre-pulls the rendered manifest images into the kind nodes, then blocks new outbound connections from the kind network with an iptables `DOCKER-USER` rule and starts a `tcpdump` capture on the kind bridge. It runs `make e2e-run` against the cluster, then removes the rule, stops the capture, and fails if any packet left the private ranges for the public internet. The pcap and tcpdump text are uploaded as the `application-e2e-egress-evidence` artifact.
 

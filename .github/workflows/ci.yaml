@@ -41,3 +41,29 @@ jobs:
           env: |
             SOURCE_COMMIT=${{ github.sha }}
           runCmd: make lint test
+
+  # Separate, non-blocking check: red when the devcontainer's OCM CLI has no row in
+  # test/ocm-versions.tsv (version-specific tests then SKIP in the test job). It runs
+  # whenever this workflow runs. The workflow's paths-ignore means a PR that touches only
+  # ignored paths (for example renovate.json) runs neither this job nor test.
+  # Do not mark it as a required status check. See docs/development.md#ocm-version-validation.
+  ocm-version-validated:
+    name: ocm-version-validated
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Log in to GHCR (devcontainer cache)
+        continue-on-error: true
+        env:
+          GHCR_USER: ${{ github.actor }}
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: printf '%s' "$GHCR_TOKEN" | docker login ghcr.io -u "$GHCR_USER" --password-stdin
+      - name: Check OCM CLI version is validated
+        uses: devcontainers/ci@513af61f4de4f75d37e4438f184ba4358f0fc1ca # v0.3.1900000450
+        with:
+          push: never
+          cacheFrom: ${{ env.DEVCONTAINER_IMAGE }}:latest
+          env: |
+            GITHUB_ACTIONS=true
+          runCmd: make ocm-version-check

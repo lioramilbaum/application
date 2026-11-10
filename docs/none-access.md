@@ -2,7 +2,7 @@
 
 A resource with `access: type: None` is listed in the component, but OCM has no access to fetch its bytes. It records that an artifact exists and where it belongs: provenance records, attestations and artifacts that live outside OCM.
 
-**`None` resources are not signed.** Before hashing, `jsonNormalisation/v4alpha3` (like `v4alpha1` before OCM 0.23.0) drops the `digest` of every resource whose access type is `None` (see [Signing normalisation](signing.md#signing-normalisation)). A digest written for a `None` resource therefore changes neither the component digest nor the signature. OCM also warns that it cannot use that digest. To bind the external bytes to the signature, put their sha256 in a label with `signing: true` (see [Binding external bytes](#binding-external-bytes)).
+**`None` resources are not signed.** Before hashing, `jsonNormalisation/v4alpha3` drops the `digest` of every resource whose access type is `None` (see [Signing normalisation](signing.md#signing-normalisation)). A digest written for a `None` resource therefore changes neither the component digest nor the signature. OCM also warns that it cannot use that digest. To bind the external bytes to the signature, put their sha256 in a label with `signing: true` (see [Binding external bytes](#binding-external-bytes)).
 
 ### Demo component
 

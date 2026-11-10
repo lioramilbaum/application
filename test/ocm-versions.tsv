@@ -1,0 +1,15 @@
+# OCM CLI versions this repository's tests are validated against, one row per version.
+# test/run.sh reads the expected version-specific behaviour from the row matching
+# `ocm version`. On a version without a row, the version-specific tests SKIP and the
+# ocm-version-validated CI check fails (make ocm-version-check).
+# To validate a new OCM release, see docs/development.md#ocm-version-validation.
+#
+# Columns (tab-separated):
+#   version              OCM CLI version as printed by `ocm version` (no leading v)
+#   default_norm         normalisation algorithm of new signatures and reference digests
+#   v1_sign_rejection    text in the error of `ocm sign cv --normalisation jsonNormalisation/v1`
+#   plugin_tampered      `scripts/plugin.sh scenarios tampered-content` row: <ocm>,<check>
+#   git_tree_mismatch    `scripts/git.sh download` reason for a commit with a different tree
+#   tsa_label_transfer   `ocm transfer cv` of a TSA-timestamped GPG component: ok or fail
+version	default_norm	v1_sign_rejection	plugin_tampered	git_tree_mismatch	tsa_label_transfer
+0.23.0	jsonNormalisation/v4alpha3	expected one of	fail,-	digest-mismatch	fail

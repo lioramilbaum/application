@@ -116,7 +116,7 @@ The demo plugin is stdlib only and runs on Python 3.9. These points cost the mos
 
 ### Limitations
 
-- Before OCM 0.23.0, OCM does not check the bytes served by `/resource/get` against the digest in the descriptor. A plugin that serves tampered bytes therefore downloads "successfully", and `make plugin` catches this with its own comparison (`tampered-content` row `ok fail`). Since OCM 0.23.0, `ocm download resource` makes that check itself and fails with `digest mismatch` (`tampered-content` row `fail -`).
+- `ocm download resource` checks the bytes served by `/resource/get` against the digest in the descriptor and fails with `digest mismatch` (`tampered-content` row `fail -`). `make plugin` also compares the downloaded bytes with the digest itself, for OCM releases that do not check them (`tampered-content` row `ok fail`).
 - `ocm describe types access` lists only built-in access types, not plugin types.
 - There is no `ocm plugin list`. `ocm plugin` only has `registry` subcommands. To see what is registered, run with `--loglevel debug` and read the `discovered plugin` and `adding ... plugin` lines.
 - `locations` under `plugin.config.ocm.software` is always overwritten by `--plugin-directory`, which always has a value, so it never takes effect.
