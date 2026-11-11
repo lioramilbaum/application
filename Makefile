@@ -3,7 +3,7 @@ OCM            ?= ocm
 
 export VERSION OCM
 
-.PHONY: help build sign verify resolvers manifests deploy publish transfer-plan ownership sbom product versions helm wget pki git gpg oci credentials plugin registry controller graph github normalisation s3 none-access lint test ocm-version-check e2e cluster-up cluster-down e2e-run clean
+.PHONY: help build sign verify resolvers manifests deploy publish transfer-plan ownership sbom product versions helm wget pki git gpg oci credentials plugin registry controller source package target target-cluster target-bootstrap target-transfer target-deploy target-down up bootstrap graph github normalisation s3 none-access lint test ocm-version-check e2e cluster-up cluster-down e2e-run clean
 
 help: ## Show this help
 	@grep -E '^[a-zA-Z0-9_-]+:.*?## .*$$' $(MAKEFILE_LIST) | \
@@ -74,6 +74,36 @@ registry: ## Start a local registry:2 on 127.0.0.1:5055, push (ocm transfer cv),
 
 controller: ## Create or reuse the ocm-controller kind cluster, install OCM controllers, kro and Flux, deploy the published component (OCM_CONTROLLER_REPO=ghcr.io/lioramilbaum/ocm) via NamespacedDeployer + kro + Flux and check the pod answers; KEEP_CLUSTER=1 keeps it (requires docker, helm, flux, kind; stop with: bash scripts/controller.sh down)
 	@bash scripts/controller.sh
+
+source: build sign ## Online side, the only step that needs the internet: write build/bootstrap-bundle when it is missing or stale (CTF, key or platform pins changed)
+	@bash scripts/sourcectl.sh check || bash scripts/sourcectl.sh bundle
+
+package: ## Write the bootstrap bundle unconditionally (build/bootstrap-bundle: signed CTF with external resources inlined, charts, Flux manifests, platform image archives for amd64 and arm64, image list, public key); run make build sign first; online (requires helm, flux, OCM)
+	@bash scripts/sourcectl.sh bundle
+
+target: ## Offline side: target-bootstrap, target-transfer and target-deploy from build/bootstrap-bundle; leaves everything running (stop with: make target-down)
+	@bash scripts/targetctl.sh up
+
+target-cluster: ## Create the ocm-bootstrap kind cluster, the stand-in for the site's own cluster, from the pinned node image; reuses it when it exists (CI runs this before the egress block)
+	@bash scripts/targetctl.sh cluster
+
+target-bootstrap: ## Offline: create the ocm-bootstrap kind cluster when missing, load the platform images from build/bootstrap-bundle, start the registry, point containerd at it, install the OCM controller, kro, Flux and the controller RBAC
+	@bash scripts/targetctl.sh bootstrap
+
+target-transfer: ## Offline: verify the bundle component and transfer it into the target registry (needs target-bootstrap)
+	@bash scripts/targetctl.sh transfer
+
+target-deploy: ## Offline: deploy the application from the target registry and check it (needs target-transfer)
+	@bash scripts/targetctl.sh deploy
+
+target-down: ## Delete the ocm-bootstrap kind cluster and the registry
+	@bash scripts/targetctl.sh down
+
+up: source ## Air-gapped path end to end: source (online), then target (offline); leaves everything running (stop with: make target-down)
+	@$(MAKE) --no-print-directory target
+
+bootstrap: source ## Ready the air-gapped target: source, then target-bootstrap; next: make target-transfer target-deploy
+	@bash scripts/targetctl.sh bootstrap
 
 graph: ## Build a three-level component graph across three CTFs (platform → frontend/backend → runtime), show get cv --recursive, resolver order, flat vs recursive transfer and transitive digest enforcement; offline
 	@bash scripts/graph.sh

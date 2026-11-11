@@ -16,7 +16,8 @@
 - `kubectl` (for deploying and for `make manifests`, which uses `kubectl kustomize`)
 - `helm` is optional for `make helm` (only for rendering the downloaded chart with `helm template`) but required for `make controller`
 - `docker` (for `make e2e` or `make e2e-run` only, and for `make registry`)
-- `flux` CLI v2.9.6 (required for `make controller` only; the devcontainer installs it)
+- `flux` CLI (required for `make controller` and `make package`/`make source`; the version is pinned by `FLUX_VERSION` in `.devcontainer/Dockerfile`, and the devcontainer installs it)
+- `docker`, `kind`, `helm`, `kubectl`, `ocm`, `jq` and `tar` for the offline target targets (`make target`, `make target-bootstrap`, `make target-transfer`, `make target-deploy`); `make source` and `make package` need internet access (see [Air-gapped target](bootstrap.md))
 - Docker Hub access for `make build` and `make test` (to resolve `nginx:1.31-alpine`)
 
 The tests are validated against the OCM CLI versions listed in `test/ocm-versions.tsv`; on any other version the version-specific tests SKIP (see [OCM version validation](#ocm-version-validation)).
@@ -40,6 +41,16 @@ make e2e-run         # run e2e against an existing cluster
 make cluster-down    # delete the kind cluster
 make e2e             # spin up kind cluster, deploy, verify pod ready, tear down (requires docker)
 make controller      # create or reuse the ocm-controller kind cluster, install OCM controllers, kro and Flux, deploy the published component and check the pod (requires docker, helm, flux; KEEP_CLUSTER=1 keeps it; see docs/controller.md)
+make source         # online: write build/bootstrap-bundle when missing or stale, after build and sign (see docs/bootstrap.md)
+make package        # online: always rewrite build/bootstrap-bundle: the bundle CTF (external resources inlined), charts, Flux manifests, platform image archives (amd64 and arm64), image list and public key; run make build sign first (requires helm, flux)
+make target         # offline: target-bootstrap, target-transfer and target-deploy from the bundle; leaves everything running
+make target-cluster    # create the ocm-bootstrap kind cluster, the stand-in for the site's cluster; reuses it when it exists
+make target-bootstrap  # offline: create the cluster when missing, load the platform images, start the registry, install the controller stack
+make target-transfer   # offline: transfer the component into the target registry
+make target-deploy     # offline: deploy the application from the target registry and check it
+make target-down    # delete the ocm-bootstrap kind cluster and the registry
+make up             # make source, then make target
+make bootstrap      # make source, then target-bootstrap only: a ready environment for target-transfer and target-deploy
 make publish OCM_REPO=ghcr.io/<you>/ocm  # transfer to an OCI registry, copying external resources (e.g. the nginx image) as OCI artifacts; optional OCM_REGISTRY_USERNAME/OCM_REGISTRY_PASSWORD
 make ownership       # build the ownership demo component and trace the owner of each resource
 make sbom            # regenerate the CycloneDX SBOM (build/sbom/hello-world.cdx.json); also run by make build
@@ -80,9 +91,13 @@ make e2e-run         # Run e2e tests against the cluster (only tears down if it 
 make cluster-down    # Delete the cluster
 ```
 
+Every kind cluster in this repository is created from one pinned node image, `KIND_NODE_IMAGE` in `scripts/cluster.sh` (`kindest/node:v1.37.0@sha256:…`). That covers `make cluster-up` and `make e2e` (the CI `e2e (cli)` leg), `make controller`, and the air-gapped `targetctl.sh bootstrap`. The pin is the image kind v0.33.0 uses by default, so clusters are the same as before it was pinned, now by digest. `bash scripts/cluster.sh node-image` prints it. Renovate updates it; a bump must stay a node image that the release notes of the pinned `KIND_VERSION` list.
+
 The `e2e.sh` script automatically detects whether the cluster existed before this run and only tears it down if this run created it. This allows reusing pre-existing clusters in CI environments.
 
 `make controller` is separate from `make e2e`. It uses its own kind cluster, `ocm-controller`, and deploys the published component from `ghcr.io/lioramilbaum/ocm` through the OCM controllers, kro and Flux. It needs internet access and a published component with the `hello-world-rgd` and `hello-world-kustomize` resources, and CI does not run it. See [Controller stack](controller.md).
+
+The air-gapped path runs the same controller stack with no internet access on the target. `make source` (`sourcectl.sh bundle`) is its only online step: it writes `build/bootstrap-bundle`, platform images included. On the target, `targetctl.sh bootstrap` prepares the environment (cluster, platform images, registry, controller stack), `targetctl.sh transfer` puts the component into the registry and `targetctl.sh deploy` deploys the application; `make target` runs all three and `make up` runs `make source` first. None of them names an internet host. The `e2e (controller)` leg of CI runs bootstrap, transfer and deploy with the egress block in place. See [Air-gapped target](bootstrap.md).
 
 ## Version management
 
@@ -130,6 +145,7 @@ make test  # run the test suite
 ```
 
 Tests include:
+- Air-gapped controller path: `rgd is valid kro simple schema`, `controller rbac grants controller rgd read`, `deploy resources ship in component`, `controller.sh install uses offline sources`, `controller.sh apply localizes deploy manifest with guards`, `controller.sh check waits on app label`, `cluster.sh passes kind config`, `sourcectl bundle writes offline bundle`, `sourcectl bundle writes image archives`, `sourcectl check detects changed platform pins`, `targetctl cluster creates stand-in cluster`, `targetctl bootstrap uses existing cluster`, `targetctl bootstrap loads platform images from the bundle`, `targetctl bootstrap rejects mislabeled archive`, `targetctl bootstrap fails on unstaged image`, `targetctl bootstrap fails on failed import`, `targetctl bootstrap re-imports a missing image once`, `targetctl bootstrap prepares environment only`, `targetctl transfer rejects external resources`, `targetctl transfer publishes verified component`, `targetctl deploy applies application from registry`, `targetctl deploy rejects tampered manifest`, `targetctl transfer and deploy require bootstrap`, `targetctl deploy requires transferred component`, `targetctl up runs bootstrap transfer deploy and leaves it running`, `targetctl offline subcommands run behind offline proxy`, `targetctl bootstrap no_proxy ipv6 api`, `bootstrap verify config quotes key path`, `sourcectl bundle refuses dir outside build`, `make bootstrap rebuilds stale bundle`, `sourcectl chart refs come from controller`, `sourcectl and targetctl stay on their side`, `bootstrap registry image matches registry demo`, `make bootstrap targets`, `make up runs source before target`, `e2e workflow runs controller leg with targetctl`, `docs document bootstrap`, `no stale bootstrap manifest names`, `transfer config routes inlined images`
 - Component structure and resource metadata
 - Signature verification with correct and wrong keys
 - Manifest rendering with digest-pinned images
@@ -141,13 +157,14 @@ Tests include:
 - Transferred images: `manifests localizes transferred image`, `manifests rejects mismatched image digest`, `manifests rejects missing image digest`
 - Local registry mirror for kind nodes: `cluster.sh configures local registry mirror`
 - CI e2e isolation: `e2e workflow isolates deploy`
+- Pinned runners: `workflows pin runner image`
 - Resource access types: `resource access types`, `readme documents resource access types`
 - Publish copies resources: `publish copies resources as OCI artifacts`, `publish rejects missing repo and config`, `publish uploaders match deprecated flags`
 - Transfer plans: `transfer without copy-resources keeps external reference`, `transfer copy-resources inlines image as local blob`, `transfer copy-resources uploads OCI artifact`
 - Canonical component repositories (CTF): `ctf layout is canonical`, `ctf archive is portable and signed`, `readme documents canonical component repositories`
 - Kubernetes controller: `readme documents kubernetes controller`
-- Controller stack script (`make controller`): `controller.sh run deletes cluster it created`, `controller.sh run keeps cluster with KEEP_CLUSTER`, `controller.sh run reuses existing cluster`, `controller.sh down deletes cluster`, `controller.sh rejects unknown subcommand`, `controller.sh apply sets target architecture`, `controller.sh check fails without answer`, `controller.sh install requires tools`
-- Renovate configuration: `renovate updates OCM SHA256 ARGs`, `renovate updates Flux SHA256 ARGs`, `renovate updates kind SHA256 ARGs`, `renovate managers match their targets`, `renovate captures pinned versions`, `renovate regexes reject invalid input`, `renovate extractVersion maps release tags`, `renovate groups Flux updates`
+- Controller stack script (`make controller`): `controller.sh run deletes cluster it created`, `controller.sh run keeps cluster with KEEP_CLUSTER`, `controller.sh run reuses existing cluster`, `controller.sh down deletes cluster`, `controller.sh rejects unknown subcommand`, `controller.sh apply sets target architecture`, `controller.sh apply rejects renamed targets`, `controller.sh apply matches backslash values`, `controller.sh check fails without answer`, `controller.sh install requires tools`
+- Renovate configuration: `renovate updates OCM SHA256 ARGs`, `renovate updates Flux SHA256 ARGs`, `renovate updates kind SHA256 ARGs`, `renovate updates kind node image`, `renovate managers match their targets`, `renovate captures pinned versions`, `renovate regexes reject invalid input`, `renovate extractVersion maps release tags`, `renovate groups Flux updates`
 - Kubernetes deployer: `readme documents kubernetes deployer`
 - Plugin system: `builtin plugins serve component types`, `readme documents plugin system`, demo plugin: `plugin capabilities returns access type`, `plugin healthz responds`, `plugin build registers access type`, `plugin download returns blob`, `plugin identity endpoint`, `plugin missing plugin fails gracefully`, `plugin show lists capabilities`, `plugin scenarios correct response`, `plugin scenarios malformed response`, `plugin loglevel debug shows registration`, `make plugin target`, `readme documents plugin demo`
 - Signing and verification: `signature covers normalized descriptor`, `readme documents signing and verification`
@@ -175,11 +192,11 @@ Tests include:
 
 ## CI
 
-CI runs on `ubuntu-latest` (linux/amd64) inside the devcontainer across three workflows:
+CI runs on `ubuntu-26.04` (linux/amd64) inside the devcontainer. Every job, including the `renovate.yaml` job, pins that runner image rather than `ubuntu-latest`, so a GitHub image switch cannot change CI unannounced. Renovate opens a PR when a newer `ubuntu-*` runner is available. Three workflows build and test:
 
 - **`ci.yaml`** — runs on every push and pull request to `main`: lint and unit tests (`test` job), and the non-blocking `ocm-version-validated` job (`make ocm-version-check`, see [OCM version validation](#ocm-version-validation)).
 - **`release.yaml`** — triggered by a `v*.*.*` tag or `workflow_dispatch` with a semver `version` input. Runs tests, then builds and signs the OCM component with `OCM_SIGNING_KEY`, uploads a `application-ctf` artifact, and on tags publishes the component to `ghcr.io/<owner>/ocm` and creates a GitHub release.
-- **`e2e.yaml`** — runs on every push and pull request to `main`. A `package` job builds and signs the component with an auto-generated dev key and uploads it. A `deploy` job downloads it, verifies the signature, and runs the e2e in isolation: it creates the kind cluster and pre-pulls the rendered manifest images into the kind nodes, then blocks new outbound connections from the kind network with an iptables `DOCKER-USER` rule and starts a `tcpdump` capture on the kind bridge. It runs `make e2e-run` against the cluster, then removes the rule, stops the capture, and fails if any packet left the private ranges for the public internet. The pcap and tcpdump text are uploaded as the `application-e2e-egress-evidence` artifact.
+- **`e2e.yaml`** — runs on every push and pull request to `main`. A `build` job builds, signs and verifies the component with an auto-generated dev key and uploads it (`application-ctf-dev`). A `package` job (`needs: build`) downloads that artifact, writes the bootstrap bundle (the only online step of the air-gapped path, platform images included), prints its size and uploads it (`application-bootstrap-bundle`), so a bundle failure fails only that job. An `e2e` job (`needs: [build, package]`) runs whenever `build` succeeded and has two legs, `e2e (cli)` and `e2e (controller)`, with `fail-fast: false`. If the bundle is missing, the `controller` leg fails before downloading the bundle and the `cli` leg still runs. Before the block, the `cli` leg creates the kind cluster and pre-pulls the rendered manifest images into the nodes; the `controller` leg only creates the stand-in kind cluster (`make target-cluster`), because the kind node entrypoint resolves `host.docker.internal` over DNS. Both legs create their clusters from the pinned `kindest/node` image in `scripts/cluster.sh` (the kind v0.33.0 default, updated by Renovate). Both then block new outbound connections from the kind network with an iptables `DOCKER-USER` rule and start a `tcpdump` capture on the kind bridge. Inside the block, the `cli` leg runs `make e2e-run` and checks the pod, and the `controller` leg runs `make target-bootstrap`, `make target-transfer` and `make target-deploy` as three steps, all from the bundle. Each leg then removes the rule, stops the capture, and fails if any packet left the private ranges for the public internet. Each pcap and tcpdump text is uploaded as the `application-e2e-egress-evidence-<leg>` artifact.
 
 Required repository secrets: `OCM_SIGNING_KEY` (RSA private key PEM).
 

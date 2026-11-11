@@ -2,8 +2,16 @@
 # Without this file, the catch-all oci uploader in uploaders.ocmconfig pushes both variants
 # to the same tag (last write wins). publish.sh loads this file before uploaders.ocmconfig,
 # so this more specific entry matches first. Apply with: TRANSFER_CONFIG=transfer.ocmconfig
+# The second entry covers images already inlined as LocalBlob (the bootstrap bundle); they
+# carry no toOCI() reference, so the tag comes from referenceName. OCM writes referenceName as
+# <repo>:<tag> with the digest removed (for example library/nginx:1.31-alpine). The entry splits
+# at the first ":", so it assumes that form: a referenceName with a digest, a registry port
+# or no tag is not handled and gives a wrong reference.
 type: generic.config.ocm.software/v1
 configurations:
   - type: oci.uploader.transfer.config.ocm.software/v1alpha1
-    match: resource.name == "hello-world-image"
+    match: resource.name == "hello-world-image" && !resource.access.isType("LocalBlob")
     imageReference: '${target.baseUrl + (target.subPath == "" ? "" : "/" + target.subPath) + "/" + resource.access.toOCI().repository + ":" + resource.access.toOCI().tag + "-" + resource.extraIdentity.architecture}'
+  - type: oci.uploader.transfer.config.ocm.software/v1alpha1
+    match: resource.name == "hello-world-image" && resource.access.isType("LocalBlob")
+    imageReference: '${target.baseUrl + (target.subPath == "" ? "" : "/" + target.subPath) + "/" + resource.access.referenceName.split(":")[0] + ":" + resource.access.referenceName.split(":")[1] + "-" + resource.extraIdentity.architecture}'

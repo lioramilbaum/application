@@ -17,8 +17,8 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
-  package:
-    runs-on: ubuntu-latest
+  build:
+    runs-on: ubuntu-26.04
     timeout-minutes: 15
     permissions:
       contents: read
@@ -56,10 +56,12 @@ jobs:
           retention-days: 1
           compression-level: 0
 
-  deploy:
-    needs: package
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
+  # Its own job, so a bundle failure fails only this job and does not skip e2e (cli). The only online step of the
+  # air-gapped path: it saves the platform images into the bundle too.
+  package:
+    needs: build
+    runs-on: ubuntu-26.04
+    timeout-minutes: 20
     permissions:
       contents: read
       packages: read
@@ -78,11 +80,86 @@ jobs:
         with:
           name: application-ctf-dev
           path: build
+      - name: Write bootstrap bundle
+        uses: devcontainers/ci@513af61f4de4f75d37e4438f184ba4358f0fc1ca # v0.3.1900000450
+        with:
+          push: never
+          cacheFrom: ${{ env.DEVCONTAINER_IMAGE }}:latest
+          runCmd: |
+            set -euo pipefail
+            make package
+            du -sh build/bootstrap-bundle build/bootstrap-bundle/images
+      - name: Upload bootstrap bundle
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: application-bootstrap-bundle
+          path: build/bootstrap-bundle
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 0
+
+  e2e:
+    needs: [build, package]
+    # Runs whenever build succeeded, even if package failed: the controller leg then fails on its own and the cli leg still runs
+    if: ${{ !cancelled() && needs.build.result == 'success' }}
+    runs-on: ubuntu-26.04
+    # The controller leg also loads the platform images and installs the controller stack inside the block, which needs more time.
+    timeout-minutes: ${{ matrix.path == 'controller' && 45 || 30 }}
+    # cli deploys with the OCM CLI. controller bootstraps the target, transfers the component and deploys the
+    # application with the in-cluster controllers, all from the bundle and inside the egress block; only the
+    # stand-in kind cluster is created before it.
+    strategy:
+      fail-fast: false
+      matrix:
+        path: [cli, controller]
+    name: e2e (${{ matrix.path }})
+    permissions:
+      contents: read
+      packages: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Log in to GHCR (devcontainer cache)
+        continue-on-error: true
+        env:
+          GHCR_USER: ${{ github.actor }}
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: printf '%s' "$GHCR_TOKEN" | docker login ghcr.io -u "$GHCR_USER" --password-stdin
+      - name: Download signed component
+        if: matrix.path == 'cli'
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: application-ctf-dev
+          path: build
       - name: Verify artifact contents
+        if: matrix.path == 'cli'
         run: |
           [[ -d build/ctf && -f build/keys/public.pem ]] || \
             { echo '::error::signed component or public key missing from artifact'; exit 1; }
+      - name: Fail if bootstrap bundle was not produced
+        if: matrix.path == 'controller' && needs.package.result != 'success'
+        env:
+          BUNDLE_RESULT: ${{ needs.package.result }}
+        run: |
+          echo "::error::bootstrap bundle was not produced (package result: $BUNDLE_RESULT)"
+          exit 1
+      - name: Download bootstrap bundle
+        if: matrix.path == 'controller'
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: application-bootstrap-bundle
+          path: build/bootstrap-bundle
+      - name: Verify bootstrap bundle contents
+        if: matrix.path == 'controller'
+        run: |
+          [[ -d build/bootstrap-bundle/ctf && -f build/bootstrap-bundle/charts/ocm-k8s-toolkit.tgz && -f build/bootstrap-bundle/charts/kro.tgz && -f build/bootstrap-bundle/flux/install.yaml && -f build/bootstrap-bundle/images.txt && -f build/bootstrap-bundle/public.pem && -f build/bootstrap-bundle/images/registry.tar ]] || \
+            { echo '::error::bootstrap bundle is incomplete'; exit 1; }
+          # One archive per node image plus the registry archive; targetctl bootstrap checks each one by name
+          [[ "$(find build/bootstrap-bundle/images -name '*.tar' | wc -l)" -eq "$(( $(grep -c . build/bootstrap-bundle/images.txt) + 1 ))" ]] || \
+            { echo '::error::bootstrap bundle image archives do not match images.txt'; exit 1; }
       - name: Create kind cluster and stage images
+        if: matrix.path == 'cli'
         uses: devcontainers/ci@513af61f4de4f75d37e4438f184ba4358f0fc1ca # v0.3.1900000450
         with:
           push: never
@@ -111,6 +188,18 @@ jobs:
                 docker exec "$node" crictl pull "$img"
               done
             done
+      - name: Create target cluster (make target-cluster)
+        if: matrix.path == 'controller'
+        # The stand-in for the site's own cluster is created before the block: the kind node entrypoint resolves
+        # host.docker.internal, and Docker's embedded DNS forwards that query upstream. Everything else on the target
+        # side runs inside the block. This also builds or pulls the devcontainer image before the block.
+        uses: devcontainers/ci@513af61f4de4f75d37e4438f184ba4358f0fc1ca # v0.3.1900000450
+        with:
+          push: never
+          cacheFrom: ${{ env.DEVCONTAINER_IMAGE }}:latest
+          runCmd: |
+            set -euo pipefail
+            make target-cluster
       - name: Block external egress from kind network
         id: egress
         run: |
@@ -148,6 +237,7 @@ jobs:
             exit 1
           fi
       - name: E2E in devcontainer
+        if: matrix.path == 'cli'
         uses: devcontainers/ci@513af61f4de4f75d37e4438f184ba4358f0fc1ca # v0.3.1900000450
         with:
           push: never
@@ -155,6 +245,33 @@ jobs:
           runCmd: |
             set -euo pipefail
             make e2e-run
+      - name: Bootstrap target (make target-bootstrap)
+        if: matrix.path == 'controller'
+        uses: devcontainers/ci@513af61f4de4f75d37e4438f184ba4358f0fc1ca # v0.3.1900000450
+        with:
+          push: never
+          cacheFrom: ${{ env.DEVCONTAINER_IMAGE }}:latest
+          runCmd: |
+            set -euo pipefail
+            make target-bootstrap
+      - name: Transfer component (make target-transfer)
+        if: matrix.path == 'controller'
+        uses: devcontainers/ci@513af61f4de4f75d37e4438f184ba4358f0fc1ca # v0.3.1900000450
+        with:
+          push: never
+          cacheFrom: ${{ env.DEVCONTAINER_IMAGE }}:latest
+          runCmd: |
+            set -euo pipefail
+            make target-transfer
+      - name: Deploy application (make target-deploy)
+        if: matrix.path == 'controller'
+        uses: devcontainers/ci@513af61f4de4f75d37e4438f184ba4358f0fc1ca # v0.3.1900000450
+        with:
+          push: never
+          cacheFrom: ${{ env.DEVCONTAINER_IMAGE }}:latest
+          runCmd: |
+            set -euo pipefail
+            make target-deploy
       - name: Restore egress and assert no external traffic
         if: always() && steps.egress.outcome != 'skipped'
         env:
@@ -195,7 +312,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: application-e2e-egress-evidence
+          name: application-e2e-egress-evidence-${{ matrix.path }}
           path: |
             /tmp/e2e-public-egress.pcap
             /tmp/e2e-public-egress.txt

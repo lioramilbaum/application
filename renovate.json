@@ -8,6 +8,13 @@
       "prBodyNotes": [
         "**OCM CLI bump:** the `ocm-version-validated` check stays red, and the version-specific tests SKIP, until `test/ocm-versions.tsv` has a row for the new version. Add the row in a separate PR, not on this branch. See docs/development.md#ocm-version-validation."
       ]
+    },
+    {
+      "description": "kind node image bumps must stay within the node images the pinned kind release supports",
+      "matchDepNames": ["kindest/node"],
+      "prBodyNotes": [
+        "**kind node image bump:** merge only if this `kindest/node` tag and digest are listed in the release notes of the kind version pinned by `KIND_VERSION` in `.devcontainer/Dockerfile`. A node image newer than that kind release supports can fail cluster creation. Bump kind first when needed."
+      ]
     }
   ],
   "customManagers": [
@@ -69,6 +76,16 @@
       ],
       "depNameTemplate": "kubernetes-sigs/kind",
       "datasourceTemplate": "github-release-attachments"
+    },
+    {
+      "customType": "regex",
+      "description": "kind node image in cluster.sh",
+      "managerFilePatterns": ["/^scripts/cluster\\.sh$/"],
+      "matchStrings": [
+        "KIND_NODE_IMAGE=\"\\$\\{KIND_NODE_IMAGE:-kindest/node:(?<currentValue>v[0-9]+\\.[0-9]+\\.[0-9]+)@(?<currentDigest>sha256:[a-f0-9]{64})\\}\""
+      ],
+      "depNameTemplate": "kindest/node",
+      "datasourceTemplate": "docker"
     },
     {
       "customType": "regex",

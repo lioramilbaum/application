@@ -193,6 +193,7 @@ case "$cmd" in
     esac
     ;;
   create)
+    env | grep -i '_proxy=' | sort >> "$(dirname "$0")/../kind-env.log" || true
     name_next=0
     for arg in "$@"; do
       if [[ "$name_next" -eq 1 ]]; then echo "$arg" >> "$(dirname "$0")/../kind-clusters"; name_next=0; fi
@@ -226,31 +227,324 @@ EOF
 }
 
 _stub_controller_tools() {
-  local dir="$1"
-  # helm stub
-  cat > "$dir/helm" <<'EOF'
+  local dir="$1" real_kubectl
+  # Resolve the real binary now, before the stub is first on PATH: kustomize renders with it
+  real_kubectl="$(command -v kubectl)"
+  # helm stub: `pull` writes a chart archive into --destination; `template` prints the images a chart deploys
+  cat > "$dir/helm" <<'HELM_STUB_EOF'
 #!/usr/bin/env bash
 echo "helm $*" >> "$STUB_LOG_DIR/helm.log"
-EOF
+printf 'helm %s | %s\n' "$*" "$(env | grep -i '_proxy=' | sort | tr '\n' ' ')" >> "$STUB_LOG_DIR/proxy-env.log"
+case "${1:-}" in
+  pull)
+    dest=""
+    prev=""
+    for arg in "$@"; do
+      [[ "$prev" == --destination ]] && dest="$arg"
+      prev="$arg"
+    done
+    touch "$dest/chart.tgz"
+    ;;
+  template)
+    echo 'image: "registry.example/controller@sha256:1111111111111111111111111111111111111111111111111111111111111111"'
+    echo 'image: registry.example/kro:v1'
+    ;;
+esac
+HELM_STUB_EOF
   chmod +x "$dir/helm"
-  # flux stub
-  cat > "$dir/flux" <<'EOF'
+  # flux stub: `install --export` prints a manifest that names one image
+  cat > "$dir/flux" <<'FLUX_STUB_EOF'
 #!/usr/bin/env bash
 echo "flux $*" >> "$STUB_LOG_DIR/flux.log"
-EOF
+case " $* " in
+  *" --export "*) echo 'image: ghcr.io/fluxcd/source-controller:v1.10.1' ;;
+esac
+FLUX_STUB_EOF
   chmod +x "$dir/flux"
-  # kubectl stub (logs args, handles exec by printing Hello, handles apply -f - by tee-ing stdin)
-  cat > "$dir/kubectl" <<'EOF'
-#!/usr/bin/env bash
+  # kubectl stub: kustomize runs for real; apply -f - keeps its stdin; exec prints Hello;
+  # get pods prints STUB_APP_IMAGE
+  # shellcheck disable=SC2016
+  printf '#!/usr/bin/env bash\nif [[ "${1:-}" == kustomize ]]; then exec %q "$@"; fi\n' \
+    "$real_kubectl" > "$dir/kubectl"
+  cat >> "$dir/kubectl" <<'KUBECTL_STUB_EOF'
 echo "kubectl $*" >> "$STUB_LOG_DIR/kubectl.log"
+printf 'kubectl %s | %s\n' "$*" "$(env | grep -i '_proxy=' | sort | tr '\n' ' ')" >> "$STUB_LOG_DIR/proxy-env.log"
 if [[ "$*" == *"-f -"* ]]; then
   tee -a "$STUB_LOG_DIR/kubectl-stdin.log" > /dev/null
 fi
 if [[ "$*" == *"exec"* ]]; then
   echo "${STUB_EXEC_OUTPUT:-Hello, World!}"
 fi
-EOF
-  chmod +x "$dir/kubectl"
+if [[ "$*" == *" get pods "* ]]; then
+  echo "${STUB_APP_IMAGE:-}"
+fi
+KUBECTL_STUB_EOF
+  chmod 0755 "$dir/kubectl"
+}
+
+# Test doubles for the bootstrap path. docker reports 172.18.0.9 for the registry and fails
+# crictl inspecti for $STUB_MISSING_IMAGE. The ocm wrapper serves oci::http://172.18.0.9:5000/ocm
+# from $dir/ctf, records transfers into it without copying, and reports every resource in
+# `get cv -o json` as a local blob, as a bundle that has inlined its resources would.
+# STUB_TAMPER_RESOURCE appends a byte to that resource after it is downloaded.
+_stub_bootstrap_tools() {
+  local dir="$1" real_ocm
+  real_ocm="$(command -v "$OCM")"
+  mkdir -p "$dir/stub-bin"
+  cat > "$dir/stub-bin/docker" <<'DOCKER_STUB_EOF'
+#!/usr/bin/env bash
+state="$(dirname "$0")/.."
+echo "$*" >> "$state/docker.log"
+case "${1:-}" in
+  # The registry container has an address only while it runs (run creates it, rm removes it)
+  inspect) [[ -f "$state/registry-running" ]] || exit 1; echo 172.18.0.9 ;;
+  run) touch "$state/registry-running" ;;
+  rm) rm -f "$state/registry-running" ;;
+  info) echo "${STUB_DOCKER_ARCH:-x86_64}" ;;
+  # The loaded registry image's ID, for the host platform STUB_DOCKER_ARCH reports
+  image) id="$state/registry-image-id${STUB_DOCKER_ARCH:+-$STUB_DOCKER_ARCH}"
+    [[ "${2:-}" == inspect && -f "$id" ]] || exit 1; cat "$id" ;;
+  exec)
+    if [[ "$*" == *" crictl inspecti "* ]]; then
+      if [[ -n "${STUB_MISSING_IMAGE:-}" && "$*" == *"$STUB_MISSING_IMAGE"* ]]; then exit 1; fi
+      # STUB_MISSING_ONCE: the first lookup of that image misses, as after an import that did not take
+      if [[ -n "${STUB_MISSING_ONCE:-}" && "$*" == *"$STUB_MISSING_ONCE"* && ! -f "$state/missed-once" ]]; then
+        touch "$state/missed-once"; exit 1
+      fi
+    fi
+    if [[ "$*" == *" uname -m"* ]]; then echo "${STUB_NODE_UNAME:-x86_64}"; fi
+    if [[ "${2:-}" == -i ]]; then
+      if [[ "$*" == *" images import "* ]]; then
+        cat > /dev/null
+        # STUB_IMPORT_FAIL: ctr cannot import the archive, as with a truncated file
+        [[ -z "${STUB_IMPORT_FAIL:-}" ]] || exit 1
+      else
+        cat >> "$state/docker-stdin.log"
+      fi
+    fi
+    ;;
+esac
+exit 0
+DOCKER_STUB_EOF
+  cat > "$dir/stub-bin/curl" <<'CURL_STUB_EOF'
+#!/usr/bin/env bash
+printf 'curl %s | %s\n' "$*" "$(env | grep -i '_proxy=' | sort | tr '\n' ' ')" >> "$(dirname "$0")/../proxy-env.log"
+exit 0
+CURL_STUB_EOF
+  {
+    printf '#!/usr/bin/env bash\nREAL_OCM=%q\nSTATE_DIR=%q\n' "$real_ocm" "$dir"
+    cat <<'OCM_STUB_EOF'
+echo "$*" >> "$STATE_DIR/ocm-args.log"
+printf 'OCM_CONFIG=%s\n' "${OCM_CONFIG:-}" >> "$STATE_DIR/ocm-env.log"
+printf 'ocm %s | %s\n' "$*" "$(env | grep -i '_proxy=' | sort | tr '\n' ' ')" >> "$STATE_DIR/proxy-env.log"
+if [[ "$*" == *"application-platform"* || "$*" == *"platform-images/component-constructor"* ]]; then
+  exec python3 -I "$STATE_DIR/stub-bin/platform_ocm.py" "$STATE_DIR" "$@"
+fi
+REGISTRY_PREFIX="oci::http://172.18.0.9:5000/ocm"
+if [[ " $* " == *" transfer cv "* ]]; then
+  positional=()
+  seen=0
+  for arg in "$@"; do
+    if [[ $seen -eq 1 && "$arg" != -* ]]; then positional+=("$arg"); fi
+    [[ "$arg" == cv ]] && seen=1
+  done
+  if [[ "${positional[1]}" == "$REGISTRY_PREFIX" ]]; then
+    exit 0
+  fi
+  cp -R "$STATE_DIR/ctf" "${positional[1]#ctf::}"
+  exit 0
+fi
+args=()
+for arg in "$@"; do
+  case "$arg" in
+    "$REGISTRY_PREFIX"*) arg="ctf::$STATE_DIR/ctf${arg#"$REGISTRY_PREFIX"}" ;;
+  esac
+  args+=("$arg")
+done
+if [[ "$*" == *"get cv"* && "$*" == *"-o json"* ]]; then
+  "$REAL_OCM" "${args[@]}" | jq '(.[].component.resources[]? | .access.type) = "LocalBlob/v1"'
+  exit "${PIPESTATUS[0]}"
+fi
+"$REAL_OCM" "${args[@]}" || exit $?
+if [[ "$*" == *"download resource"* && -n "${STUB_TAMPER_RESOURCE:-}" && "$*" == *"name=$STUB_TAMPER_RESOURCE"* ]]; then
+  out=""
+  prev=""
+  for arg in "$@"; do
+    [[ "$prev" == --output ]] && out="$arg"
+    prev="$arg"
+  done
+  printf 'x' >> "$out"
+fi
+OCM_STUB_EOF
+  } > "$dir/stub-bin/ocm"
+  # Stand-in for the platform image component: add cv keeps the constructor, get cv reports each image's digest
+  # (its pin, a hash of the reference, or STUB_IMAGE_DIGEST), and download resource writes an OCI layout whose
+  # index lists linux/amd64, linux/arm64 and linux/s390x manifests
+  cat > "$dir/stub-bin/platform_ocm.py" <<'PLATFORM_OCM_EOF'
+import hashlib, json, os, shutil, sys
+state, args = sys.argv[1], sys.argv[2:]
+saved = os.path.join(state, "platform-constructor.json")
+def arg(flag):
+    return args[args.index(flag) + 1] if flag in args else None
+def digest_for(ref):
+    if os.environ.get("STUB_IMAGE_DIGEST"):
+        return os.environ["STUB_IMAGE_DIGEST"].split(":", 1)[1]
+    if "@sha256:" in ref:
+        return ref.split("@sha256:", 1)[1]
+    return hashlib.sha256(ref.encode()).hexdigest()
+if args[0] == "add":
+    with open(arg("--constructor")) as src, open(saved, "w") as dst:
+        dst.write(src.read())
+    sys.exit(0)
+resources = json.load(open(saved))["components"][0]["resources"]
+if args[0] == "get":
+    print(json.dumps([{"component": {"resources": [
+        {"name": r["name"], "digest": {"value": digest_for(r["access"]["imageReference"])}} for r in resources]}}]))
+    sys.exit(0)
+if args[0] == "download":
+    name = arg("--identity").split("=", 1)[1]
+    out = arg("--output")
+    ref = next(r for r in resources if r["name"] == name)["access"]["imageReference"]
+    os.makedirs(os.path.join(out, "blobs", "sha256"))
+    def put(data, hexd=None):
+        hexd = hexd or hashlib.sha256(data).hexdigest()
+        with open(os.path.join(out, "blobs", "sha256", hexd), "wb") as f:
+            f.write(data)
+        return "sha256:" + hexd, len(data)
+    manifests = []
+    for arch in ("amd64", "arm64", "s390x"):
+        layer, layer_size = put(("layer " + ref + " " + arch).encode())
+        config, config_size = put(json.dumps({"architecture": arch, "os": "linux"}).encode())
+        manifest, manifest_size = put(json.dumps({"schemaVersion": 2,
+            "mediaType": "application/vnd.oci.image.manifest.v1+json",
+            "config": {"mediaType": "application/vnd.oci.image.config.v1+json", "digest": config, "size": config_size},
+            "layers": [{"mediaType": "application/vnd.oci.image.layer.v1.tar", "digest": layer, "size": layer_size}]}).encode())
+        manifests.append({"mediaType": "application/vnd.oci.image.manifest.v1+json", "digest": manifest,
+                          "size": manifest_size, "platform": {"os": "linux", "architecture": arch}})
+    # An attestation, as BuildKit attaches one: platform unknown/unknown, with its own config and layer
+    layer, layer_size = put(("attestation " + ref).encode())
+    config, config_size = put(json.dumps({"attestation-of": ref}).encode())
+    manifest, manifest_size = put(json.dumps({"schemaVersion": 2,
+        "mediaType": "application/vnd.oci.image.manifest.v1+json",
+        "config": {"mediaType": "application/vnd.oci.image.config.v1+json", "digest": config, "size": config_size},
+        "layers": [{"mediaType": "application/vnd.in-toto+json", "digest": layer, "size": layer_size}]}).encode())
+    manifests.append({"mediaType": "application/vnd.oci.image.manifest.v1+json", "digest": manifest, "size": manifest_size,
+                      "platform": {"os": "unknown", "architecture": "unknown"},
+                      "annotations": {"vnd.docker.reference.type": "attestation-manifest",
+                                      "vnd.docker.reference.digest": manifests[0]["digest"]}})
+    put(json.dumps({"schemaVersion": 2, "mediaType": "application/vnd.oci.image.index.v1+json",
+                    "manifests": manifests}).encode(), digest_for(ref))
+    with open(os.path.join(out, "oci-layout"), "w") as f:
+        f.write('{"imageLayoutVersion": "1.0.0"}')
+    with open(os.path.join(out, "index.json"), "w") as f:
+        json.dump({"schemaVersion": 2, "manifests": [{"mediaType": "application/vnd.oci.image.index.v1+json",
+                   "digest": "sha256:" + digest_for(ref), "size": 1}]}, f)
+    # Keep the layout as downloaded, so tests can compare an archive with it after pruning
+    shutil.copytree(out, os.path.join(state, "platform-layouts", digest_for(ref)), dirs_exist_ok=True)
+    sys.exit(0)
+sys.exit(1)
+PLATFORM_OCM_EOF
+  chmod 0755 "$dir/stub-bin/"*
+}
+
+# _fixture_registry_archive OUT ARCH...: writes a registry archive as sourcectl.sh does, with real content hashes:
+# an index listing one manifest per ARCH, each tagged $BOOTSTRAP_REGISTRY_LOCAL_REF-<arch>. Prints the index digest,
+# then "<arch> <manifest digest> <config digest>" per ARCH.
+_fixture_registry_archive() {
+  local out="$1"; shift
+  python3 -I - "$out" "$BOOTSTRAP_REGISTRY_LOCAL_REF" "$@" <<'PY'
+import hashlib, io, json, sys, tarfile
+out, local_ref, arches = sys.argv[1], sys.argv[2], sys.argv[3:]
+blobs, entries, legacy, report = {}, [], [], []
+def put(data):
+    h = hashlib.sha256(data).hexdigest()
+    blobs[h] = data
+    return "sha256:" + h, len(data)
+manifests = []
+for arch in ("amd64", "arm64"):
+    layer, layer_size = put(("registry layer " + arch).encode())
+    config, config_size = put(json.dumps({"architecture": arch, "os": "linux"}).encode())
+    manifest, manifest_size = put(json.dumps({"schemaVersion": 2, "mediaType": "application/vnd.oci.image.manifest.v1+json",
+        "config": {"mediaType": "application/vnd.oci.image.config.v1+json", "digest": config, "size": config_size},
+        "layers": [{"mediaType": "application/vnd.oci.image.layer.v1.tar", "digest": layer, "size": layer_size}]}).encode())
+    manifests.append({"mediaType": "application/vnd.oci.image.manifest.v1+json", "digest": manifest, "size": manifest_size,
+                      "platform": {"os": "linux", "architecture": arch}, "config": config, "layer": layer})
+index, _ = put(json.dumps({"schemaVersion": 2, "mediaType": "application/vnd.oci.image.index.v1+json",
+    "manifests": [{k: m[k] for k in ("mediaType", "digest", "size", "platform")} for m in manifests]}).encode())
+report.append(index)
+for m in manifests:
+    arch = m["platform"]["architecture"]
+    if arch not in arches:
+        continue
+    name = local_ref + "-" + arch
+    # The containerd store looks names up normalized (docker.io/...); ref.name is the tag alone
+    entries.append({"mediaType": m["mediaType"], "digest": m["digest"], "size": m["size"],
+                    "annotations": {"io.containerd.image.name": "docker.io/" + name,
+                                    "org.opencontainers.image.ref.name": name.rsplit(":", 1)[1]}})
+    legacy.append({"Config": "blobs/" + m["config"].replace(":", "/"), "RepoTags": [name],
+                   "Layers": ["blobs/" + m["layer"].replace(":", "/")]})
+    report.append(arch + " " + m["digest"] + " " + m["config"])
+files = {"oci-layout": b'{"imageLayoutVersion": "1.0.0"}', "index.json": json.dumps({"schemaVersion": 2, "manifests": entries}).encode(),
+         "manifest.json": json.dumps(legacy).encode()}
+files.update({"blobs/sha256/" + h: d for h, d in blobs.items()})
+with tarfile.open(out, "w") as t:
+    for name, data in files.items():
+        info = tarfile.TarInfo(name)
+        info.size = len(data)
+        t.addfile(info, io.BytesIO(data))
+print("\n".join(report))
+PY
+}
+
+# _fixture_node_archive BUNDLE REF: an archive for REF whose index.json names it the way sourcectl.sh does
+_fixture_node_archive() {
+  local bundle="$1" ref="$2" work
+  work="$(mktemp -d)"
+  printf '{"imageLayoutVersion": "1.0.0"}' > "$work/oci-layout"
+  mkdir -p "$work/blobs/sha256"
+  if [[ "$ref" == *@sha256:* ]]; then _bundle_helper _image_names "$ref" "${ref##*@}"
+  else _bundle_helper _image_names "$ref" "sha256:$(printf '%s' "$ref" | sha256 /dev/stdin)"; fi \
+    | jq -R . | jq -s '{schemaVersion: 2, manifests: [.[] | {mediaType: "application/vnd.oci.image.index.v1+json",
+        digest: "sha256:0", size: 1, annotations: {"io.containerd.image.name": ., "org.opencontainers.image.ref.name": .}}]}' \
+    > "$work/index.json"
+  mkdir -p "$bundle/images"
+  tar -C "$work" -cf "$bundle/$(_bundle_helper _image_archive "$ref")" oci-layout index.json blobs
+  rm -rf "$work"
+}
+
+# _bootstrap_fixture TMP [BUNDLE]: signs the application CTF ($CTF) with throwaway keys in $BUILD_DIR and lays
+# out a bundle in BUNDLE (default TMP/bootstrap-bundle): the signed CTF (still with its docker.io resources), stand-in
+# charts and Flux manifest, public key, node image list and image archives. The registry archive is built with real
+# hashes, so BOOTSTRAP_REGISTRY_IMAGE is exported with its index digest, and the docker stub reports its amd64 config
+# as the loaded image's ID.
+_bootstrap_fixture() {
+  local tmp="$1" bundle="${2:-$1/bootstrap-bundle}" ref report
+  _build
+  bash "$ROOT/scripts/sign.sh" >/dev/null
+  mkdir -p "$bundle/charts" "$bundle/flux" "$bundle/images"
+  # shellcheck disable=SC2031
+  cp -R "$CTF" "$bundle/ctf"
+  printf 'chart\n' > "$bundle/charts/ocm-k8s-toolkit.tgz"
+  printf 'chart\n' > "$bundle/charts/kro.tgz"
+  printf 'kind: List\n' > "$bundle/flux/install.yaml"
+  cp "$tmp/keys/public.pem" "$bundle/public.pem"
+  printf '%s\n' \
+    "registry.example/controller@sha256:1111111111111111111111111111111111111111111111111111111111111111" \
+    "ghcr.io/fluxcd/source-controller:v1.10.1" \
+    > "$bundle/images.txt"
+  while IFS= read -r ref; do
+    _fixture_node_archive "$bundle" "$ref"
+  done < "$bundle/images.txt"
+  # The local tag is derived from the pin, so a first pass finds the index digest (the names are not part of the
+  # index) and a second writes the archive with the final tags
+  BOOTSTRAP_REGISTRY_LOCAL_REF="ocm-bootstrap/registry:pending"
+  report="$(_fixture_registry_archive "$bundle/images/registry.tar" amd64 arm64)"
+  BOOTSTRAP_REGISTRY_IMAGE="registry:2@$(head -1 <<< "$report")"
+  export BOOTSTRAP_REGISTRY_IMAGE
+  BOOTSTRAP_REGISTRY_LOCAL_REF="ocm-bootstrap/registry:sha256-${BOOTSTRAP_REGISTRY_IMAGE##*@sha256:}"
+  report="$(_fixture_registry_archive "$bundle/images/registry.tar" amd64 arm64)"
+  awk '$1 == "amd64" { print $3 }' <<< "$report" > "$tmp/registry-image-id"
+  awk '$1 == "arm64" { print $3 }' <<< "$report" > "$tmp/registry-image-id-aarch64"
 }
 
 # Records ocm argv and stdin instead of running ocm
@@ -343,7 +637,7 @@ _build_variant() {
   local repo="$dir/variant-repo"
   rm -rf "$repo"
   mkdir -p "$repo"
-  cp -R "$ROOT/component-constructor.yaml" "$ROOT/scripts" "$ROOT/components" "$repo/"
+  cp -R "$ROOT/component-constructor.yaml" "$ROOT/scripts" "$ROOT/components" "$ROOT/k8s" "$repo/"
   if [[ -n "$manifest_expr" ]]; then
     sed "$manifest_expr" "$ROOT/components/hello-world/manifests.yaml" \
       > "$repo/components/hello-world/manifests.yaml"
@@ -485,7 +779,7 @@ test_build_produces_application_tree() {
   local resource_names
   resource_names=$("$OCM" get cv "$(cv_ref "$ROOT_COMPONENT")" \
     -o json 2>/dev/null | jq -r '.[0].component.resources[].name' | sort | paste -sd, -)
-  assert_eq "$resource_names" "deploy-bundle,hello-world-config,hello-world-image,hello-world-image,hello-world-kustomize,hello-world-localization,hello-world-manifests,hello-world-rgd,hello-world-sbom" "resource names"
+  assert_eq "$resource_names" "deploy-bundle,hello-world-config,hello-world-deploy,hello-world-image,hello-world-image,hello-world-instance,hello-world-kustomize,hello-world-localization,hello-world-manifests,hello-world-rgd,hello-world-sbom" "resource names"
 
   local image_archs
   image_archs=$("$OCM" get cv "$(cv_ref "$ROOT_COMPONENT")" \
@@ -1789,6 +2083,25 @@ test_renovate_updates_flux_sha256() {
   ' "$df" > /dev/null || die "Flux Renovate matches overlap or are missing"
 }
 
+test_renovate_updates_kind_node_image() {
+  local re caps h64 node_image
+  h64="$(printf 'a%.0s' {1..64})"
+  re=$(_renovate_manager "cluster" "kindest/node") || return 1
+  node_image="$(bash "$ROOT/scripts/cluster.sh" node-image)"
+  caps="$(_renovate_captures "$re" "$(cat "$ROOT/scripts/cluster.sh")")" || return 1
+  assert_eq "$(jq -r 'length' <<< "$caps")" "1" "kindest/node captures in cluster.sh" || return 1
+  assert_eq "kindest/node:$(jq -r '.[0].currentValue' <<< "$caps")@$(jq -r '.[0].currentDigest' <<< "$caps")" "$node_image" "captured node image" || return 1
+  assert_eq "$(jq -r '.customManagers[] | select(.depNameTemplate == "kindest/node") | .datasourceTemplate' "$ROOT/renovate.json")" "docker" "datasource" || return 1
+  # A tag without a digest, another image, or a short digest is not updated
+  # shellcheck disable=SC2016
+  _expect_renovate_match "$re" 'KIND_NODE_IMAGE="${KIND_NODE_IMAGE:-kindest/node:v1.37.0}"' || return 1
+  _expect_renovate_match "$re" "KIND_NODE_IMAGE=\"\${KIND_NODE_IMAGE:-kindest/other:v1.37.0@sha256:$h64}\"" || return 1
+  _expect_renovate_match "$re" "KIND_NODE_IMAGE=\"\${KIND_NODE_IMAGE:-kindest/node:v1.37.0@sha256:${h64:1}}\"" || return 1
+  # A node image newer than the pinned kind supports can break clusters: the PR says to check kind's release notes
+  jq -e '.packageRules[] | select(.matchDepNames == ["kindest/node"]) | .prBodyNotes[] | test("KIND_VERSION")' \
+    "$ROOT/renovate.json" >/dev/null || { echo "  no kindest/node PR note about KIND_VERSION" >&2; return 1; }
+}
+
 test_renovate_updates_kind_sha256() {
   local df="$ROOT/.devcontainer/Dockerfile" rv="$ROOT/renovate.json"
   local kind_version arch sha
@@ -1820,11 +2133,28 @@ test_renovate_updates_kind_sha256() {
   ' "$df" > /dev/null || die "kind Renovate matches overlap or are missing"
 }
 
+test_workflows_pin_runner_image() {
+  local wf labels found=0
+  for wf in "$ROOT"/.github/workflows/*.yaml "$ROOT"/.github/workflows/*.yml; do
+    [[ -f "$wf" ]] || continue
+    labels="$(grep -E '^[[:space:]]*runs-on:' "$wf" | sed -E 's/^[[:space:]]*runs-on:[[:space:]]*//')"
+    [[ -n "$labels" ]] || continue
+    found=1
+    # Every job names a versioned image (ubuntu-26.04), never a moving -latest label
+    if grep -vqE '^ubuntu-[0-9]{2}\.[0-9]{2}$' <<< "$labels"; then
+      echo "  $(basename "$wf") has a runner that is not a pinned ubuntu-NN.NN image:" >&2
+      grep -vE '^ubuntu-[0-9]{2}\.[0-9]{2}$' <<< "$labels" | sed 's/^/    /' >&2
+      return 1
+    fi
+  done
+  [[ "$found" == 1 ]] || { echo "  no runs-on found in .github/workflows" >&2; return 1; }
+}
+
 test_e2e_workflow_isolates_deploy() {
   local wf="$ROOT/.github/workflows/e2e.yaml"
   [[ -f "$wf" ]] || { echo "FAIL: e2e.yaml not found"; return 1; }
   local deploy
-  deploy="$(sed -n '/^  deploy:/,$p' "$wf")"
+  deploy="$(sed -n '/^  e2e:/,$p' "$wf")"
 
   assert_contains "$deploy" "make cluster-up"         || return 1
   assert_contains "$deploy" "crictl pull"             || return 1
@@ -1857,9 +2187,9 @@ test_e2e_workflow_isolates_deploy() {
   # upload step must also have if: always()
   assert_contains "$deploy" "always()" || return 1
 
-  # package job must not contain iptables or tcpdump
+  # build and package jobs must not contain iptables or tcpdump
   local pkg
-  pkg="$(sed -n '/^  package:/,/^  deploy:/p' "$wf")"
+  pkg="$(sed -n '/^  build:/,/^  e2e:/p' "$wf")"
   assert_not_contains "$pkg" "iptables" || return 1
   assert_not_contains "$pkg" "tcpdump"  || return 1
 }
@@ -2149,7 +2479,7 @@ test_resource_access_types() {
     [[ "$img" == docker.io/* ]] || { echo "  $a image not referenced on docker.io: $img" >&2; return 1; }
   done
 
-  for name in hello-world-manifests hello-world-localization hello-world-rgd hello-world-kustomize hello-world-sbom deploy-bundle; do
+  for name in hello-world-manifests hello-world-localization hello-world-rgd hello-world-deploy hello-world-instance hello-world-kustomize hello-world-sbom deploy-bundle; do
     relation=$(echo "$cv_json" | jq -r --arg n "$name" '.[0].component.resources[] | select(.name==$n) | .relation')
     assert_eq "$relation" "local" "$name relation" || return 1
     access=$(echo "$cv_json" | jq -r --arg n "$name" '.[0].component.resources[] | select(.name==$n) | .access.type')
@@ -2749,7 +3079,7 @@ test_component_identity_selects_artifacts() {
   out="$("$OCM" download resource "$(cv_ref)" --identity "version=$VERSION" \
     --output "$tmp/bad.yaml" 2>&1)" \
     && { echo "  version-only identity should fail" >&2; return 1; }
-  assert_contains "$out" "got 9" || return 1
+  assert_contains "$out" "got $total" || return 1
 
   out="$("$OCM" download resource "$(cv_ref)" \
     --identity "name=hello-world-manifests,version=9.9.9" \
@@ -3186,6 +3516,8 @@ hello-world-manifests	components/hello-world/manifests.yaml
 hello-world-localization	components/hello-world/localization.json
 hello-world-config	components/hello-world/config.json
 hello-world-rgd	components/hello-world/rgd.yaml
+hello-world-deploy	k8s/controller/deploy.yaml
+hello-world-instance	k8s/controller/instance.yaml
 hello-world-kustomize	components/hello-world/hello-world-kustomize.oci.tar
 TABLE
 
@@ -7446,7 +7778,7 @@ test_build_generates_flux_artifact() {
   # Same repo copy as _build_variant: constructor, scripts and components
   local repo="$tmp/variant-repo"
   mkdir -p "$repo"
-  cp -R "$ROOT/component-constructor.yaml" "$ROOT/scripts" "$ROOT/components" "$repo/"
+  cp -R "$ROOT/component-constructor.yaml" "$ROOT/scripts" "$ROOT/components" "$ROOT/k8s" "$repo/"
   # Remove the tar so build.sh must generate it
   rm -f "$repo/components/hello-world/hello-world-kustomize.oci.tar"
   # Append a build marker so we can verify the generated content matches
@@ -7490,15 +7822,17 @@ test_rgd_mirrors_localization_and_config() {
   [[ "$cfg_html" == "$inst_html" ]] || { echo "  instance.yaml html does not match config.json" >&2; return 1; }
 }
 
-test_controller_bootstrap_wires_published_component() {
-  local bootstrap="$ROOT/k8s/controller/bootstrap.yaml"
+test_controller_deploy_manifest_wires_published_component() {
+  local bootstrap="$ROOT/k8s/controller/deploy.yaml"
   grep -q "baseUrl: ghcr.io/lioramilbaum/ocm" "$bootstrap" || return 1
   grep -q "component: $ROOT_COMPONENT" "$bootstrap" || return 1
   grep -q "kind: NamespacedDeployer" "$bootstrap" || return 1
   grep -q "serviceAccountName: hello-world-deployer" "$bootstrap" || return 1
   grep -q "resourcegraphdefinitions" "$bootstrap" || return 1
   grep -q "name: hello-world-rgd" "$bootstrap" || return 1
-  # Every OCM resource referenced by byReference in bootstrap must exist in the built descriptor
+  # The controller RBAC is environment setup (k8s/controller/rbac.yaml), not part of the application
+  ! grep -q "ocm-k8s-toolkit-controller-manager" "$bootstrap" || { echo "  deploy.yaml still binds the controller" >&2; return 1; }
+  # Every OCM resource referenced by byReference in the deploy manifest must exist in the built descriptor
   _build || return 1
   local cv_json rname
   cv_json="$("$OCM" get cv "$(cv_ref "$ROOT_COMPONENT")" -o json)" || return 1
@@ -7517,13 +7851,16 @@ test_controller_sh_installs_stack() {
     bash "$ROOT/scripts/controller.sh" install || return 1
   local ocm_ver; ocm_ver=$(sed -n 's/^OCM_CONTROLLER_CHART_VERSION="\([^"]*\)"/\1/p' "$ROOT/scripts/controller.sh")
   local kro_ver; kro_ver=$(sed -n 's/^KRO_CHART_VERSION="\([^"]*\)"/\1/p' "$ROOT/scripts/controller.sh")
+  kro_ver="${kro_ver#v}"  # the chart tag has no v prefix
   local flux_ver; flux_ver=$(sed -n 's/^FLUX_VERSION="\([^"]*\)"/\1/p' "$ROOT/scripts/controller.sh")
   grep -q "upgrade --install ocm-k8s-toolkit oci://ghcr.io/open-component-model/kubernetes/controller/chart --version $ocm_ver --namespace ocm-k8s-toolkit-system" "$tmp/helm.log" || return 1
   grep -q "upgrade --install kro oci://registry.k8s.io/kro/charts/kro --version $kro_ver --namespace kro-system" "$tmp/helm.log" || return 1
   grep -q "install --version $flux_ver" "$tmp/flux.log" || return 1
+  # The controller RBAC is installed with the stack
+  grep -qF "apply -f $ROOT/k8s/controller/rbac.yaml" "$tmp/kubectl.log" || { echo "  install did not apply rbac.yaml" >&2; return 1; }
 }
 
-test_controller_sh_applies_bootstrap_and_checks_app() {
+test_controller_sh_applies_deploy_manifest_and_checks_app() {
   local tmp="$1"
   export STUB_LOG_DIR="$tmp"
   # Make kubectl wait/rollout succeed silently, exec print Hello
@@ -7579,7 +7916,7 @@ test_controller_sh_run_deletes_created_cluster() {
   # kind created the cluster
   grep -q "create cluster.*--name ocm-controller" "$tmp/kind.log" || { echo "  kind create not called" >&2; return 1; }
   # kubeconfig written inside tmp (not the e2e kubeconfig or ~/.kube/config)
-  grep -qF "create cluster --name ocm-controller --kubeconfig $tmp/" "$tmp/kind.log" \
+  grep -qF "create cluster --name ocm-controller --image $(bash "$ROOT/scripts/cluster.sh" node-image) --kubeconfig $tmp/" "$tmp/kind.log" \
     || { echo "  kubeconfig not isolated to tmp" >&2; return 1; }
   # kind deleted the cluster on exit
   grep -q "delete cluster.*--name ocm-controller" "$tmp/kind.log" || { echo "  kind delete not called" >&2; return 1; }
@@ -7676,6 +8013,1158 @@ test_controller_sh_install_requires_tools() {
   [[ ! -f "$tmp/helm.log" ]] || { echo "  helm was invoked despite missing tool" >&2; return 1; }
 }
 
+test_rgd_is_valid_kro_simple_schema() {
+  local rgd="$ROOT/components/hello-world/rgd.yaml" bootstrap="$ROOT/k8s/controller/deploy.yaml"
+  python3 -I - "$rgd" "$bootstrap" <<'PY' || return 1
+import sys
+import yaml
+
+rgd_path, bootstrap_path = sys.argv[1], sys.argv[2]
+errors = []
+
+def check_byref(doc, where):
+    # kro and OCM read byReference.resource as a flat identity: name -> string
+    if isinstance(doc, dict):
+        for key, value in doc.items():
+            if key == "byReference" and isinstance(value, dict):
+                res = value.get("resource")
+                if not isinstance(res, dict) or not all(isinstance(v, str) for v in res.values()):
+                    errors.append(f"{where}: byReference.resource is not a flat string map: {res}")
+            check_byref(value, where)
+    elif isinstance(doc, list):
+        for item in doc:
+            check_byref(item, where)
+
+rgd = yaml.safe_load(open(rgd_path))
+# SimpleSchema: each spec field is a type string such as "string | default=\"x\""; a map is a nested object
+for key, value in rgd["spec"]["schema"]["spec"].items():
+    if not isinstance(value, str):
+        errors.append(f"schema field {key} is {type(value).__name__}, not a SimpleSchema string")
+check_byref(rgd, "rgd")
+for doc in yaml.safe_load_all(open(bootstrap_path)):
+    check_byref(doc, "bootstrap")
+
+resources = {r["id"]: r for r in rgd["spec"]["resources"]}
+for rid in ("kustomize", "image"):
+    fields = resources[rid]["template"]["spec"].get("additionalStatusFields", {})
+    if fields.get("oci") != "resource.access.toOCI()":
+        errors.append(f"{rid}: additionalStatusFields.oci must be resource.access.toOCI()")
+oci = resources["ocirepository"]["template"]
+if oci["apiVersion"] != "source.toolkit.fluxcd.io/v1":
+    errors.append(f"OCIRepository apiVersion is {oci['apiVersion']}, Flux serves source.toolkit.fluxcd.io/v1")
+if oci["spec"].get("insecure") != "${schema.spec.insecure}":
+    errors.append("OCIRepository spec.insecure must be ${schema.spec.insecure}")
+if "imageReference.split(" in open(rgd_path).read():
+    errors.append("rgd parses imageReference; use resource.access.toOCI()")
+for e in errors:
+    print(e, file=sys.stderr)
+sys.exit(1 if errors else 0)
+PY
+}
+
+test_controller_rbac_grants_controller_rgd_read() {
+  local rbac="$ROOT/k8s/controller/rbac.yaml"
+  python3 -I - "$rbac" <<'PY' || { echo "  OCM controller service account cannot read ResourceGraphDefinitions" >&2; return 1; }
+import sys
+import yaml
+
+docs = [d for d in yaml.safe_load_all(open(sys.argv[1])) if d]
+roles = {d["metadata"]["name"]: d for d in docs if d["kind"] == "ClusterRole"}
+granted = False
+for binding in (d for d in docs if d["kind"] == "ClusterRoleBinding"):
+    subjects = [s for s in binding["subjects"]
+                if s["kind"] == "ServiceAccount"
+                and s["name"] == "ocm-k8s-toolkit-controller-manager"
+                and s["namespace"] == "ocm-k8s-toolkit-system"]
+    role = roles.get(binding["roleRef"]["name"])
+    if not subjects or role is None:
+        continue
+    for rule in role["rules"]:
+        if "kro.run" in rule["apiGroups"] and "resourcegraphdefinitions" in rule["resources"] \
+                and {"get", "list", "watch"} <= set(rule["verbs"]):
+            granted = True
+sys.exit(0 if granted else 1)
+PY
+  # The service account name follows the install's fullnameOverride, and the deploy manifest no longer carries it
+  grep -q -- "--set fullnameOverride=ocm-k8s-toolkit" "$ROOT/scripts/controller.sh" || return 1
+  ! grep -q "ocm-k8s-toolkit-controller-manager" "$ROOT/k8s/controller/deploy.yaml" || return 1
+}
+
+test_deploy_resources_ship_in_component() {
+  local tmp="$1" name file cv_json refs
+  _build || return 1
+  cv_json="$("$OCM" get cv "$(cv_ref "$ROOT_COMPONENT")" -o json)" || return 1
+  for pair in "hello-world-deploy k8s/controller/deploy.yaml" "hello-world-instance k8s/controller/instance.yaml"; do
+    read -r name file <<< "$pair"
+    assert_eq "$(jq -r --arg n "$name" '.[0].component.resources[] | select(.name==$n) | .type' <<< "$cv_json")" \
+      "blob" "$name type" || return 1
+    assert_eq "$(jq -r --arg n "$name" '.[0].component.resources[] | select(.name==$n) | .relation' <<< "$cv_json")" \
+      "local" "$name relation" || return 1
+    assert_eq "$(jq -r --arg n "$name" '.[0].component.resources[] | select(.name==$n) | .access.type' <<< "$cv_json")" \
+      "LocalBlob/v1" "$name access type" || return 1
+    assert_eq "$(jq -r --arg n "$name" '.[0].component.resources[] | select(.name==$n) | .access.mediaType' <<< "$cv_json")" \
+      "application/yaml" "$name media type" || return 1
+    "$OCM" download resource "$(cv_ref "$ROOT_COMPONENT")" --identity "name=$name" \
+      --output "$tmp/$name.yaml" >/dev/null || return 1
+    cmp -s "$tmp/$name.yaml" "$ROOT/$file" || { echo "  $name differs from $file" >&2; return 1; }
+  done
+  refs="$(jq -r '.[0].component.resources[] | select(.name=="hello-world-sbom") | .labels[]
+    | select(.name=="ocm.software/artifact-references") | .value[].identity.name' <<< "$cv_json")"
+  grep -qx hello-world-deploy <<< "$refs" || { echo "  hello-world-deploy missing from SBOM artifact references" >&2; return 1; }
+  grep -qx hello-world-instance <<< "$refs" || { echo "  hello-world-instance missing from SBOM artifact references" >&2; return 1; }
+}
+
+test_controller_sh_install_uses_offline_sources() {
+  local tmp="$1" chart kro manifest
+  _stub_kind "$tmp" > /dev/null
+  _stub_controller_tools "$tmp"
+  chart="$tmp/ocm-k8s-toolkit.tgz"
+  kro="$tmp/kro.tgz"
+  manifest="$tmp/flux-install.yaml"
+  touch "$chart" "$kro" "$manifest"
+  STUB_LOG_DIR="$tmp" OCM_CONTROLLER_CHART="$chart" KRO_CHART="$kro" FLUX_MANIFESTS="$manifest" \
+    HELM="$tmp/helm" FLUX="$tmp/flux" KUBECTL="$tmp/kubectl" \
+    bash "$ROOT/scripts/controller.sh" install >/dev/null || return 1
+  local helm_log; helm_log="$(cat "$tmp/helm.log")"
+  assert_contains "$helm_log" "upgrade --install ocm-k8s-toolkit $chart --namespace ocm-k8s-toolkit-system" || return 1
+  assert_contains "$helm_log" "upgrade --install kro $kro --namespace kro-system" || return 1
+  assert_not_contains "$helm_log" "oci://" || return 1
+  assert_not_contains "$helm_log" "--version" || return 1
+  assert_contains "$(cat "$tmp/kubectl.log")" "apply -f $manifest" || return 1
+  assert_contains "$(cat "$tmp/kubectl.log")" "-n flux-system wait --for=condition=Available deployment --all" || return 1
+  assert_contains "$(cat "$tmp/kubectl.log")" "apply -f $ROOT/k8s/controller/rbac.yaml" || return 1
+  [[ ! -e "$tmp/flux.log" ]] || { echo "  flux CLI was invoked with FLUX_MANIFESTS set" >&2; return 1; }
+}
+
+test_controller_sh_apply_localizes_with_guards() {
+  local tmp="$1" drift
+  _stub_kind "$tmp" > /dev/null
+  _stub_controller_tools "$tmp"
+  STUB_LOG_DIR="$tmp" OCM_CONTROLLER_REPO="http://172.18.0.9:5000/ocm" OCM_CONTROLLER_INSECURE=true \
+    TARGET_ARCH=arm64 KUBECTL="$tmp/kubectl" KUBECONFIG="$tmp/kubeconfig" \
+    bash "$ROOT/scripts/controller.sh" apply >/dev/null 2>&1 || { echo "  apply failed with overrides" >&2; return 1; }
+  local stdin; stdin="$(cat "$tmp/kubectl-stdin.log")"
+  assert_contains "$stdin" "baseUrl: http://172.18.0.9:5000/ocm" || return 1
+  assert_contains "$stdin" "architecture: arm64" || return 1
+  assert_contains "$stdin" "insecure: true" || return 1
+  assert_not_contains "$stdin" "ghcr.io/lioramilbaum/ocm" || return 1
+
+  # A deploy manifest whose shipped baseUrl differs from the default must fail the render, not apply unchanged
+  rm -f "$tmp/kubectl.log"
+  drift="$tmp/deploy-drift.yaml"
+  sed 's|ghcr.io/lioramilbaum/ocm|ghcr.io/other/ocm|' "$ROOT/k8s/controller/deploy.yaml" > "$drift"
+  if DEPLOY_FILE="$drift" KUBECTL="$tmp/kubectl" KUBECONFIG="$tmp/kubeconfig" STUB_LOG_DIR="$tmp" \
+    bash "$ROOT/scripts/controller.sh" apply >/dev/null 2>&1; then
+    echo "  apply accepted a deploy manifest whose baseUrl differs from the shipped value" >&2
+    return 1
+  fi
+  if [[ -f "$tmp/kubectl.log" ]] && grep -q "kubectl apply" "$tmp/kubectl.log"; then
+    echo "  kubectl apply ran after the guard failed" >&2
+    return 1
+  fi
+}
+
+test_controller_sh_check_waits_on_app_label() {
+  local tmp="$1"
+  _stub_kind "$tmp" > /dev/null
+  _stub_controller_tools "$tmp"
+  STUB_LOG_DIR="$tmp" HELM="$tmp/helm" FLUX="$tmp/flux" KUBECTL="$tmp/kubectl" KUBECONFIG="$tmp/kubeconfig" \
+    bash "$ROOT/scripts/controller.sh" check >/dev/null || return 1
+  local log; log="$(cat "$tmp/kubectl.log")"
+  assert_contains "$log" "--selector=app.kubernetes.io/name=hello-world" || return 1
+  assert_not_contains "$log" "--selector=app=hello-world" || return 1
+  # The deployment may not exist yet when the instance reports ACTIVE
+  assert_contains "$log" "-n hello-world wait --for=create deployment/hello-world" || return 1
+}
+
+test_cluster_sh_passes_kind_config() {
+  local tmp="$1" stub_dir
+  stub_dir=$(_stub_kind "$tmp")
+  printf 'kind: Cluster\n' > "$tmp/kind-config.yaml"
+  BUILD_DIR="$tmp/build" KIND="$stub_dir/kind" E2E_KUBECONFIG="$tmp/build/e2e/kubeconfig" \
+    KIND_CONFIG="$tmp/kind-config.yaml" PATH="$stub_dir:$PATH" \
+    bash "$ROOT/scripts/cluster.sh" up >/dev/null || return 1
+  assert_contains "$(cat "$tmp/kind.log")" "create cluster --name ocm-application" || return 1
+  assert_contains "$(cat "$tmp/kind.log")" "--config $tmp/kind-config.yaml" || return 1
+  # Every cluster is created from the pinned node image, which CI stages before the egress block
+  local node_image; node_image="$(bash "$ROOT/scripts/cluster.sh" node-image)"
+  [[ "$node_image" =~ ^kindest/node:v[0-9]+\.[0-9]+\.[0-9]+@sha256:[0-9a-f]{64}$ ]] || { echo "  node image is not pinned: $node_image" >&2; return 1; }
+  assert_contains "$(cat "$tmp/kind.log")" "--image $node_image" || return 1
+
+  # Without KIND_CONFIG, creation gets no --config
+  : > "$tmp/kind-clusters"
+  rm -f "$tmp/kind.log"
+  BUILD_DIR="$tmp/build" KIND="$stub_dir/kind" E2E_KUBECONFIG="$tmp/build/e2e/kubeconfig" \
+    PATH="$stub_dir:$PATH" \
+    bash "$ROOT/scripts/cluster.sh" up >/dev/null || return 1
+  assert_contains "$(cat "$tmp/kind.log")" "create cluster --name ocm-application" || return 1
+  assert_not_contains "$(cat "$tmp/kind.log")" "--config" || return 1
+}
+
+test_sourcectl_bundle_writes_offline_bundle() {
+  local tmp="$1" bundle="$1/bootstrap-bundle" stub_dir
+  _build || return 1
+  bash "$ROOT/scripts/sign.sh" >/dev/null || return 1
+  _stub_controller_tools "$tmp"
+  _stub_bootstrap_tools "$tmp"
+  STUB_LOG_DIR="$tmp" PATH="$tmp/stub-bin:$PATH" HELM="$tmp/helm" FLUX="$tmp/flux" \
+    bash "$ROOT/scripts/sourcectl.sh" bundle >/dev/null || return 1
+
+  # The application CTF is transferred into the bundle, with the uploaders config
+  assert_contains "$(cat "$tmp/ocm-args.log")" "ctf::$bundle/ctf --recursive" || return 1
+  assert_contains "$(cat "$tmp/ocm-env.log")" "OCM_CONFIG=$ROOT/uploaders.ocmconfig" || return 1
+  [[ -f "$bundle/ctf/artifact-index.json" ]] || { echo "  bundle CTF missing" >&2; return 1; }
+
+  # Charts are pulled at the versions scripts/controller.sh pins
+  local helm_log; helm_log="$(cat "$tmp/helm.log")"
+  assert_contains "$helm_log" "pull oci://ghcr.io/open-component-model/kubernetes/controller/chart --version 0.23.0" || return 1
+  assert_contains "$helm_log" "pull oci://registry.k8s.io/kro/charts/kro --version 0.9.4" || return 1
+  [[ -f "$bundle/charts/ocm-k8s-toolkit.tgz" && -f "$bundle/charts/kro.tgz" ]] || { echo "  chart archives missing" >&2; return 1; }
+
+  assert_contains "$(cat "$tmp/flux.log")" "install --export --version v2.10.0" || return 1
+  [[ -f "$bundle/flux/install.yaml" ]] || { echo "  flux/install.yaml missing" >&2; return 1; }
+
+  local images; images="$(cat "$bundle/images.txt")"
+  assert_contains "$images" "registry.example/controller@sha256:1111" || return 1
+  assert_contains "$images" "registry.example/kro:v1" || return 1
+  assert_contains "$images" "ghcr.io/fluxcd/source-controller:v1.10.1" || return 1
+  # images.txt lists the node images; the registry runs on the host and has its own archive
+  assert_not_contains "$images" "registry:2" || return 1
+  assert_not_contains "$images" '"' || return 1
+
+  cmp -s "$tmp/keys/public.pem" "$bundle/public.pem" || { echo "  public.pem is not the signing key" >&2; return 1; }
+}
+
+# _assert_pruned ARCHIVE LAYOUT ROOT: ARCHIVE holds the root index blob ROOT of the downloaded LAYOUT byte for byte,
+# with the linux/amd64 and linux/arm64 manifests and their blobs, and none of the other manifests or their blobs
+# (other platforms, unknown/unknown attestations)
+_assert_pruned() {
+  local archive="$1" layout="$2" root="$3" listing kind m blob
+  listing="$(tar -tf "$archive")"
+  assert_contains "$listing" "blobs/sha256/$root" || return 1
+  assert_eq "$(tar -xOf "$archive" "blobs/sha256/$root" | sha256 /dev/stdin)" "$(sha256 "$layout/blobs/sha256/$root")" \
+    "root index blob of $(basename "$archive")" || return 1
+  [[ "$(jq -r '[.manifests[] | select(.platform.architecture == "unknown")] | length' "$layout/blobs/sha256/$root")" -ge 1 ]] \
+    || { echo "  the downloaded index has no unknown/unknown manifest to prune" >&2; return 1; }
+  while read -r kind m; do
+    for blob in "$m" $(jq -r '.config.digest, .layers[].digest' "$layout/blobs/sha256/${m#sha256:}"); do
+      if [[ "$kind" == keep ]]; then
+        assert_contains "$listing" "blobs/sha256/${blob#sha256:}" "kept blob" || return 1
+      else
+        assert_not_contains "$listing" "blobs/sha256/${blob#sha256:}" || { echo "  $(basename "$archive") kept $blob" >&2; return 1; }
+      fi
+    done
+  done < <(jq -r '.manifests[] | (if .platform.os == "linux" and (.platform.architecture == "amd64" or .platform.architecture == "arm64")
+    then "keep" else "drop" end) + " " + .digest' "$layout/blobs/sha256/$root")
+}
+
+test_sourcectl_bundle_writes_image_archives() {
+  local tmp="$1" bundle="$1/bootstrap-bundle" ref archive names digest m arch listing pin out
+  _build || return 1
+  bash "$ROOT/scripts/sign.sh" >/dev/null || return 1
+  _stub_controller_tools "$tmp"
+  _stub_bootstrap_tools "$tmp"
+  local run_env=(STUB_LOG_DIR="$tmp" PATH="$tmp/stub-bin:$PATH" HELM="$tmp/helm" FLUX="$tmp/flux")
+  env "${run_env[@]}" bash "$ROOT/scripts/sourcectl.sh" bundle >/dev/null || return 1
+
+  # One archive per node image, named the way a node looks the image up: by digest, and by tag when it has one
+  while IFS= read -r ref; do
+    archive="$bundle/$(_bundle_helper _image_archive "$ref")"
+    [[ -f "$archive" ]] || { echo "  no archive for $ref" >&2; return 1; }
+    names="$(tar -xOf "$archive" index.json | jq -r '.manifests[].annotations["io.containerd.image.name"]' | sort | paste -sd' ' -)"
+    case "$ref" in
+      *@sha256:*) digest="sha256:${ref##*@sha256:}" ;;
+      *) digest="sha256:$(printf '%s' "$ref" | sha256 /dev/stdin)" ;;
+    esac
+    assert_contains " $names " " $(_bundle_helper _image_repo "$ref")@$digest " "$ref" || return 1
+    [[ "$ref" == *@* ]] || assert_contains " $names " " $ref " "$ref" || return 1
+    _assert_pruned "$archive" "$tmp/platform-layouts/${digest#sha256:}" "${digest#sha256:}" || return 1
+  done < "$bundle/images.txt"
+  assert_eq "$(grep -c . "$bundle/images.txt")" "3" "node images" || return 1
+
+  # The registry archive: the pinned index blob, and one tag per platform for both Docker image stores
+  # shellcheck disable=SC2016
+  pin="$(_bundle_helper eval 'echo "${BOOTSTRAP_REGISTRY_IMAGE##*@sha256:}"')"
+  archive="$bundle/images/registry.tar"
+  assert_contains "$(tar -tf "$archive")" "blobs/sha256/$pin" || return 1
+  for arch in amd64 arm64; do
+    # containerd image store: the normalized name, and the tag alone as ref.name; classic store: the short name
+    assert_eq "$(tar -xOf "$archive" index.json | jq -r --arg t "sha256-$pin-$arch" \
+      '.manifests[] | select(.annotations["org.opencontainers.image.ref.name"] == $t) | .annotations["io.containerd.image.name"]')" \
+      "docker.io/ocm-bootstrap/registry:sha256-$pin-$arch" "index.json name for $arch" || return 1
+    assert_eq "$(tar -xOf "$archive" manifest.json | jq -r --arg n "ocm-bootstrap/registry:sha256-$pin-$arch" \
+      '[.[] | select(.RepoTags | index($n))] | length')" "1" "manifest.json tag for $arch" || return 1
+  done
+  assert_not_contains "$(tar -xOf "$archive" index.json)" "s390x" || return 1
+  _assert_pruned "$archive" "$tmp/platform-layouts/$pin" "$pin" || return 1
+
+  # Written with OCM alone: the source side never runs docker
+  [[ ! -e "$tmp/docker.log" ]] || { echo "  bundle ran docker" >&2; return 1; }
+
+  # A pinned image that resolves to another digest fails the bundle
+  if out="$(env "${run_env[@]}" STUB_IMAGE_DIGEST="sha256:$(printf '9%.0s' {1..64})" bash "$ROOT/scripts/sourcectl.sh" bundle 2>&1)"; then
+    echo "  bundle accepted a pinned image with another digest" >&2; return 1
+  fi
+  assert_contains "$out" "not its pinned digest" || return 1
+
+  # A missing archive makes the bundle incomplete
+  env "${run_env[@]}" bash "$ROOT/scripts/sourcectl.sh" bundle >/dev/null || return 1
+  rm -f "$bundle/$(_bundle_helper _image_archive ghcr.io/fluxcd/source-controller:v1.10.1)"
+  if out="$(bash "$ROOT/scripts/sourcectl.sh" check 2>&1)"; then
+    echo "  check accepted a bundle without an image archive" >&2; return 1
+  fi
+  assert_contains "$out" "missing images/ghcr.io_fluxcd_source-controller_v1.10.1.tar" || return 1
+}
+
+test_sourcectl_check_detects_changed_platform_pins() {
+  local tmp="$1" out
+  _build || return 1
+  bash "$ROOT/scripts/sign.sh" >/dev/null || return 1
+  _stub_controller_tools "$tmp"
+  _stub_bootstrap_tools "$tmp"
+  STUB_LOG_DIR="$tmp" PATH="$tmp/stub-bin:$PATH" HELM="$tmp/helm" FLUX="$tmp/flux" \
+    bash "$ROOT/scripts/sourcectl.sh" bundle >/dev/null || return 1
+  out="$(bash "$ROOT/scripts/sourcectl.sh" check 2>&1)" || { echo "  check rejected a current bundle: $out" >&2; return 1; }
+  # Another registry pin means other platform images: the bundle is stale
+  if out="$(BOOTSTRAP_REGISTRY_IMAGE="registry:2@sha256:$(printf 'c%.0s' {1..64})" bash "$ROOT/scripts/sourcectl.sh" check 2>&1)"; then
+    echo "  check accepted a bundle built for another registry pin" >&2; return 1
+  fi
+  assert_contains "$out" "stale" || return 1
+}
+
+# _bundle_helper FUNCTION ARGS...: runs a function of scripts/bootstrap-bundle.sh in a separate shell
+_bundle_helper() {
+  # shellcheck disable=SC2016
+  bash -c 'source "$1/scripts/lib.sh"; source "$1/scripts/bootstrap-bundle.sh"; shift; "$@"' _ "$ROOT" "$@"
+}
+
+test_targetctl_bootstrap_loads_platform_images() {
+  local tmp="$1" stub_dir log ref node combined
+  stub_dir=$(_stub_kind "$tmp")
+  _stub_controller_tools "$tmp"
+  _stub_bootstrap_tools "$tmp"
+  _bootstrap_fixture "$tmp"
+  local run_env=(PATH="$tmp/stub-bin:$PATH" KIND="$stub_dir/kind" HELM="$tmp/helm" FLUX="$tmp/flux" KUBECTL="$tmp/kubectl"
+    STUB_LOG_DIR="$tmp")
+  env "${run_env[@]}" bash "$ROOT/scripts/targetctl.sh" bootstrap >/dev/null || return 1
+
+  # The cluster: the pinned node image, the containerd config_path patch, and no proxy variables for kind to copy
+  assert_contains "$(cat "$tmp/kind.log")" "create cluster --name ocm-bootstrap --image $(bash "$ROOT/scripts/cluster.sh" node-image)" || return 1
+  assert_contains "$(cat "$tmp/kind.log")" "--config $tmp/bootstrap-kind.yaml" || return 1
+  assert_contains "$(cat "$tmp/bootstrap-kind.yaml")" 'config_path = "/etc/containerd/certs.d"' || return 1
+  [[ ! -s "$tmp/kind-env.log" ]] || { echo "  kind ran with proxy variables: $(cat "$tmp/kind-env.log")" >&2; return 1; }
+
+  # Platform images come from the bundle: node images through ctr for the node's platform, the registry by its host tag
+  log="$(cat "$tmp/docker.log")"
+  assert_contains "$log" "load -i $tmp/bootstrap-bundle/images/registry.tar" || return 1
+  assert_contains "$log" "run -d --name ocm-bootstrap-registry --network kind --pull never $BOOTSTRAP_REGISTRY_LOCAL_REF-amd64" || return 1
+  for node in ocm-application-control-plane ocm-application-worker; do
+    assert_contains "$log" "exec -i $node ctr --namespace=k8s.io images import --platform linux/amd64 -" || return 1
+    while IFS= read -r ref; do
+      assert_contains "$log" "exec $node crictl inspecti $ref" || return 1
+    done < "$tmp/bootstrap-bundle/images.txt"
+  done
+
+  # Nothing is pulled: not by the nodes, not by the host, not by kind
+  combined="$(cat "$tmp"/*.log 2>/dev/null)"
+  for log in "crictl pull" "docker pull" "pull registry" "kind load" "helm pull" "flux install" "oci://"; do
+    assert_not_contains "$combined" "$log" || return 1
+  done
+
+  # On an arm64 host and nodes, the arm64 variants are used
+  rm -f "$tmp"/*.log
+  : > "$tmp/kind-clusters"
+  env "${run_env[@]}" STUB_DOCKER_ARCH=aarch64 STUB_NODE_UNAME=aarch64 \
+    bash "$ROOT/scripts/targetctl.sh" bootstrap >/dev/null || return 1
+  log="$(cat "$tmp/docker.log")"
+  assert_contains "$log" "images import --platform linux/arm64 -" || return 1
+  assert_contains "$log" "--pull never $BOOTSTRAP_REGISTRY_LOCAL_REF-arm64" || return 1
+}
+
+test_targetctl_cluster_creates_stand_in_cluster() {
+  local tmp="$1" stub_dir out
+  stub_dir=$(_stub_kind "$tmp")
+  # Proxy variables in the caller's environment must not reach kind, which would copy them into the nodes
+  out="$(env PATH="$stub_dir:$PATH" KIND="$stub_dir/kind" HTTPS_PROXY=http://127.0.0.1:9 https_proxy=http://127.0.0.1:9 \
+    bash "$ROOT/scripts/targetctl.sh" cluster 2>&1)" || { echo "$out" >&2; return 1; }
+  assert_contains "$(cat "$tmp/kind.log")" "create cluster --name ocm-bootstrap --image $(bash "$ROOT/scripts/cluster.sh" node-image)" || return 1
+  assert_contains "$(cat "$tmp/kind.log")" "--config $tmp/bootstrap-kind.yaml" || return 1
+  assert_contains "$(cat "$tmp/bootstrap-kind.yaml")" 'config_path = "/etc/containerd/certs.d"' || return 1
+  [[ ! -s "$tmp/kind-env.log" ]] || { echo "  kind ran with proxy variables: $(cat "$tmp/kind-env.log")" >&2; return 1; }
+  # It needs no bundle and touches nothing else: no registry, no images
+  assert_not_contains "$(cat "$tmp/docker.log" 2>/dev/null || true)" "load" || return 1
+  assert_not_contains "$(cat "$tmp/docker.log" 2>/dev/null || true)" "run -d" || return 1
+
+  # A second run reuses the cluster
+  rm -f "$tmp/kind.log"
+  env PATH="$stub_dir:$PATH" KIND="$stub_dir/kind" bash "$ROOT/scripts/targetctl.sh" cluster >/dev/null || return 1
+  assert_not_contains "$(cat "$tmp/kind.log")" "create cluster" || return 1
+  assert_contains "$(cat "$tmp/kind.log")" "export kubeconfig --name ocm-bootstrap" || return 1
+}
+
+test_targetctl_bootstrap_uses_existing_cluster() {
+  local tmp="$1" stub_dir
+  stub_dir=$(_stub_kind "$tmp")
+  _stub_controller_tools "$tmp"
+  _stub_bootstrap_tools "$tmp"
+  _bootstrap_fixture "$tmp"
+  # make target-cluster ran before the block; bootstrap goes on with that cluster instead of creating one
+  env PATH="$tmp/stub-bin:$PATH" KIND="$stub_dir/kind" bash "$ROOT/scripts/targetctl.sh" cluster >/dev/null || return 1
+  rm -f "$tmp/kind.log"
+  env PATH="$tmp/stub-bin:$PATH" KIND="$stub_dir/kind" HELM="$tmp/helm" FLUX="$tmp/flux" KUBECTL="$tmp/kubectl" \
+    STUB_LOG_DIR="$tmp" bash "$ROOT/scripts/targetctl.sh" bootstrap >/dev/null || return 1
+  assert_not_contains "$(cat "$tmp/kind.log")" "create cluster" || return 1
+}
+
+test_targetctl_bootstrap_rejects_mislabeled_archive() {
+  local tmp="$1" stub_dir out flux_archive work
+  stub_dir=$(_stub_kind "$tmp")
+  _stub_controller_tools "$tmp"
+  _stub_bootstrap_tools "$tmp"
+  _bootstrap_fixture "$tmp"
+  local run_env=(PATH="$tmp/stub-bin:$PATH" KIND="$stub_dir/kind" HELM="$tmp/helm" FLUX="$tmp/flux" KUBECTL="$tmp/kubectl"
+    STUB_LOG_DIR="$tmp")
+
+  # A node archive that does not name its image by tag
+  flux_archive="$tmp/bootstrap-bundle/$(_bundle_helper _image_archive ghcr.io/fluxcd/source-controller:v1.10.1)"
+  cp "$flux_archive" "$tmp/flux.tar.orig"
+  work="$tmp/relabel"
+  mkdir -p "$work"
+  tar -xf "$flux_archive" -C "$work"
+  jq '.manifests |= map(select(.annotations["io.containerd.image.name"] | test(":v1.10.1$") | not))' "$work/index.json" > "$work/i.json"
+  mv "$work/i.json" "$work/index.json"
+  tar -C "$work" -cf "$flux_archive" oci-layout index.json blobs
+  if out="$(env "${run_env[@]}" bash "$ROOT/scripts/targetctl.sh" bootstrap 2>&1)"; then
+    echo "  bootstrap accepted an archive without its tag" >&2; return 1
+  fi
+  assert_contains "$out" "does not hold ghcr.io/fluxcd/source-controller:v1.10.1" || return 1
+  cp "$tmp/flux.tar.orig" "$flux_archive"
+
+  # A registry archive whose index is not the pinned one
+  if out="$(env "${run_env[@]}" BOOTSTRAP_REGISTRY_IMAGE="registry:2@sha256:$(printf 'b%.0s' {1..64})" \
+    bash "$ROOT/scripts/targetctl.sh" bootstrap 2>&1)"; then
+    echo "  bootstrap accepted a registry archive that does not match the pin" >&2; return 1
+  fi
+  assert_contains "$out" "does not hold the pinned registry index" || return 1
+
+  # A registry archive with no tag for the host's platform
+  _fixture_registry_archive "$tmp/bootstrap-bundle/images/registry.tar" arm64 >/dev/null
+  if out="$(env "${run_env[@]}" bash "$ROOT/scripts/targetctl.sh" bootstrap 2>&1)"; then
+    echo "  bootstrap accepted a registry archive without an amd64 tag" >&2; return 1
+  fi
+  assert_contains "$out" "does not tag" || return 1
+
+  # Every check runs before anything is created or loaded
+  assert_not_contains "$(cat "$tmp/kind.log" 2>/dev/null || true)" "create cluster" || return 1
+  for out in "load -i" "run -d" "images import"; do
+    assert_not_contains "$(cat "$tmp/docker.log" 2>/dev/null || true)" "$out" || return 1
+  done
+}
+
+test_targetctl_transfer_rejects_external_resources() {
+  local tmp="$1" out stub_dir
+  stub_dir=$(_stub_kind "$tmp")
+  _stub_controller_tools "$tmp"
+  _bootstrap_fixture "$tmp"
+  # Real ocm on the signed CTF: its resources still point at docker.io, so the bundle is not self-contained
+  if out="$(PATH="$stub_dir:$PATH" KIND="$stub_dir/kind" HELM="$tmp/helm" KUBECTL="$tmp/kubectl" \
+    STUB_LOG_DIR="$tmp" bash "$ROOT/scripts/targetctl.sh" transfer 2>&1)"; then
+    echo "  transfer accepted a bundle with external resources" >&2
+    return 1
+  fi
+  assert_contains "$out" "hello-world-image" || return 1
+  assert_contains "$out" "not self-contained" || return 1
+  [[ ! -e "$tmp/helm.log" ]] || { echo "  helm ran for a rejected bundle" >&2; return 1; }
+  [[ ! -e "$tmp/docker.log" ]] || { echo "  docker ran for a rejected bundle" >&2; return 1; }
+  [[ ! -e "$tmp/kubectl.log" ]] || { echo "  kubectl ran for a rejected bundle" >&2; return 1; }
+}
+
+test_targetctl_bootstrap_fails_on_unstaged_image() {
+  local tmp="$1" out stub_dir
+  stub_dir=$(_stub_kind "$tmp")
+  _stub_controller_tools "$tmp"
+  _stub_bootstrap_tools "$tmp"
+  _bootstrap_fixture "$tmp"
+  if out="$(env PATH="$tmp/stub-bin:$PATH" KIND="$stub_dir/kind" HELM="$tmp/helm" FLUX="$tmp/flux" KUBECTL="$tmp/kubectl" STUB_LOG_DIR="$tmp" STUB_MISSING_IMAGE="registry.example/controller@sha256:1111111111111111111111111111111111111111111111111111111111111111" \
+    bash "$ROOT/scripts/targetctl.sh" bootstrap 2>&1)"; then
+    echo "  bootstrap ran with an image a node cannot resolve" >&2
+    return 1
+  fi
+  assert_contains "$out" "image registry.example/controller@sha256:1111111111111111111111111111111111111111111111111111111111111111 is not on node ocm-application-control-plane" || return 1
+  assert_contains "$out" "after importing $(_bundle_helper _image_archive "registry.example/controller@sha256:1111111111111111111111111111111111111111111111111111111111111111")" || return 1
+  [[ ! -e "$tmp/helm.log" ]] || { echo "  helm ran with an unresolved image" >&2; return 1; }
+  assert_not_contains "$(cat "$tmp/docker.log" 2>/dev/null || true)" "run -d" || return 1
+  [[ ! -e "$tmp/kubectl.log" ]] || { echo "  kubectl ran with an unresolved image" >&2; return 1; }
+}
+
+test_targetctl_bootstrap_fails_on_failed_import() {
+  local tmp="$1" stub_dir out first
+  stub_dir=$(_stub_kind "$tmp")
+  _stub_controller_tools "$tmp"
+  _stub_bootstrap_tools "$tmp"
+  _bootstrap_fixture "$tmp"
+  first="$(head -1 "$tmp/bootstrap-bundle/images.txt")"
+  if out="$(env PATH="$tmp/stub-bin:$PATH" KIND="$stub_dir/kind" HELM="$tmp/helm" FLUX="$tmp/flux" KUBECTL="$tmp/kubectl" \
+    STUB_LOG_DIR="$tmp" STUB_IMPORT_FAIL=1 bash "$ROOT/scripts/targetctl.sh" bootstrap 2>&1)"; then
+    echo "  bootstrap went on after ctr could not import an image" >&2
+    return 1
+  fi
+  # The first import names the archive and the node it failed on, and nothing further runs
+  assert_contains "$out" "importing $(_bundle_helper _image_archive "$first") into node ocm-application-control-plane failed" || return 1
+  assert_not_contains "$(cat "$tmp/docker.log")" "crictl inspecti" || return 1
+  assert_not_contains "$(cat "$tmp/docker.log")" "run -d" || return 1
+  [[ ! -e "$tmp/helm.log" ]] || { echo "  helm ran after a failed import" >&2; return 1; }
+}
+
+test_targetctl_bootstrap_reimports_missing_image_once() {
+  local tmp="$1" stub_dir imports
+  stub_dir=$(_stub_kind "$tmp")
+  _stub_controller_tools "$tmp"
+  _stub_bootstrap_tools "$tmp"
+  _bootstrap_fixture "$tmp"
+  # The first lookup misses, as after an import that did not take: bootstrap imports it again and goes on
+  env PATH="$tmp/stub-bin:$PATH" KIND="$stub_dir/kind" HELM="$tmp/helm" FLUX="$tmp/flux" KUBECTL="$tmp/kubectl" STUB_LOG_DIR="$tmp" STUB_MISSING_ONCE="registry.example/controller@sha256:1111111111111111111111111111111111111111111111111111111111111111" \
+    bash "$ROOT/scripts/targetctl.sh" bootstrap >/dev/null || return 1
+  imports="$(grep -c "exec -i ocm-application-control-plane ctr --namespace=k8s.io images import" "$tmp/docker.log")"
+  assert_eq "$imports" "3" "imports on the control plane (2 images, 1 retry)" || return 1
+  imports="$(grep -c "exec -i ocm-application-worker ctr --namespace=k8s.io images import" "$tmp/docker.log")"
+  assert_eq "$imports" "2" "imports on the worker" || return 1
+}
+
+test_targetctl_deploy_rejects_tampered_manifest() {
+  local tmp="$1" out stub_dir
+  stub_dir=$(_stub_kind "$tmp")
+  _stub_controller_tools "$tmp"
+  _stub_bootstrap_tools "$tmp"
+  _bootstrap_fixture "$tmp"
+  touch "$tmp/registry-running"
+  if out="$(env PATH="$tmp/stub-bin:$PATH" KIND="$stub_dir/kind" HELM="$tmp/helm" FLUX="$tmp/flux" KUBECTL="$tmp/kubectl" STUB_LOG_DIR="$tmp" STUB_TAMPER_RESOURCE=hello-world-deploy \
+    bash "$ROOT/scripts/targetctl.sh" deploy 2>&1)"; then
+    echo "  deploy applied a tampered hello-world-deploy" >&2
+    return 1
+  fi
+  assert_contains "$out" "hello-world-deploy does not match its descriptor digest" || return 1
+  if [[ -f "$tmp/kubectl.log" ]] && grep -q "kubectl apply" "$tmp/kubectl.log"; then
+    echo "  kubectl apply ran after a digest mismatch" >&2
+    return 1
+  fi
+}
+
+test_targetctl_bootstrap_prepares_environment_only() {
+  local tmp="$1" stub_dir out
+  stub_dir=$(_stub_kind "$tmp")
+  _stub_controller_tools "$tmp"
+  _stub_bootstrap_tools "$tmp"
+  _bootstrap_fixture "$tmp"
+  out="$(env PATH="$tmp/stub-bin:$PATH" KIND="$stub_dir/kind" HELM="$tmp/helm" FLUX="$tmp/flux" KUBECTL="$tmp/kubectl" STUB_LOG_DIR="$tmp" bash "$ROOT/scripts/targetctl.sh" bootstrap 2>&1)" || { echo "$out" >&2; return 1; }
+  assert_contains "$out" "bootstrap complete: registry at 172.18.0.9:5000" || return 1
+
+  # The environment: containerd pointed at the registry, the controller stack from the bundle, the controller RBAC
+  assert_contains "$(cat "$tmp/docker-stdin.log")" '[host."http://172.18.0.9:5000"]' || return 1
+  assert_contains "$(cat "$tmp/helm.log")" "upgrade --install ocm-k8s-toolkit $tmp/bootstrap-bundle/charts/ocm-k8s-toolkit.tgz" || return 1
+  assert_contains "$(cat "$tmp/helm.log")" "upgrade --install kro $tmp/bootstrap-bundle/charts/kro.tgz" || return 1
+  assert_contains "$(cat "$tmp/kubectl.log")" "apply -f $tmp/bootstrap-bundle/flux/install.yaml" || return 1
+  assert_contains "$(cat "$tmp/kubectl.log")" "apply -f $ROOT/k8s/controller/rbac.yaml" || return 1
+
+  # Nothing of the application: no component read or transferred, nothing applied from stdin, no app checked
+  [[ ! -e "$tmp/ocm-args.log" ]] || { echo "  bootstrap ran ocm: $(cat "$tmp/ocm-args.log")" >&2; return 1; }
+  [[ ! -e "$tmp/kubectl-stdin.log" ]] || { echo "  bootstrap applied manifests from stdin" >&2; return 1; }
+  assert_not_contains "$(cat "$tmp/kubectl.log")" "helloworld" || return 1
+  assert_not_contains "$(cat "$tmp/kubectl.log")" "get pods" || return 1
+}
+
+test_targetctl_transfer_publishes_verified_component() {
+  local tmp="$1" stub_dir out ocm_order verify_line transfer_line
+  stub_dir=$(_stub_kind "$tmp")
+  _stub_controller_tools "$tmp"
+  _stub_bootstrap_tools "$tmp"
+  _bootstrap_fixture "$tmp"
+  touch "$tmp/registry-running"
+  out="$(env PATH="$tmp/stub-bin:$PATH" KIND="$stub_dir/kind" HELM="$tmp/helm" FLUX="$tmp/flux" KUBECTL="$tmp/kubectl" STUB_LOG_DIR="$tmp" bash "$ROOT/scripts/targetctl.sh" transfer 2>&1)" || { echo "$out" >&2; return 1; }
+  assert_contains "$out" "transfer verified: $ROOT_COMPONENT:$VERSION in 172.18.0.9:5000/ocm" || return 1
+
+  # Signature is checked before the bundle is transferred to the registry, and the copy is verified after
+  ocm_order="$(cat "$tmp/ocm-args.log")"
+  verify_line="$(grep -n '^verify cv ' <<< "$ocm_order" | head -1 | cut -d: -f1)"
+  transfer_line="$(grep -n ' transfer cv ' <<< "$ocm_order" | head -1 | cut -d: -f1)"
+  [[ -n "$verify_line" && -n "$transfer_line" && "$verify_line" -lt "$transfer_line" ]] || \
+    { echo "  bundle was not verified before the transfer" >&2; return 1; }
+  assert_contains "$ocm_order" "oci::http://172.18.0.9:5000/ocm --recursive" || return 1
+  # Each hello-world-image architecture gets its own tag in the registry
+  assert_contains "$ocm_order" "--config $ROOT/transfer.ocmconfig transfer cv" || return 1
+  assert_contains "$(sed -n "$((transfer_line + 1)),\$p" <<< "$ocm_order")" "verify cv --config $tmp/bootstrap-verify.ocmconfig --signature default oci::http://172.18.0.9:5000/ocm//" || return 1
+
+  # Only the component moves: no cluster, no stack, no apply
+  [[ ! -e "$tmp/helm.log" ]] || { echo "  transfer ran helm" >&2; return 1; }
+  [[ ! -e "$tmp/kubectl.log" ]] || { echo "  transfer ran kubectl" >&2; return 1; }
+  assert_not_contains "$(cat "$tmp/docker.log")" "run -d" || return 1
+}
+
+test_targetctl_deploy_applies_application_from_registry() {
+  local tmp="$1" stub_dir out combined
+  stub_dir=$(_stub_kind "$tmp")
+  _stub_controller_tools "$tmp"
+  _stub_bootstrap_tools "$tmp"
+  _bootstrap_fixture "$tmp"
+  touch "$tmp/registry-running"
+  local run_env=(PATH="$tmp/stub-bin:$PATH" KIND="$stub_dir/kind" HELM="$tmp/helm" FLUX="$tmp/flux" KUBECTL="$tmp/kubectl"
+    STUB_LOG_DIR="$tmp")
+  out="$(env "${run_env[@]}" STUB_APP_IMAGE="172.18.0.9:5000/ocm/hello-world@sha256:1111" \
+    bash "$ROOT/scripts/targetctl.sh" deploy 2>&1)" || { echo "$out" >&2; return 1; }
+  assert_contains "$out" "deploy verified: pods run images from 172.18.0.9:5000" || return 1
+
+  # The component's deploy manifest and instance point at the registry copy over plain HTTP
+  local stdin; stdin="$(cat "$tmp/kubectl-stdin.log")"
+  assert_contains "$stdin" "baseUrl: http://172.18.0.9:5000/ocm" || return 1
+  assert_contains "$stdin" "insecure: true" || return 1
+  assert_contains "$stdin" "architecture: $TARGET_ARCH" || return 1
+  # The registry copy is verified again; nothing is transferred, installed or started
+  assert_contains "$(cat "$tmp/ocm-args.log")" "verify cv --config $tmp/bootstrap-verify.ocmconfig --signature default oci::http://172.18.0.9:5000/ocm//" || return 1
+  assert_not_contains "$(cat "$tmp/ocm-args.log")" "transfer cv" || return 1
+  [[ ! -e "$tmp/helm.log" ]] || { echo "  deploy ran helm" >&2; return 1; }
+  assert_not_contains "$(cat "$tmp/docker.log")" "run -d" || return 1
+
+  # Nothing fetched from the internet or pulled at run time
+  combined="$(cat "$tmp"/*.log 2>/dev/null)"
+  for out in "oci://" "crictl pull" "docker pull" "helm pull" "flux install"; do
+    assert_not_contains "$combined" "$out" || return 1
+  done
+
+  # The pod must run an image from the registry copy, not from docker.io
+  rm -f "$tmp"/*.log
+  if out="$(env "${run_env[@]}" STUB_APP_IMAGE="docker.io/library/nginx:1.31-alpine@sha256:1111" \
+    bash "$ROOT/scripts/targetctl.sh" deploy 2>&1)"; then
+    echo "  deploy accepted a pod image from docker.io" >&2
+    return 1
+  fi
+  assert_contains "$out" "not an image from the bootstrap registry" || return 1
+}
+
+test_targetctl_transfer_and_deploy_require_bootstrap() {
+  local tmp="$1" stub_dir out cmd
+  stub_dir=$(_stub_kind "$tmp")
+  _stub_controller_tools "$tmp"
+  _stub_bootstrap_tools "$tmp"
+  _bootstrap_fixture "$tmp"
+  # No registry is running: bootstrap has not run
+  for cmd in transfer deploy; do
+    if out="$(env PATH="$tmp/stub-bin:$PATH" KIND="$stub_dir/kind" HELM="$tmp/helm" FLUX="$tmp/flux" KUBECTL="$tmp/kubectl" STUB_LOG_DIR="$tmp" bash "$ROOT/scripts/targetctl.sh" "$cmd" 2>&1)"; then
+      echo "  $cmd ran without a bootstrapped target" >&2; return 1
+    fi
+    assert_contains "$out" "is not running on the kind network" "$cmd" || return 1
+    assert_contains "$out" "make target-bootstrap" "$cmd" || return 1
+  done
+  assert_not_contains "$(cat "$tmp/ocm-args.log" 2>/dev/null || true)" "transfer cv" || return 1
+  [[ ! -e "$tmp/kubectl.log" ]] || { echo "  kubectl ran without a bootstrapped target" >&2; return 1; }
+}
+
+test_targetctl_deploy_requires_transferred_component() {
+  local tmp="$1" stub_dir out
+  stub_dir=$(_stub_kind "$tmp")
+  _stub_controller_tools "$tmp"
+  _stub_bootstrap_tools "$tmp"
+  _bootstrap_fixture "$tmp"
+  touch "$tmp/registry-running"
+  # The registry is empty: the stand-in serves it from $tmp/ctf
+  mv "$tmp/ctf" "$tmp/ctf-not-transferred"
+  if out="$(env PATH="$tmp/stub-bin:$PATH" KIND="$stub_dir/kind" HELM="$tmp/helm" FLUX="$tmp/flux" KUBECTL="$tmp/kubectl" STUB_LOG_DIR="$tmp" bash "$ROOT/scripts/targetctl.sh" deploy 2>&1)"; then
+    echo "  deploy ran without a transferred component" >&2; return 1
+  fi
+  assert_contains "$out" "transfer it first: make target-transfer" || return 1
+  [[ ! -e "$tmp/kubectl.log" ]] || { echo "  kubectl ran without a transferred component" >&2; return 1; }
+}
+
+test_targetctl_up_runs_bootstrap_transfer_deploy_and_leaves_it_running() {
+  local tmp="$1" stub_dir out b t d penv helm_line transfer_line apply_line
+  stub_dir=$(_stub_kind "$tmp")
+  _stub_controller_tools "$tmp"
+  _stub_bootstrap_tools "$tmp"
+  _bootstrap_fixture "$tmp"
+  out="$(env PATH="$tmp/stub-bin:$PATH" KIND="$stub_dir/kind" HELM="$tmp/helm" FLUX="$tmp/flux" KUBECTL="$tmp/kubectl" STUB_LOG_DIR="$tmp" STUB_APP_IMAGE="172.18.0.9:5000/ocm/hello-world@sha256:1111" \
+    bash "$ROOT/scripts/targetctl.sh" up 2>&1)" || { echo "$out" >&2; return 1; }
+  b="$(grep -n 'bootstrap complete' <<< "$out" | head -1 | cut -d: -f1)"
+  t="$(grep -n 'transfer verified' <<< "$out" | head -1 | cut -d: -f1)"
+  d="$(grep -n 'deploy verified' <<< "$out" | head -1 | cut -d: -f1)"
+  [[ -n "$b" && -n "$t" && -n "$d" && "$b" -lt "$t" && "$t" -lt "$d" ]] || \
+    { echo "  up did not run bootstrap, transfer and deploy in that order" >&2; return 1; }
+  penv="$(cat "$tmp/proxy-env.log")"
+  helm_line="$(grep -n '^helm upgrade' <<< "$penv" | head -1 | cut -d: -f1)"
+  transfer_line="$(grep -n ' transfer cv ' <<< "$penv" | head -1 | cut -d: -f1)"
+  apply_line="$(grep -n '^kubectl apply -f - ' <<< "$penv" | head -1 | cut -d: -f1)"
+  [[ -n "$helm_line" && -n "$transfer_line" && -n "$apply_line" && "$helm_line" -lt "$transfer_line" && "$transfer_line" -lt "$apply_line" ]] || \
+    { echo "  stack install, transfer and apply ran out of order" >&2; return 1; }
+  # Left running: nothing deleted, the registry still up, and no exit trap to tear it down
+  assert_not_contains "$(cat "$tmp/kind.log")" "delete cluster" || return 1
+  [[ -f "$tmp/registry-running" ]] || { echo "  up removed the registry" >&2; return 1; }
+  ! grep -qE '^[[:space:]]*trap[[:space:]]' "$ROOT/scripts/targetctl.sh" || { echo "  targetctl.sh sets a trap" >&2; return 1; }
+}
+
+test_bootstrap_registry_image_matches_registry_demo() {
+  local demo pinned
+  # shellcheck disable=SC2016
+  demo="$(sed -n 's/^REGISTRY_IMAGE="${REGISTRY_IMAGE:-\(.*\)}"$/\1/p' "$ROOT/scripts/registry.sh")"
+  # shellcheck disable=SC2016
+  pinned="$(sed -n 's/^BOOTSTRAP_REGISTRY_IMAGE="${BOOTSTRAP_REGISTRY_IMAGE:-\(.*\)}"$/\1/p' "$ROOT/scripts/bootstrap-bundle.sh")"
+  [[ "$demo" =~ ^registry:2@sha256:[0-9a-f]{64}$ ]] || { echo "  registry.sh has no digest-pinned registry:2 image" >&2; return 1; }
+  assert_eq "$pinned" "$demo" "bootstrap registry image matches scripts/registry.sh"
+}
+
+# _make_recipe TARGET: the recipe lines of TARGET in the Makefile
+_make_recipe() {
+  awk -v t="$1:" '$1 == t {f=1; next} f && /^\t/ {print; next} f {exit}' "$ROOT/Makefile"
+}
+
+test_make_bootstrap_targets() {
+  local out target
+  out="$(make -n -C "$ROOT" package target-cluster target-bootstrap target-transfer target-deploy target target-down 2>/dev/null)" || return 1
+  for target in "sourcectl.sh bundle" "targetctl.sh cluster" "targetctl.sh bootstrap" "targetctl.sh transfer" "targetctl.sh deploy" \
+    "targetctl.sh up" "targetctl.sh down"; do
+    assert_contains "$out" "scripts/$target" || return 1
+  done
+  out="$(make -C "$ROOT" help)" || return 1
+  for target in source package target target-cluster target-bootstrap target-transfer target-deploy target-down up bootstrap; do
+    assert_contains "$out" "  $target " || return 1
+  done
+  assert_not_contains "$out" "  target-up " || return 1
+  # source is every online step, target every offline step, up both in that order
+  assert_eq "$(_make_recipe source)" $'\t@bash scripts/sourcectl.sh check || bash scripts/sourcectl.sh bundle' "make source recipe" || return 1
+  assert_eq "$(_make_recipe target)" $'\t@bash scripts/targetctl.sh up' "make target recipe" || return 1
+  assert_eq "$(_make_recipe target-cluster)" $'\t@bash scripts/targetctl.sh cluster' "make target-cluster recipe" || return 1
+  assert_eq "$(_make_recipe up)" $'\t@$(MAKE) --no-print-directory target' "make up recipe" || return 1
+  grep -qE '^source: build sign ##' "$ROOT/Makefile" || { echo "  source does not depend on build and sign" >&2; return 1; }
+  grep -qE '^up: source ##' "$ROOT/Makefile" || { echo "  up does not depend on source" >&2; return 1; }
+}
+
+test_make_up_runs_source_before_target() {
+  local out build sign src tgt
+  out="$(make -n -C "$ROOT" up 2>/dev/null)" || return 1
+  build="$(grep -n 'scripts/build.sh' <<< "$out" | head -1 | cut -d: -f1)"
+  sign="$(grep -n 'scripts/sign.sh' <<< "$out" | head -1 | cut -d: -f1)"
+  src="$(grep -n 'scripts/sourcectl.sh check || bash scripts/sourcectl.sh bundle' <<< "$out" | head -1 | cut -d: -f1)"
+  tgt="$(grep -n 'scripts/targetctl.sh up' <<< "$out" | head -1 | cut -d: -f1)"
+  [[ -n "$build" && -n "$sign" && -n "$src" && -n "$tgt" ]] || { echo "  make -n up is missing a step:"$'\n'"$out" >&2; return 1; }
+  [[ "$build" -lt "$src" && "$sign" -lt "$src" && "$src" -lt "$tgt" ]] || \
+    { echo "  make up must run build and sign, then source, then target" >&2; return 1; }
+}
+
+# Prints the step named $2 from workflow text $1: from its "- name:" line to the next step at the same indent
+_workflow_step() {
+  awk -v want="      - name: $2" '
+    $0 == want { f = 1; print; next }
+    f && /^      - / { exit }
+    f { print }
+  ' <<< "$1"
+}
+
+test_e2e_workflow_runs_controller_leg_with_targetctl() {
+  local wf="$ROOT/.github/workflows/e2e.yaml" build_job pkg_job e2e window makes step block
+  build_job="$(sed -n '/^  build:/,/^  package:/p' "$wf")"
+  pkg_job="$(sed -n '/^  package:/,/^  e2e:/p' "$wf")"
+  e2e="$(sed -n '/^  e2e:/,$p' "$wf")"
+  [[ -n "$e2e" ]] || { echo "  e2e.yaml has no e2e job" >&2; return 1; }
+
+  # build builds, signs, verifies and uploads the CLI component; the bundle is not written here
+  assert_contains "$build_job" "runCmd: make build sign verify" || return 1
+  assert_contains "$build_job" "name: application-ctf-dev" || return 1
+  assert_not_contains "$build_job" "make package" || return 1
+  assert_not_contains "$build_job" "build/bootstrap-bundle" || return 1
+
+  # package runs after build, writes the bundle (the only online step) from the CLI artifact and uploads it
+  assert_contains "$pkg_job" "needs: build" || return 1
+  assert_contains "$pkg_job" "name: application-ctf-dev" || return 1
+  assert_contains "$pkg_job" "make package" || return 1
+  assert_contains "$pkg_job" "du -sh build/bootstrap-bundle" || return 1
+  assert_contains "$pkg_job" "name: application-bootstrap-bundle" || return 1
+  assert_contains "$pkg_job" "path: build/bootstrap-bundle" || return 1
+  assert_not_contains "$pkg_job" "packages: write" || return 1
+  assert_not_contains "$pkg_job" "make build sign verify" || return 1
+  local download_line bundle_line bundle_upload_line
+  download_line=$(grep -n 'name: application-ctf-dev' <<< "$pkg_job" | head -1 | cut -d: -f1)
+  bundle_line=$(grep -n 'make package' <<< "$pkg_job" | head -1 | cut -d: -f1)
+  bundle_upload_line=$(grep -n 'name: application-bootstrap-bundle' <<< "$pkg_job" | head -1 | cut -d: -f1)
+  [[ -n "$download_line" && -n "$bundle_line" && -n "$bundle_upload_line" ]] || \
+    { echo "  package lacks the CLI download, bundle or bundle upload step" >&2; return 1; }
+  [[ "$download_line" -lt "$bundle_line" && "$bundle_line" -lt "$bundle_upload_line" ]] || \
+    { echo "  expected CLI download, bundle, bundle upload in that order" >&2; return 1; }
+
+  # e2e waits for both jobs. A bundle failure must not skip the cli leg, so e2e only needs build to succeed
+  assert_contains "$e2e" "needs: [build, package]" || return 1
+  assert_contains "$e2e" "if: \${{ !cancelled() && needs.build.result == 'success' }}" || return 1
+  assert_contains "$e2e" "path: [cli, controller]" || return 1
+  # shellcheck disable=SC2016
+  assert_contains "$e2e" 'name: e2e (${{ matrix.path }})' || return 1
+  assert_contains "$e2e" "timeout-minutes: \${{ matrix.path == 'controller' && 45 || 30 }}" || return 1
+  assert_not_contains "$(cat "$wf")" "matrix.path == 'bootstrap'" || return 1
+  assert_not_contains "$(cat "$wf")" "make target-up" || return 1
+  assert_not_contains "$(cat "$wf")" "Bring up" || return 1
+
+  # Each leg-specific step must carry the gate for its own leg, so a gate moved off its step fails here
+  for step in "Download signed component" "Verify artifact contents" "Create kind cluster and stage images" "E2E in devcontainer"; do
+    block="$(_workflow_step "$e2e" "$step")"
+    [[ -n "$block" ]] || { echo "  e2e has no step named '$step'" >&2; return 1; }
+    assert_contains "$block" "if: matrix.path == 'cli'" "$step" || return 1
+    assert_not_contains "$block" "matrix.path == 'controller'" || return 1
+  done
+  for step in "Download bootstrap bundle" "Verify bootstrap bundle contents" "Create target cluster (make target-cluster)" \
+    "Bootstrap target (make target-bootstrap)" "Transfer component (make target-transfer)" "Deploy application (make target-deploy)"; do
+    block="$(_workflow_step "$e2e" "$step")"
+    [[ -n "$block" ]] || { echo "  e2e has no step named '$step'" >&2; return 1; }
+    assert_contains "$block" "if: matrix.path == 'controller'" "$step" || return 1
+    assert_not_contains "$block" "matrix.path == 'cli'" || return 1
+  done
+  # The three offline stages are separate steps, each running only its own make target
+  local own other
+  for own in target-bootstrap target-transfer target-deploy; do
+    case "$own" in
+      target-bootstrap) block="$(_workflow_step "$e2e" "Bootstrap target (make target-bootstrap)")" ;;
+      target-transfer)  block="$(_workflow_step "$e2e" "Transfer component (make target-transfer)")" ;;
+      target-deploy)    block="$(_workflow_step "$e2e" "Deploy application (make target-deploy)")" ;;
+    esac
+    assert_contains "$block" "make $own" || return 1
+    for other in target-bootstrap target-transfer target-deploy; do
+      [[ "$other" == "$own" ]] || assert_not_contains "$block" "make $other" || return 1
+    done
+  done
+  block="$(_workflow_step "$e2e" "Verify bootstrap bundle contents")"
+  assert_contains "$block" "build/bootstrap-bundle/images/registry.tar" || return 1
+  # Only the stand-in cluster is created before the gap, by targetctl; the workflow creates no network of its own
+  block="$(_workflow_step "$e2e" "Create target cluster (make target-cluster)")"
+  assert_contains "$block" "make target-cluster" || return 1
+  for step in target-bootstrap target-transfer target-deploy; do
+    assert_not_contains "$block" "make $step" || return 1
+  done
+  assert_not_contains "$(cat "$wf")" "docker network create" || return 1
+  assert_not_contains "$(cat "$wf")" "Create kind network" || return 1
+  # The controller leg fails in its own step when the bundle was not produced, before the bundle download
+  assert_contains "$e2e" "if: matrix.path == 'controller' && needs.package.result != 'success'" || return 1
+  assert_contains "$e2e" "bootstrap bundle was not produced" || return 1
+  local fail_line dl_line
+  fail_line=$(echo "$e2e" | grep -n "needs.package.result != 'success'" | head -1 | cut -d: -f1)
+  dl_line=$(echo "$e2e" | grep -n 'name: Download bootstrap bundle' | head -1 | cut -d: -f1)
+  [[ -n "$fail_line" && -n "$dl_line" && "$fail_line" -lt "$dl_line" ]] || \
+    { echo "  bundle check must precede the bundle download" >&2; return 1; }
+  # shellcheck disable=SC2016
+  assert_contains "$e2e" 'application-e2e-egress-evidence-${{ matrix.path }}' || return 1
+
+  # Ordering: the stand-in cluster before the block; bootstrap, transfer, deploy inside it; block removed last
+  local net_line i_line b_line t_line dep_line d_line
+  net_line=$(echo "$e2e" | grep -n 'make target-cluster' | head -1 | cut -d: -f1)
+  i_line=$(echo "$e2e" | grep -n 'iptables -I DOCKER-USER' | head -1 | cut -d: -f1)
+  b_line=$(echo "$e2e" | grep -n 'make target-bootstrap' | head -1 | cut -d: -f1)
+  t_line=$(echo "$e2e" | grep -n 'make target-transfer' | head -1 | cut -d: -f1)
+  dep_line=$(echo "$e2e" | grep -n 'make target-deploy' | head -1 | cut -d: -f1)
+  d_line=$(echo "$e2e" | grep -n 'iptables -D DOCKER-USER' | head -1 | cut -d: -f1)
+  [[ -n "$net_line" && -n "$i_line" && -n "$b_line" && -n "$t_line" && -n "$dep_line" && -n "$d_line" ]] || \
+    { echo "  ordering lines not all found" >&2; return 1; }
+  [[ "$net_line" -lt "$i_line" && "$i_line" -lt "$b_line" && "$b_line" -lt "$t_line" && "$t_line" -lt "$dep_line" && "$dep_line" -lt "$d_line" ]] || \
+    { echo "  expected target-cluster, block, bootstrap, transfer, deploy, block removal in that order" >&2; return 1; }
+
+  # Inside the block only the e2e run and the three offline stages may invoke make
+  window="$(awk '/iptables -I DOCKER-USER/{f=1} /Restore egress/{f=0} f' <<< "$e2e")"
+  makes="$(grep -oE 'make [a-z0-9-]+' <<< "$window" | sort -u | paste -sd, -)"
+  assert_eq "$makes" "make e2e-run,make target-bootstrap,make target-deploy,make target-transfer" "make commands inside the egress block" || return 1
+}
+
+test_docs_document_bootstrap() {
+  local doc="$ROOT/docs/bootstrap.md" ctrl="$ROOT/docs/controller.md" text needle
+  [[ -f "$doc" ]] || { echo "  docs/bootstrap.md is missing" >&2; return 1; }
+  text="$(cat "$doc")"
+  for needle in "sourcectl.sh bundle" "sourcectl.sh check" "targetctl.sh bootstrap" "targetctl.sh transfer" \
+    "targetctl.sh deploy" "targetctl.sh up" "targetctl.sh down" "make source" "make target" "make up" "make bootstrap" \
+    "make target-transfer" "make target-deploy" "images.txt" "images/registry.tar" "ctr" "amd64" "arm64" "kindest/node" \
+    "--pull never" "config_path" "self-contained" "publish.sh" "public.pem" "hosts.toml" "HTTPS_PROXY" "NO_PROXY" \
+    "source.stamp" "e2e (controller)" "targetctl.sh cluster" "make target-cluster" "host.docker.internal"; do
+    assert_contains "$text" "$needle" "docs/bootstrap.md" || return 1
+  done
+  for needle in KEEP_CLUSTER BOOTSTRAP_DRAIN_TIMEOUT "target-up" "deploy (bootstrap)" "targetctl.sh run"; do
+    assert_not_contains "$text" "$needle" || return 1
+  done
+  text="$(cat "$ctrl")"
+  for needle in OCM_CONTROLLER_CHART KRO_CHART FLUX_MANIFESTS DEPLOY_FILE INSTANCE_FILE \
+    OCM_CONTROLLER_INSECURE "toOCI()" "(bootstrap.md)" "hello-world-deploy" "hello-world-instance" "k8s/controller/rbac.yaml"; do
+    assert_contains "$text" "$needle" "docs/controller.md" || return 1
+  done
+  assert_not_contains "$text" "0.15.0" || return 1
+  assert_not_contains "$text" "v2.9.6" || return 1
+}
+
+test_no_stale_bootstrap_manifest_names() {
+  # The application manifest is the deploy manifest now; built from parts so this file does not match itself
+  local old=bootstrap hits needle
+  for needle in "hello-world-$old" "k8s/controller/$old.yaml" "deploy ($old)" "deploy (cli)" "${old^^}_FILE" \
+    "matrix.path == '$old'" "${old^^}_DRAIN_TIMEOUT" "targetctl.sh run" "make target-up"; do
+    hits="$(grep -rIlF --exclude-dir=.git --exclude-dir=.worktrees --exclude-dir=build --exclude-dir=bin \
+      --exclude-dir=.test-golden --exclude=run.sh -- "$needle" "$ROOT" || true)"
+    [[ -z "$hits" ]] || { echo "  stale name '$needle' in: $hits" >&2; return 1; }
+  done
+}
+
+test_controller_sh_apply_matches_backslash_values() {
+  local tmp="$1" out repo='http://172.18.0.9:5000/o\tcm'
+  _stub_kind "$tmp" > /dev/null
+  _stub_controller_tools "$tmp"
+  # kustomize renders the backslash literally; the rendered-value check must compare it literally too, not as a TAB
+  out="$(STUB_LOG_DIR="$tmp" OCM_CONTROLLER_REPO="$repo" KUBECTL="$tmp/kubectl" KUBECONFIG="$tmp/kubeconfig" \
+    bash "$ROOT/scripts/controller.sh" apply 2>&1)" || { echo "  apply rejected a value with a backslash: $out" >&2; return 1; }
+  assert_contains "$(cat "$tmp/kubectl-stdin.log")" "baseUrl: $repo" || return 1
+}
+
+test_controller_sh_apply_rejects_renamed_targets() {
+  local tmp="$1" out
+  _stub_kind "$tmp" > /dev/null
+  _stub_controller_tools "$tmp"
+  # kustomize renders a file unchanged when a patch target matches nothing, so the localized-value check must catch
+  # a renamed object. Both files are checked before kubectl apply runs, so a renamed instance stops the deploy manifest too.
+  local renamed_bootstrap="$tmp/deploy-renamed.yaml" renamed_instance="$tmp/instance-renamed.yaml"
+  sed '/^kind: Repository$/,/^---$/s/name: application-repository$/name: application-repository-old/' \
+    "$ROOT/k8s/controller/deploy.yaml" > "$renamed_bootstrap"
+  sed '/^kind: HelloWorld$/,$s/^  name: hello-world$/  name: hello-world-old/' \
+    "$ROOT/k8s/controller/instance.yaml" > "$renamed_instance"
+  grep -q 'name: application-repository-old' "$renamed_bootstrap" || { echo "  Repository rename did not apply" >&2; return 1; }
+  grep -q 'name: hello-world-old' "$renamed_instance" || { echo "  HelloWorld rename did not apply" >&2; return 1; }
+
+  if out="$(DEPLOY_FILE="$renamed_bootstrap" KUBECTL="$tmp/kubectl" KUBECONFIG="$tmp/kubeconfig" STUB_LOG_DIR="$tmp" \
+    bash "$ROOT/scripts/controller.sh" apply 2>&1)"; then
+    echo "  apply accepted a deploy manifest whose Repository was renamed" >&2
+    return 1
+  fi
+  assert_contains "$out" "does not render Repository application-repository" || return 1
+  [[ ! -f "$tmp/kubectl.log" ]] || { echo "  kubectl ran for a renamed Repository" >&2; return 1; }
+
+  if out="$(INSTANCE_FILE="$renamed_instance" KUBECTL="$tmp/kubectl" KUBECONFIG="$tmp/kubeconfig" STUB_LOG_DIR="$tmp" \
+    bash "$ROOT/scripts/controller.sh" apply 2>&1)"; then
+    echo "  apply accepted an instance whose HelloWorld was renamed" >&2
+    return 1
+  fi
+  assert_contains "$out" "does not render HelloWorld hello-world with 'architecture:" || return 1
+  # Nothing reached kubectl apply, not even the deploy manifest, which renders correctly
+  [[ ! -f "$tmp/kubectl.log" ]] || { echo "  kubectl ran before the instance check failed" >&2; return 1; }
+}
+
+test_targetctl_offline_subcommands_run_behind_offline_proxy() {
+  local tmp="$1" stub_dir line want penv cmd
+  local proxy="http://127.0.0.1:9"
+  stub_dir=$(_stub_kind "$tmp")
+  _stub_controller_tools "$tmp"
+  _stub_bootstrap_tools "$tmp"
+  _bootstrap_fixture "$tmp"
+  # A non-loopback API server: it must be in NO_PROXY for the host-side tools to reach it
+  mkdir -p "$tmp/bootstrap-e2e"
+  printf 'clusters:\n- cluster:\n    server: https://192.0.2.10:6443\n  name: ocm-bootstrap\n' > "$tmp/bootstrap-e2e/kubeconfig"
+
+  # Each offline subcommand on its own, as CI runs them
+  for cmd in bootstrap transfer deploy; do
+    env PATH="$tmp/stub-bin:$PATH" KIND="$stub_dir/kind" HELM="$tmp/helm" FLUX="$tmp/flux" KUBECTL="$tmp/kubectl" STUB_LOG_DIR="$tmp" STUB_APP_IMAGE="172.18.0.9:5000/ocm/hello-world@sha256:1111" \
+      bash "$ROOT/scripts/targetctl.sh" "$cmd" >/dev/null || return 1
+  done
+
+  penv="$(cat "$tmp/proxy-env.log" 2>/dev/null || true)"
+  [[ -n "$penv" ]] || { echo "  no host-side tool was logged" >&2; return 1; }
+  # Every host-side call (ocm, helm, kubectl, curl) ran with the unreachable proxy
+  while IFS= read -r line; do
+    for want in "HTTP_PROXY=$proxy" "HTTPS_PROXY=$proxy" "http_proxy=$proxy" "https_proxy=$proxy" "NO_PROXY=localhost,127.0.0.1"; do
+      assert_contains "$line" "$want" "host-side call without the offline proxy" || return 1
+    done
+  done <<< "$penv"
+  # A call that names the registry bypasses the proxy for it, and kubectl and helm bypass it for the API server
+  if grep '172.18.0.9' <<< "$penv" | grep -qvF "NO_PROXY=localhost,127.0.0.1,192.0.2.10,172.18.0.9"; then
+    echo "  a registry call is not in NO_PROXY" >&2; return 1
+  fi
+  if grep -E '^(kubectl|helm) ' <<< "$penv" | grep -qvF "NO_PROXY=localhost,127.0.0.1,192.0.2.10"; then
+    echo "  a kubectl or helm call is not in NO_PROXY" >&2; return 1
+  fi
+  for want in "helm upgrade" "transfer cv" "kubectl apply -f -"; do
+    assert_contains "$penv" "$want" || return 1
+  done
+}
+
+test_targetctl_bootstrap_no_proxy_ipv6_api() {
+  local tmp="$1" stub_dir penv server host cmd
+  stub_dir=$(_stub_kind "$tmp")
+  _stub_controller_tools "$tmp"
+  _stub_bootstrap_tools "$tmp"
+  _bootstrap_fixture "$tmp"
+  mkdir -p "$tmp/bootstrap-e2e"
+  # A bracketed IPv6 API server, bare and quoted: NO_PROXY carries the address without brackets or quotes
+  for server in 'https://[fd00::10]:6443' '"https://[fd00::10]:6443"'; do
+    host=fd00::10
+    printf 'clusters:\n- cluster:\n    server: %s\n  name: ocm-bootstrap\n' "$server" > "$tmp/bootstrap-e2e/kubeconfig"
+    rm -f "$tmp/proxy-env.log" "$tmp/registry-running"
+    : > "$tmp/kind-clusters"
+    for cmd in bootstrap deploy; do
+      env PATH="$tmp/stub-bin:$PATH" KIND="$stub_dir/kind" HELM="$tmp/helm" FLUX="$tmp/flux" KUBECTL="$tmp/kubectl" \
+        STUB_LOG_DIR="$tmp" STUB_APP_IMAGE="172.18.0.9:5000/ocm/hello-world@sha256:1111" \
+        bash "$ROOT/scripts/targetctl.sh" "$cmd" >/dev/null || return 1
+    done
+    penv="$(grep -E '^(kubectl|helm) ' "$tmp/proxy-env.log" 2>/dev/null || true)"
+    [[ -n "$penv" ]] || { echo "  no kubectl or helm call was logged" >&2; return 1; }
+    if grep -qvF "NO_PROXY=localhost,127.0.0.1,$host" <<< "$penv"; then
+      echo "  a kubectl or helm call is missing $host in NO_PROXY for server $server" >&2; return 1
+    fi
+    assert_not_contains "$penv" "[fd00" || return 1
+  done
+}
+
+test_bootstrap_verify_config_quotes_key_path() {
+  local tmp="$1" stub_dir bundle="$1/odd: dir #1" cfg key
+  stub_dir=$(_stub_kind "$tmp")
+  _stub_controller_tools "$tmp"
+  _stub_bootstrap_tools "$tmp"
+  _bootstrap_fixture "$tmp" "$bundle"
+  touch "$tmp/registry-running"
+  # The transfer may fail later on this path; only the verify config it writes first is checked
+  PATH="$tmp/stub-bin:$PATH" KIND="$stub_dir/kind" HELM="$tmp/helm" FLUX="$tmp/flux" KUBECTL="$tmp/kubectl" \
+    STUB_LOG_DIR="$tmp" BOOTSTRAP_BUNDLE_DIR="$bundle" bash "$ROOT/scripts/targetctl.sh" transfer >/dev/null 2>&1 || true
+  cfg="$tmp/bootstrap-verify.ocmconfig"
+  [[ -f "$cfg" ]] || { echo "  verify config was not written" >&2; return 1; }
+  key="$(python3 -I -c 'import sys, yaml; d = yaml.safe_load(open(sys.argv[1])); print(d["configurations"][0]["consumers"][0]["credentials"][0]["publicKeyPEMFile"], end="")' "$cfg")" \
+    || { echo "  verify config is not valid YAML" >&2; return 1; }
+  assert_eq "$key" "$bundle/public.pem" "publicKeyPEMFile" || return 1
+}
+
+test_sourcectl_bundle_refuses_dir_outside_build() {
+  local tmp="$1" dir out victim="$1/victim"
+  mkdir -p "$victim/sub" "$tmp/build/real"
+  echo keep > "$victim/keep.txt"
+  echo keep > "$victim/sub/keep.txt"
+  ln -s "$victim" "$tmp/build/link"
+  ln -s "$victim" "$tmp/build/real/link"
+  # A sibling directory, a path that climbs out of BUILD_DIR, BUILD_DIR itself, and paths through a symlink
+  # under BUILD_DIR (as the parent, nested, or the bundle dir itself): all refused, none deleted
+  for dir in "$victim" "$tmp/build/../victim" "$tmp/build/" "$tmp/build/link/sub" "$tmp/build/real/link/sub" \
+    "$tmp/build/link"; do
+    if out="$(BUILD_DIR="$tmp/build" BOOTSTRAP_BUNDLE_DIR="$dir" bash "$ROOT/scripts/sourcectl.sh" bundle 2>&1)"; then
+      echo "  bundle accepted BOOTSTRAP_BUNDLE_DIR=$dir" >&2
+      return 1
+    fi
+    assert_contains "$out" "BOOTSTRAP_BUNDLE_DIR must" || return 1
+    [[ -f "$victim/keep.txt" && -f "$victim/sub/keep.txt" ]] || \
+      { echo "  bundle deleted files for BOOTSTRAP_BUNDLE_DIR=$dir" >&2; return 1; }
+  done
+}
+
+test_make_bootstrap_rebuilds_stale_bundle() {
+  local tmp="$1" stub_dir bundle="$1/bootstrap-bundle" expected out recipe
+  stub_dir=$(_stub_kind "$tmp")
+  _stub_controller_tools "$tmp"
+  _stub_bootstrap_tools "$tmp"
+  _build || return 1
+  bash "$ROOT/scripts/sign.sh" >/dev/null || return 1
+  local run_env=(PATH="$tmp/stub-bin:$PATH" KIND="$stub_dir/kind" HELM="$tmp/helm" FLUX="$tmp/flux"
+    KUBECTL="$tmp/kubectl" STUB_LOG_DIR="$tmp")
+  local pins
+  # shellcheck disable=SC2016
+  pins="$(printf '%s\n' "$(sed -n 's/^OCM_CONTROLLER_CHART_VERSION="\(.*\)"$/\1/p' "$ROOT/scripts/controller.sh")" \
+    "$(sed -n 's/^KRO_CHART_VERSION="\(.*\)"$/\1/p' "$ROOT/scripts/controller.sh")" \
+    "$(sed -n 's/^FLUX_VERSION="\(.*\)"$/\1/p' "$ROOT/scripts/controller.sh")" \
+    "$(_bundle_helper eval 'echo "$BOOTSTRAP_REGISTRY_IMAGE"')" | sha256 /dev/stdin)"
+
+  env "${run_env[@]}" bash "$ROOT/scripts/sourcectl.sh" bundle >/dev/null || return 1
+  expected="$(sha256 "$CTF/artifact-index.json") $(sha256 "$tmp/keys/public.pem") $pins"
+  assert_eq "$(cat "$bundle/source.stamp")" "$expected" "bundle stamp" || return 1
+
+  # A bundle built from the current CTF, key and pins is current, and the target side leaves the bundle alone
+  out="$(env "${run_env[@]}" bash "$ROOT/scripts/sourcectl.sh" check 2>&1)" || { echo "  check rejected a current bundle: $out" >&2; return 1; }
+  assert_contains "$out" "is current" || return 1
+  touch "$bundle/kept-by-run" "$tmp/registry-running"
+  env "${run_env[@]}" bash "$ROOT/scripts/targetctl.sh" transfer >/dev/null || return 1
+  [[ -e "$bundle/kept-by-run" ]] || { echo "  the target side changed the bundle" >&2; return 1; }
+
+  # A rebuilt CTF makes the bundle stale: check exits 1 and says so. make bootstrap then runs bundle again
+  # The golden CTF is copied read-only, so make the index writable before changing it
+  chmod u+w "$CTF/artifact-index.json"
+  printf '\n' >> "$CTF/artifact-index.json"
+  if out="$(bash "$ROOT/scripts/sourcectl.sh" check 2>&1)"; then
+    echo "  check accepted a bundle built from an older CTF" >&2
+    return 1
+  fi
+  assert_contains "$out" "stale" || return 1
+  bash "$ROOT/scripts/sourcectl.sh" check >/dev/null 2>&1 || env "${run_env[@]}" bash "$ROOT/scripts/sourcectl.sh" bundle >/dev/null || return 1
+  [[ ! -e "$bundle/kept-by-run" ]] || { echo "  bundle was not rebuilt after the CTF changed" >&2; return 1; }
+  expected="$(sha256 "$CTF/artifact-index.json") $(sha256 "$tmp/keys/public.pem") $pins"
+  assert_eq "$(cat "$bundle/source.stamp")" "$expected" "rebuilt bundle stamp" || return 1
+  out="$(bash "$ROOT/scripts/sourcectl.sh" check 2>&1)" || { echo "  check rejected the rebuilt bundle: $out" >&2; return 1; }
+
+  # A bundle without one of its files is incomplete: check names the file and exits 1
+  rm -f "$bundle/charts/kro.tgz"
+  if out="$(bash "$ROOT/scripts/sourcectl.sh" check 2>&1)"; then
+    echo "  check accepted a bundle without charts/kro.tgz" >&2
+    return 1
+  fi
+  assert_contains "$out" "missing charts/kro.tgz" || return 1
+
+  # make bootstrap runs source (check, falling back to bundle) and then only the environment stage. The recipe is
+  # pinned: a variant that also transferred or deployed would still contain the substrings above.
+  out="$(make -n -C "$ROOT" bootstrap 2>/dev/null)" || return 1
+  assert_contains "$out" "scripts/sourcectl.sh check || bash scripts/sourcectl.sh bundle" || return 1
+  assert_contains "$out" "scripts/targetctl.sh bootstrap" || return 1
+  for recipe in "targetctl.sh up" "targetctl.sh transfer" "targetctl.sh deploy" "targetctl.sh run"; do
+    assert_not_contains "$out" "$recipe" || return 1
+  done
+  grep -qE '^bootstrap: source ##' "$ROOT/Makefile" || { echo "  bootstrap does not depend on source" >&2; return 1; }
+  assert_eq "$(_make_recipe bootstrap)" $'\t@bash scripts/targetctl.sh bootstrap' "make bootstrap recipe" || return 1
+}
+
+test_sourcectl_chart_refs_come_from_controller() {
+  # The online chart references are written once, in scripts/controller.sh; the bootstrap scripts only read them
+  local script
+  for script in "$ROOT/scripts/sourcectl.sh" "$ROOT/scripts/targetctl.sh" "$ROOT/scripts/bootstrap-bundle.sh"; do
+    assert_not_contains "$(cat "$script")" "oci://" || return 1
+  done
+  grep -q '^OCM_CONTROLLER_CHART_REF="oci://ghcr.io/open-component-model/kubernetes/controller/chart"$' "$ROOT/scripts/controller.sh" || return 1
+  grep -q '^KRO_CHART_REF="oci://registry.k8s.io/kro/charts/kro"$' "$ROOT/scripts/controller.sh" || return 1
+}
+
+test_sourcectl_and_targetctl_stay_on_their_side() {
+  local src="$ROOT/scripts/sourcectl.sh" tgt="$ROOT/scripts/targetctl.sh" text needle script
+  # The target side never pulls charts or installs Flux, and never reads the source-side version pins or calls sourcectl
+  text="$(cat "$tgt")"
+  # shellcheck disable=SC2016
+  # It also never reads the component archive (build/ctf) or decides whether the bundle is stale
+  for needle in '"$HELM" pull' '"$FLUX" install' _controller_version sourcectl \
+    '$CTF' '${CTF' artifact-index VERIFY_KEY _bundle_is_stale _bundle_stamp \
+    'crictl pull' 'docker pull' 'kind load' _drain KEEP_CLUSTER BOOTSTRAP_CREATED; do
+    assert_not_contains "$text" "$needle" || return 1
+  done
+  # No exit trap tears the target down: up leaves it running
+  ! grep -qE '^[[:space:]]*trap[[:space:]]' "$tgt" || { echo "  targetctl.sh sets a trap" >&2; return 1; }
+  # The source side never touches the cluster or the container runtime
+  text="$(cat "$src")"
+  # shellcheck disable=SC2016
+  for needle in '"$KIND"' crictl docker; do
+    assert_not_contains "$text" "$needle" || return 1
+  done
+  # The registry image pin lives only in the shared helper
+  for text in "$(cat "$src")" "$(cat "$tgt")"; do
+    assert_not_contains "$text" "registry:2@sha256" || return 1
+  done
+  # Both sides read the shared bundle layout from the helper
+  for script in "$src" "$tgt"; do
+    # shellcheck disable=SC2016
+    grep -qF 'source "$(dirname "$0")/bootstrap-bundle.sh"' "$script" || { echo "  $(basename "$script") does not source bootstrap-bundle.sh" >&2; return 1; }
+  done
+}
+
+test_transfer_config_routes_inlined_images() {
+  local tmp="$1" plan strings
+  _build
+  # The bundle inlines each image as a LocalBlob. The second entry of transfer.ocmconfig routes those by referenceName
+  env -u OCM_COMPONENT_REPO -u OCM_REGISTRY_USERNAME -u OCM_REGISTRY_PASSWORD OCM_REPO="ctf::$tmp/inlined" \
+    bash "$ROOT/scripts/publish.sh" </dev/null >/dev/null || return 1
+  plan="$tmp/plan-inlined.json"
+  env -u OCM_REGISTRY_USERNAME -u OCM_REGISTRY_PASSWORD \
+    TRANSFER_PLAN=1 TRANSFER_PLAN_FILE="$plan" TRANSFER_CONFIG="$ROOT/transfer.ocmconfig" \
+    OCM_COMPONENT_REPO="ctf::$tmp/inlined" OCM_REPO="oci::http://localhost:5001" \
+    bash "$ROOT/scripts/publish.sh" </dev/null >/dev/null || return 1
+  strings="$(jq -r '.. | strings' "$plan")"
+  # One referenceName expression per architecture variant, each adding the architecture suffix
+  assert_eq "$(grep -c 'referenceName.split(":")\[1\] + "-" + ' <<< "$strings")" "2" "referenceName routed variants" || return 1
+  assert_contains "$strings" "extraIdentity.architecture" || return 1
+  assert_not_contains "$strings" "toOCI" || return 1
+  # The docs describe the same entry
+  assert_contains "$(cat "$ROOT/docs/transfer.md")" "referenceName" || return 1
+}
+
 # ── Run all tests ─────────────────────────────────────────────────────────────
 
 run_test "build produces application tree" test_build_produces_application_tree
@@ -7724,6 +9213,7 @@ run_test "devcontainer pins tools" test_devcontainer_pins_tools
 run_test "renovate updates OCM SHA256 ARGs" test_renovate_updates_ocm_sha256
 run_test "renovate updates Flux SHA256 ARGs" test_renovate_updates_flux_sha256
 run_test "renovate updates kind SHA256 ARGs" test_renovate_updates_kind_sha256
+run_test "renovate updates kind node image" test_renovate_updates_kind_node_image
 run_test "renovate managers match their targets"   test_renovate_managers_match_targets
 run_test "renovate captures pinned versions"        test_renovate_captures_pinned_versions
 run_test "renovate regexes reject invalid input"    test_renovate_regexes_reject_invalid_input
@@ -7731,6 +9221,7 @@ run_test "renovate extractVersion maps release tags" test_renovate_extract_versi
 run_test "renovate groups Flux updates"             test_renovate_groups_flux_updates
 run_test "renovate OCM CLI rule scoped to Dockerfile" test_renovate_ocm_cli_rule_scoped
 run_test "e2e workflow isolates deploy" test_e2e_workflow_isolates_deploy
+run_test "workflows pin runner image" test_workflows_pin_runner_image
 run_test "ocm versions table is well formed" test_ocm_versions_table_is_well_formed
 run_test "ocm version check rejects unlisted" test_ocm_version_check_rejects_unlisted
 run_test "ocm version check accepts validated" test_ocm_version_check_accepts_validated
@@ -7759,6 +9250,7 @@ run_test "transfer plan lists expected operations" test_transfer_plan_lists_expe
 run_test "transfer plan replay preserves signature" test_transfer_plan_replay_preserves_signature
 run_test "publish replays transfer spec" test_publish_replays_transfer_spec
 run_test "transfer config routes images per architecture" test_transfer_config_routes_images_per_architecture
+run_test "transfer config routes inlined images" test_transfer_config_routes_inlined_images
 run_test "readme documents transfer and transport" test_readme_documents_transfer_and_transport
 run_test "ctf layout is canonical" test_ctf_layout_is_canonical
 run_test "ctf archive is portable and signed" test_ctf_archive_is_portable_and_signed
@@ -8029,9 +9521,9 @@ run_test "flux artifact resource is flux oci layout" test_flux_artifact_resource
 run_test "flux artifact is not committed"     test_flux_artifact_is_not_committed
 run_test "build generates flux artifact"      test_build_generates_flux_artifact
 run_test "rgd mirrors localization and config" test_rgd_mirrors_localization_and_config
-run_test "controller bootstrap wires published component" test_controller_bootstrap_wires_published_component
+run_test "controller deploy manifest wires published component" test_controller_deploy_manifest_wires_published_component
 run_test "controller.sh installs stack" test_controller_sh_installs_stack
-run_test "controller.sh applies bootstrap and checks app" test_controller_sh_applies_bootstrap_and_checks_app
+run_test "controller.sh applies deploy manifest and checks app" test_controller_sh_applies_deploy_manifest_and_checks_app
 run_test "controller.sh cluster lifecycle" test_controller_sh_cluster_lifecycle
 run_test "controller.sh run deletes cluster it created"  test_controller_sh_run_deletes_created_cluster
 run_test "controller.sh run keeps cluster with KEEP_CLUSTER" test_controller_sh_run_keep_cluster
@@ -8043,6 +9535,46 @@ run_test "controller.sh check fails without answer"      test_controller_sh_chec
 run_test "controller.sh install requires tools"          test_controller_sh_install_requires_tools
 run_test "make controller target" test_make_controller_target
 run_test "docs document controller stack" test_docs_document_controller_stack
+run_test "rgd is valid kro simple schema" test_rgd_is_valid_kro_simple_schema
+run_test "controller rbac grants controller rgd read" test_controller_rbac_grants_controller_rgd_read
+run_test "deploy resources ship in component" test_deploy_resources_ship_in_component
+run_test "controller.sh install uses offline sources" test_controller_sh_install_uses_offline_sources
+run_test "controller.sh apply localizes deploy manifest with guards" test_controller_sh_apply_localizes_with_guards
+run_test "controller.sh apply rejects renamed targets" test_controller_sh_apply_rejects_renamed_targets
+run_test "controller.sh apply matches backslash values" test_controller_sh_apply_matches_backslash_values
+run_test "controller.sh check waits on app label" test_controller_sh_check_waits_on_app_label
+run_test "cluster.sh passes kind config" test_cluster_sh_passes_kind_config
+run_test "sourcectl bundle writes offline bundle" test_sourcectl_bundle_writes_offline_bundle
+run_test "sourcectl bundle writes image archives" test_sourcectl_bundle_writes_image_archives
+run_test "sourcectl check detects changed platform pins" test_sourcectl_check_detects_changed_platform_pins
+run_test "targetctl cluster creates stand-in cluster" test_targetctl_cluster_creates_stand_in_cluster
+run_test "targetctl bootstrap uses existing cluster" test_targetctl_bootstrap_uses_existing_cluster
+run_test "targetctl bootstrap loads platform images from the bundle" test_targetctl_bootstrap_loads_platform_images
+run_test "targetctl bootstrap rejects mislabeled archive" test_targetctl_bootstrap_rejects_mislabeled_archive
+run_test "targetctl bootstrap fails on unstaged image" test_targetctl_bootstrap_fails_on_unstaged_image
+run_test "targetctl bootstrap fails on failed import" test_targetctl_bootstrap_fails_on_failed_import
+run_test "targetctl bootstrap re-imports a missing image once" test_targetctl_bootstrap_reimports_missing_image_once
+run_test "targetctl bootstrap prepares environment only" test_targetctl_bootstrap_prepares_environment_only
+run_test "targetctl transfer rejects external resources" test_targetctl_transfer_rejects_external_resources
+run_test "targetctl transfer publishes verified component" test_targetctl_transfer_publishes_verified_component
+run_test "targetctl deploy applies application from registry" test_targetctl_deploy_applies_application_from_registry
+run_test "targetctl deploy rejects tampered manifest" test_targetctl_deploy_rejects_tampered_manifest
+run_test "targetctl transfer and deploy require bootstrap" test_targetctl_transfer_and_deploy_require_bootstrap
+run_test "targetctl deploy requires transferred component" test_targetctl_deploy_requires_transferred_component
+run_test "targetctl up runs bootstrap transfer deploy and leaves it running" test_targetctl_up_runs_bootstrap_transfer_deploy_and_leaves_it_running
+run_test "targetctl offline subcommands run behind offline proxy" test_targetctl_offline_subcommands_run_behind_offline_proxy
+run_test "targetctl bootstrap no_proxy ipv6 api" test_targetctl_bootstrap_no_proxy_ipv6_api
+run_test "bootstrap verify config quotes key path" test_bootstrap_verify_config_quotes_key_path
+run_test "sourcectl bundle refuses dir outside build" test_sourcectl_bundle_refuses_dir_outside_build
+run_test "make bootstrap rebuilds stale bundle" test_make_bootstrap_rebuilds_stale_bundle
+run_test "sourcectl chart refs come from controller" test_sourcectl_chart_refs_come_from_controller
+run_test "sourcectl and targetctl stay on their side" test_sourcectl_and_targetctl_stay_on_their_side
+run_test "bootstrap registry image matches registry demo" test_bootstrap_registry_image_matches_registry_demo
+run_test "make bootstrap targets" test_make_bootstrap_targets
+run_test "make up runs source before target" test_make_up_runs_source_before_target
+run_test "e2e workflow runs controller leg with targetctl" test_e2e_workflow_runs_controller_leg_with_targetctl
+run_test "docs document bootstrap" test_docs_document_bootstrap
+run_test "no stale bootstrap manifest names" test_no_stale_bootstrap_manifest_names
 
 echo ""
 _ocm_v="$(ocm_installed_version)"

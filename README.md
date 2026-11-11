@@ -31,6 +31,7 @@ make lint      # lint shell scripts
 - [Transfer and consumption](docs/transfer.md): transfer and transport, and consuming the component
 - [Kubernetes](docs/kubernetes.md): controller, deployer, and component discovery
 - [Controller stack](docs/controller.md): OCM controllers, kro and Flux; make controller
+- [Air-gapped target](docs/bootstrap.md): a bundle built online (make source), then the controller stack bootstrapped and the application transferred and deployed with no internet access (make target); make up runs both
 - [Plugin system](docs/plugins.md): external plugins and the demo-store plugin
 
 ### Signing

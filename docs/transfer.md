@@ -74,6 +74,8 @@ make publish OCM_REPO=oci::http://localhost:5001 TRANSFER_SPEC=build/transfer-pl
 # produces: .../library/nginx:1.31-alpine-amd64 and .../library/nginx:1.31-alpine-arm64
 ```
 
+The file's second entry covers the same images after the [bootstrap bundle](bootstrap.md#the-bundle) has inlined them as `LocalBlob` resources. A `LocalBlob` has no registry reference, so that entry takes the tag from `referenceName` (`library/nginx:1.31-alpine`) and gives the same per-architecture tags. The entry assumes `referenceName` is `<repo>:<tag>` with no digest, as OCM writes it. `targetctl.sh transfer` (`make target-transfer`) uses this entry when it moves the bundle into the target registry.
+
 ### Consumer side
 
 After transfer, point consumers at the target with `OCM_COMPONENT_REPO`. See
