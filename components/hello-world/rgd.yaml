@@ -7,18 +7,15 @@ spec:
     apiVersion: v1alpha1
     kind: HelloWorld
     spec:
-      component:
-        type: string
-        default: "application"
-      architecture:
-        type: string
-        default: "amd64"
-      replicas:
-        type: integer
-      html:
-        type: string
+      component: string | default="application"
+      architecture: string | default="amd64"
+      replicas: integer | default=1
+      html: string
+      insecure: boolean | default=false
   resources:
     - id: kustomize
+      readyWhen:
+        - ${kustomize.status.conditions.exists(c, c.type == "Ready" && c.status == "True")}
       template:
         apiVersion: delivery.ocm.software/v1alpha1
         kind: Resource
@@ -32,10 +29,10 @@ spec:
               resource:
                 name: hello-world-kustomize
           additionalStatusFields:
-            registry: resource.access.imageReference.split("/")[0]
-            repository: resource.access.imageReference.split("/")[1:].join("/").split("@")[0]
-            digest: resource.access.imageReference.split("@")[1]
+            oci: resource.access.toOCI()
     - id: image
+      readyWhen:
+        - ${image.status.conditions.exists(c, c.type == "Ready" && c.status == "True")}
       template:
         apiVersion: delivery.ocm.software/v1alpha1
         kind: Resource
@@ -48,25 +45,23 @@ spec:
             byReference:
               resource:
                 name: hello-world-image
-                extraIdentity:
-                  architecture: ${schema.spec.architecture}
+                architecture: ${schema.spec.architecture}
           additionalStatusFields:
-            registry: resource.access.imageReference.split("/")[0]
-            repository: resource.access.imageReference.split("/")[1:].join("/").split("@")[0]
-            digest: '"sha256:" + resource.digest.value'
+            oci: resource.access.toOCI()
     - id: ocirepository
       readyWhen:
         - ${ocirepository.status.artifact != null}
       template:
-        apiVersion: source.toolkit.fluxcd.io/v1beta2
+        apiVersion: source.toolkit.fluxcd.io/v1
         kind: OCIRepository
         metadata:
           name: ${schema.metadata.name}
         spec:
           interval: 10m
-          url: oci://${kustomize.status.additional.registry}/${kustomize.status.additional.repository}
+          url: oci://${kustomize.status.additional.oci.registry}/${kustomize.status.additional.oci.repository}
+          insecure: ${schema.spec.insecure}
           ref:
-            digest: ${kustomize.status.additional.digest}
+            digest: ${kustomize.status.additional.oci.digest}
     - id: kustomization
       template:
         apiVersion: kustomize.toolkit.fluxcd.io/v1
@@ -82,7 +77,7 @@ spec:
             kind: OCIRepository
             name: ${schema.metadata.name}
           patches:
-            - patch: ${json.marshal([{"op":"test","path":"/spec/template/spec/containers/0/image","value":"HELLO_WORLD_IMAGE"},{"op":"replace","path":"/spec/template/spec/containers/0/image","value":image.status.additional.registry+"/"+image.status.additional.repository+"@"+image.status.additional.digest}])}
+            - patch: ${json.marshal([{"op":"test","path":"/spec/template/spec/containers/0/image","value":"HELLO_WORLD_IMAGE"},{"op":"replace","path":"/spec/template/spec/containers/0/image","value":image.status.additional.oci.registry+"/"+image.status.additional.oci.repository+"@"+image.status.additional.oci.digest}])}
               target:
                 kind: Deployment
                 name: hello-world

@@ -24,7 +24,7 @@ concurrency:
 jobs:
   test:
     if: github.repository == 'lioramilbaum/application'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     permissions:
       contents: read
       packages: read
@@ -46,7 +46,7 @@ jobs:
   release:
     needs: test
     if: github.repository == 'lioramilbaum/application' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     permissions:
       contents: write
       packages: write

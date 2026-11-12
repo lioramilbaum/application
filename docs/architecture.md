@@ -9,6 +9,8 @@ github.com/lioramilbaum/application
 ├── hello-world-manifests  (blob, application/yaml, Kubernetes manifests)
 ├── hello-world-localization  (localizationConfig, application/json, image localization rules)
 ├── hello-world-config  (configData, application/json, deploy-time configuration values)
+├── hello-world-deploy  (blob, application/yaml, controller deploy manifests)
+├── hello-world-instance  (blob, application/yaml, HelloWorld instance)
 ├── hello-world-sbom  (sbom, application/vnd.cyclonedx+json)
 └── deploy-bundle  (directoryTree, deployment scripts and descriptor)
     ├── component-constructor.yaml  (OCM component descriptor)
@@ -111,6 +113,8 @@ This component's elements and their identities:
 | resource `hello-world-config` | `name=hello-world-config,version=0.1.0` | `github.com/lioramilbaum/application:0.1.0:resource/hello-world-config` |
 | resource `hello-world-kustomize` | `name=hello-world-kustomize,version=0.1.0` | `github.com/lioramilbaum/application:0.1.0:resource/hello-world-kustomize` |
 | resource `hello-world-rgd` | `name=hello-world-rgd,version=0.1.0` | `github.com/lioramilbaum/application:0.1.0:resource/hello-world-rgd` |
+| resource `hello-world-deploy` | `name=hello-world-deploy,version=0.1.0` | `github.com/lioramilbaum/application:0.1.0:resource/hello-world-deploy` |
+| resource `hello-world-instance` | `name=hello-world-instance,version=0.1.0` | `github.com/lioramilbaum/application:0.1.0:resource/hello-world-instance` |
 | resource `hello-world-sbom` | `name=hello-world-sbom,version=0.1.0` | `github.com/lioramilbaum/application:0.1.0:resource/hello-world-sbom` |
 | resource `deploy-bundle` | `name=deploy-bundle,version=0.1.0` | `github.com/lioramilbaum/application:0.1.0:resource/deploy-bundle` |
 | source `application-source` | `name=application-source,version=0.1.0` | `github.com/lioramilbaum/application:0.1.0:source/application-source` |
