@@ -96,7 +96,7 @@ _compare() {
 }
 
 # Prints the algorithm OCM signs with by default and the rejection of the verify-only
-# jsonNormalisation/v1 (test/ocm-versions.tsv records both per validated OCM version).
+# jsonNormalisation/v1.
 _algorithms() {
   local ref="ctf::$NORM_DEMO_OUT/base-ctf//github.com/lioramilbaum/normalisation-demo:${VERSION}" err
   printf '%s\tsupported\n' "$("$OCM" sign cv --config "$BUILD_DIR/sign.ocmconfig" \
@@ -104,7 +104,7 @@ _algorithms() {
   err="$("$OCM" sign cv --config "$BUILD_DIR/sign.ocmconfig" \
     --dry-run --normalisation "jsonNormalisation/v1" "$ref" \
     </dev/null 2>&1 || true)"
-  # The error text differs between OCM releases (test/ocm-versions.tsv: v1_sign_rejection), so print it whole.
+  # The error text differs between OCM releases, so print it whole.
   printf 'jsonNormalisation/v1\trejected\t%s\n' "$(echo "$err" | sed -n 's/^Error: //p' | head -1)"
 }
 

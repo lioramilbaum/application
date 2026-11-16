@@ -20,8 +20,6 @@
 - `docker`, `kind`, `helm`, `kubectl`, `ocm`, `jq` and `tar` for the offline target targets (`make target`, `make target-bootstrap`, `make target-transfer`, `make target-deploy`); `make source` and `make package` need internet access (see [Air-gapped target](bootstrap.md))
 - Docker Hub access for `make build` and `make test` (to resolve `nginx:1.31-alpine`)
 
-The tests are validated against the OCM CLI versions listed in `test/ocm-versions.tsv`; on any other version the version-specific tests SKIP (see [OCM version validation](#ocm-version-validation)).
-
 OCM CLI and kind are provided by the devcontainer image. Outside the devcontainer, put `ocm` and `kind` on your PATH.
 
 The `.devcontainer/` directory provides all required tools when used with Docker Desktop or a compatible Docker host and devcontainers CLI.
@@ -107,37 +105,6 @@ Renovate likewise bumps `FLUX_VERSION` in the Dockerfile and `scripts/controller
 
 Renovate likewise bumps `KIND_VERSION` together with both `KIND_SHA256_LINUX_AMD64` and `KIND_SHA256_LINUX_ARM64`, using `github-release-attachments` and `# renovate: kind-linux-<arch> <version>` markers in the Dockerfile.
 
-## OCM version validation
-
-The tests are validated against the OCM CLI versions in `test/ocm-versions.tsv`, one row per version. A row records the behaviour that has changed between OCM releases and that the tests assert:
-
-| Column | Behaviour | Tests |
-|---|---|---|
-| `default_norm` | normalisation algorithm of new signatures and component-reference digests | `readme documents signing and verification`, `product references application`, `pki signature is pem encoded`, `pki show reports chain`, `gpg signature is openpgp`, `gpg show reports key`, `normalisation rejects legacy v1` |
-| `v1_sign_rejection` | error text of `ocm sign cv --normalisation jsonNormalisation/v1` | `normalisation rejects legacy v1` |
-| `plugin_tampered` | `<ocm>,<check>` columns of the plugin `tampered-content` scenario | `plugin scenarios malformed response` |
-| `git_tree_mismatch` | `scripts/git.sh download` reason for a commit with a different tree | `git digest covers tree not commit` |
-| `tsa_label_transfer` | `ok` or `fail`: transfer of a TSA-timestamped GPG component (upstream label bug) | `gpg timestamp survives transfer` |
-
-A row's `version` must equal the string `ocm version` prints exactly (after stripping a leading `v`), including any pre-release or build suffix: a release candidate such as `0.24.0-rc.1` needs its own row.
-
-These tests read their expectation from the row of the installed `ocm version` (`_ocm_expect` in `test/run.sh`). On a version without a row:
-
-- the version-specific tests report SKIP (`skip: OCM <version> not validated`), and `make test` prints `NOTE: OCM <version> not validated` above the results;
-- all other tests run as usual, so the `test` CI job stays green unless something else broke;
-- `make ocm-version-check` fails with `OCM <version> not validated: add expectations to test/ocm-versions.tsv`. CI runs it in the separate `ocm-version-validated` job, which turns red on the pull request.
-
-`ocm-version-validated` is informational and must not be a required status check. `main` has no branch protection or rulesets today, so no check is required. If you add them, require `test` and the E2E jobs, not `ocm-version-validated`.
-
-When Renovate bumps `OCM_CLI_VERSION` to a version without a row:
-
-1. Do not push to the Renovate branch. Check it out locally and run `make test` in its devcontainer.
-2. For each column, check the behaviour of the new version in the tests listed above, and add a row for it to `test/ocm-versions.tsv`. Keep the existing rows: `main` still runs the old version until the Renovate PR merges. If OCM changed something else, fix that test. If behaviour that a test asserts differs between versions, add a column and read it with `_ocm_expect` at the top of the test.
-3. `make ocm-version-check lint test` must pass with the new version and report no `not validated` note.
-4. Commit the row (and any test or doc changes) on a branch from `main` and open a separate PR. After it merges, Renovate rebases its PR and `ocm-version-validated` turns green.
-
-Rows for older versions can stay. Remove a row when a new column would need a value that you can no longer check.
-
 ## Running tests
 
 ```bash
@@ -175,7 +142,7 @@ Tests include:
 - HTTP resources: `wget resource metadata`, `wget pinned digest matches upstream file`, `wget pinned digest rejects mismatch`, `wget input embeds bytes at build time`, `wget access needs server at consume time`, `wget download rejects changed upstream`, `wget download requires signature`, `wget checksum require rejects unadvertised`, `wget checksum matrix`, `wget rejects invalid checksum mode`, `wget credentials resolved by url identity`, `wget transfer reference vs copy`, `wget transfer copy enforces digest`, `wget requires ocm 0.19`, `wget server port in use`, `wget show reports resources`, `make wget target`, `readme documents http resources`
 - Certificate-chain signing: `pki signature is pem encoded`, `pki verifier pins only root`, `pki scenarios`, `pki rotation keeps verifier config`, `pki certs are reused`, `pki reissues expiring leaf`, `pki signature covers descriptor`, `pki signature survives transfer`, `pki verify requires signature`, `pki own pki requires all vars`, `pki own pki uses supplied files`, `pki show reports chain`, `make pki target`, `readme documents certificate-chain signing`
 - GPG signing timestamps (need OCM >= 0.21.0 and a local TSA): `gpg timestamp rfc3161`, `gpg timestamp survives transfer`
-- Git repositories: `git resource metadata`, `git ref pinned at build time`, `git upstream is deterministic`, `git snapshot matches commit tree`, `git digest covers tree not commit`, `git signature binds commit label`, `git audit matches snapshot`, `git audit rejects wrong commit label`, `git audit requires signature`, `git scenarios`, `git transfer carries snapshot only`, `git uploader cannot copy git access`, `git own repo requires both vars`, `git own repo uses supplied repository`, `git rejects sha256 repository`, `git requires ocm 0.19`, `git show reports provenance`, `make git target`, `readme documents git repositories`
+- Git repositories: `git resource metadata`, `git ref pinned at build time`, `git upstream is deterministic`, `git snapshot matches commit tree`, `git digest covers tree not commit`, `git signature binds commit label`, `git audit matches snapshot`, `git audit rejects wrong commit label`, `git audit requires signature`, `git scenarios`, `git transfer carries snapshot only`, `git uploader cannot copy git access`, `git access uses remote url`, `git own repo rejects missing path`, `git own repo rejects unsafe name`, `git own repo requires both vars`, `git own repo uses supplied repository`, `git rejects sha256 repository`, `git requires ocm 0.19`, `git show reports provenance`, `make git target`, `readme documents git repositories`
 - OCI images: `oci layout is reproducible`, `oci image resource metadata`, `oci resource digest is manifest digest`, `oci download yields oci layout`, `oci multiarch index references variants`, `oci download requires signature`, `oci signature covers image digest`, `oci transfer plan copy-resources leaves local images`, `oci transfer plan uploader rewrites references`, `oci transfer to ctf keeps digests`, `oci inspect reports architectures`, `localization relocate rewrites access keeps digest`, `localization readme documents three levels`, `make oci target`, `readme documents oci images`
 - Version selection: `versions lists newest first`, `versions constraint filters`, `versions latest includes prereleases by default`, `versions scheme orders build numbers`, `versions without scheme misorders`, `versions reference requires semver`, `versions requires ocm 0.19`, `versions show reports selection`, `make versions target`, `readme documents version selection`, `docs versions page`
 - Credential system: `credentials build creates ctf`, `credentials show lists consumer types`, `credentials match exact wins over wildcard`, `credentials match wildcard catches subpath`, `credentials match path star does not cross slash`, `credentials chain combines configs`, `credentials wget identity hostname required`, `credentials wget identity port attribute`, `credentials generic config wraps multiple`, `credentials scenarios matrix output`, `make credentials target`, `readme documents credential system`
@@ -188,13 +155,12 @@ Tests include:
 - Resources without access (None): `none-access sha256 matches constructor label`, `none-access resource has no digest in descriptor`, `none-access build warns no digest processor`, `none-access control resource downloads`, `none-access download fails gracefully`, `none-access sign and verify`, `none-access digest not signed`, `none-access digest triggers warning`, `none-access lowercase warns missing digest`, `none-access versioned type is not none`, `none-access identity is signed`, `none-access label is signed`, `none-access audit passes`, `none-access audit detects tamper`, `none-access transfer keeps none`, `none-access copy resources keeps none`, `make none-access target`, `readme documents none access`
 - README index: `readme intro lists demos`
 - Repository metadata: `license is apache 2.0`, `contributing guide covers workflow`
-- OCM version validation: `ocm versions table is well formed`, `ocm version check rejects unlisted`, `ocm version check accepts validated`, `ocm version-specific tests skip unlisted`, `ci checks ocm version separately`, `docs document ocm version validation`
 
 ## CI
 
 CI runs on `ubuntu-26.04` (linux/amd64) inside the devcontainer. Every job, including the `renovate.yaml` job, pins that runner image rather than `ubuntu-latest`, so a GitHub image switch cannot change CI unannounced. Renovate opens a PR when a newer `ubuntu-*` runner is available. Three workflows build and test:
 
-- **`ci.yaml`** — runs on every push and pull request to `main`: lint and unit tests (`test` job), and the non-blocking `ocm-version-validated` job (`make ocm-version-check`, see [OCM version validation](#ocm-version-validation)).
+- **`ci.yaml`** — runs on every push and pull request to `main`: lint and unit tests (`test` job).
 - **`release.yaml`** — triggered by a `v*.*.*` tag or `workflow_dispatch` with a semver `version` input. Runs tests, then builds and signs the OCM component with `OCM_SIGNING_KEY`, uploads a `application-ctf` artifact, and on tags publishes the component to `ghcr.io/<owner>/ocm` and creates a GitHub release.
 - **`e2e.yaml`** — runs on every push and pull request to `main`. A `build` job builds, signs and verifies the component with an auto-generated dev key and uploads it (`application-ctf-dev`). A `package` job (`needs: build`) downloads that artifact, writes the bootstrap bundle (the only online step of the air-gapped path, platform images included), prints its size and uploads it (`application-bootstrap-bundle`), so a bundle failure fails only that job. An `e2e` job (`needs: [build, package]`) runs whenever `build` succeeded and has two legs, `e2e (cli)` and `e2e (controller)`, with `fail-fast: false`. If the bundle is missing, the `controller` leg fails before downloading the bundle and the `cli` leg still runs. Before the block, the `cli` leg creates the kind cluster and pre-pulls the rendered manifest images into the nodes; the `controller` leg only creates the stand-in kind cluster (`make target-cluster`), because the kind node entrypoint resolves `host.docker.internal` over DNS. Both legs create their clusters from the pinned `kindest/node` image in `scripts/cluster.sh` (the kind v0.33.0 default, updated by Renovate). Both then block new outbound connections from the kind network with an iptables `DOCKER-USER` rule and start a `tcpdump` capture on the kind bridge. Inside the block, the `cli` leg runs `make e2e-run` and checks the pod, and the `controller` leg runs `make target-bootstrap`, `make target-transfer` and `make target-deploy` as three steps, all from the bundle. Each leg then removes the rule, stops the capture, and fails if any packet left the private ranges for the public internet. Each pcap and tcpdump text is uploaded as the `application-e2e-egress-evidence-<leg>` artifact.
 

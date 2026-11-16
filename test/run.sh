@@ -5,6 +5,16 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 # shellcheck source=scripts/lib.sh
 source "$ROOT/scripts/lib.sh"
 
+# Concurrent suite runs must not share the git:// port: take the first free one from 18471.
+if [[ -z "${GIT_DEMO_PORT:-}" ]]; then
+  GIT_DEMO_PORT=18471
+  while (exec 3<>"/dev/tcp/127.0.0.1/$GIT_DEMO_PORT") 2>/dev/null; do
+    GIT_DEMO_PORT=$((GIT_DEMO_PORT + 1))
+    (( GIT_DEMO_PORT < 18471 + 50 )) || { echo "no free port from 18471 for the git demo" >&2; exit 1; }
+  done
+  export GIT_DEMO_PORT
+fi
+
 # Set up golden directory for testing
 GOLDEN_DIR="${GOLDEN_DIR:-$ROOT/.test-golden}"
 
@@ -97,24 +107,6 @@ doc_heading_exists() { grep -qxF -e "# $1" -e "## $1" "${DOC_FILES[@]}"; }
 # _heading_slugs FILE: GitHub-style anchor slug of each heading outside fences
 _heading_slugs() {
   awk '/^(```|~~~)/{ if(!c){c=1; m=substr($0,1,3)} else if(substr($0,1,3)==m){c=0}; next } !c && /^#+ /{t=$0; sub(/^#+ /,"",t); s=tolower(t); gsub(/[^a-z0-9 _-]/,"",s); gsub(/ /,"-",s); print s}' "$1"
-}
-
-# Version-specific expectations live in test/ocm-versions.tsv, one row per validated OCM version.
-# shellcheck source=scripts/ocm-version.sh
-source "$ROOT/scripts/ocm-version.sh"
-
-# _ocm_expect COLUMN: the test/ocm-versions.tsv value of COLUMN for the installed $OCM.
-# On an OCM version without a row it prints a skip reason and returns 77 (SKIP), so a
-# version-specific test calls it before anything else: want="$(_ocm_expect COLUMN)" || return $?
-_ocm_expect() {
-  local v rc=0
-  v="$(ocm_installed_version)"
-  ocm_expectation "$v" "$1" || rc=$?
-  case "$rc" in
-    0) return 0 ;;
-    1) echo "  skip: OCM ${v:-<unknown version>} not validated; add a row to test/ocm-versions.tsv" >&2; return 77 ;;
-    *) echo "  test/ocm-versions.tsv has no column $1" >&2; return 1 ;;
-  esac
 }
 
 _build_golden() {
@@ -1927,131 +1919,6 @@ test_renovate_updates_ocm_sha256() {
     || die "OCM dependencies are not grouped into one PR"
 }
 
-# ── OCM version validation ──────────────────────────────────────────────────
-
-# _stub_ocm_version <dir> <version>: an ocm that reports <version> and fails every other command,
-# so a version-specific test that runs ocm before its _ocm_expect gate fails instead of skipping.
-_stub_ocm_version() {
-  mkdir -p "$1"
-  cat > "$1/ocm" <<STUB
-#!/usr/bin/env bash
-if [[ "\${1:-}" == version ]]; then
-  printf 'OCM CLI (Open Component Model v2)\n  Version:  %s\n' '$2'
-  exit 0
-fi
-echo "stub ocm $2: unexpected call: \$*" >&2
-exit 1
-STUB
-  chmod 0755 "$1/ocm"
-  echo "$1/ocm"
-}
-
-# _with_ocm <ocm> <command...>: runs <command> with $OCM and every per-demo *_OCM set to <ocm>.
-_with_ocm() {
-  # shellcheck disable=SC2034
-  local -x OCM="$1"
-  # shellcheck disable=SC2034
-  local VERSIONS_OCM="$1" WGET_OCM="$1" GIT_OCM="$1" GPG_OCM="$1" OCI_OCM="$1" CREDENTIALS_OCM="$1" \
-    PLUGIN_OCM="$1" REGISTRY_OCM="$1" GRAPH_OCM="$1" GITHUB_OCM="$1" NORM_OCM="$1" S3_OCM="$1" NONE_OCM="$1"
-  shift
-  "$@"
-}
-
-test_ocm_versions_table_is_well_formed() {
-  local table="$ROOT/test/ocm-versions.tsv" header want col used
-  [[ -f "$table" ]] || { echo "  test/ocm-versions.tsv is missing" >&2; return 1; }
-  header="$(awk '!/^#/ && NF { print; exit }' "$table")"
-  want="$(printf '%s\t' version default_norm v1_sign_rejection plugin_tampered git_tree_mismatch tsa_label_transfer)"
-  assert_eq "$header" "${want%$'\t'}" "table header" || return 1
-  awk -F'\t' '
-    /^#/ || NF == 0 { next }
-    !h { n = NF; h = 1; next }
-    { rows++ }
-    NF != n { printf "  row %s has %d columns, expected %d\n", $1, NF, n > "/dev/stderr"; bad = 1 }
-    { for (i = 1; i <= NF; i++) if ($i == "") { printf "  row %s has an empty column %d\n", $1, i > "/dev/stderr"; bad = 1 } }
-    $1 !~ /^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$/ { printf "  bad version %s\n", $1 > "/dev/stderr"; bad = 1 }
-    seen[$1]++ { printf "  duplicate version %s\n", $1 > "/dev/stderr"; bad = 1 }
-    $2 !~ /^jsonNormalisation\/v[0-9a-z]+$/ { printf "  row %s: bad default_norm %s\n", $1, $2 > "/dev/stderr"; bad = 1 }
-    $4 !~ /^(ok,(ok|fail)|fail,-)$/ { printf "  row %s: bad plugin_tampered %s\n", $1, $4 > "/dev/stderr"; bad = 1 }
-    $3 ~ /^[ \t]|[ \t]$/ || $3 ~ /[^ -~]/ { printf "  row %s: v1_sign_rejection is not printable text without edge spaces: %s\n", $1, $3 > "/dev/stderr"; bad = 1 }
-    $5 !~ /^[a-z]+(-[a-z]+)*$/ { printf "  row %s: bad git_tree_mismatch %s\n", $1, $5 > "/dev/stderr"; bad = 1 }
-    $6 !~ /^(ok|fail)$/ { printf "  row %s: bad tsa_label_transfer %s\n", $1, $6 > "/dev/stderr"; bad = 1 }
-    END { if (!rows) { print "  no validated versions" > "/dev/stderr"; bad = 1 } exit bad }
-  ' "$table" || return 1
-  # Every column a test asks for exists in the header.
-  used="$(grep -oE '_ocm_expect [a-z_]+\)' "$ROOT/test/run.sh" | sed 's/^_ocm_expect //; s/)$//' | sort -u)"
-  [[ -n "$used" ]] || { echo "  no test calls _ocm_expect" >&2; return 1; }
-  for col in $used; do
-    grep -qxF -e "$col" <<<"${header//$'\t'/$'\n'}" || { echo "  _ocm_expect column '$col' is not in the table" >&2; return 1; }
-  done
-}
-
-test_ocm_version_check_rejects_unlisted() {
-  local tmp="$1" stub out
-  stub="$(_stub_ocm_version "$tmp/stub-bin" 0.99.0)"
-  if out="$(OCM="$stub" bash "$ROOT/scripts/ocm-version.sh" check 2>&1)"; then
-    echo "  check passed for unlisted OCM 0.99.0" >&2; return 1
-  fi
-  assert_contains "$out" "OCM 0.99.0 not validated: add expectations to test/ocm-versions.tsv" || return 1
-  if out="$(make -s -C "$ROOT" ocm-version-check OCM="$stub" 2>&1)"; then
-    echo "  make ocm-version-check passed for unlisted OCM 0.99.0" >&2; return 1
-  fi
-  assert_contains "$out" "OCM 0.99.0 not validated" "make ocm-version-check" || return 1
-}
-
-test_ocm_version_check_accepts_validated() {
-  local tmp="$1" v stub out n=0
-  while read -r v; do
-    stub="$(_stub_ocm_version "$tmp/stub-$v" "$v")"
-    out="$(OCM="$stub" bash "$ROOT/scripts/ocm-version.sh" check 2>&1)" || { echo "  $out" >&2; return 1; }
-    assert_contains "$out" "OCM $v is validated" || return 1
-    out="$(make -s -C "$ROOT" ocm-version-check OCM="$stub" 2>&1)" || { echo "  make: $out" >&2; return 1; }
-    n=$((n + 1))
-  done < <(ocm_validated_versions)
-  [[ $n -gt 0 ]] || { echo "  no validated versions" >&2; return 1; }
-}
-
-test_ocm_version_specific_tests_skip_unlisted() {
-  local tmp="$1" stub fn rc out n=0
-  stub="$(_stub_ocm_version "$tmp/stub-bin" 0.99.0)"
-  for fn in $(declare -F | awk '$3 ~ /^test_/ { print $3 }'); do
-    declare -f "$fn" | grep -qE '_ocm_expect [a-z_]+\)' || continue
-    n=$((n + 1))
-    mkdir -p "$tmp/$fn"
-    rc=0
-    out="$(_with_ocm "$stub" "$fn" "$tmp/$fn" 2>&1)" || rc=$?
-    [[ $rc -eq 77 ]] || { echo "  $fn: exit $rc on unlisted OCM 0.99.0, expected 77 (SKIP): $out" >&2; return 1; }
-    assert_contains "$out" "skip: OCM 0.99.0 not validated" "$fn skip reason" || return 1
-  done
-  # default_norm (7 tests), plugin_tampered, git_tree_mismatch, tsa_label_transfer
-  [[ $n -ge 10 ]] || { echo "  found $n version-specific tests, expected at least 10" >&2; return 1; }
-}
-
-test_ci_checks_ocm_version_separately() {
-  local wf="$ROOT/.github/workflows/ci.yaml" job step
-  job="$(awk '/^  ocm-version-validated:/{f=1; print; next} f && /^  [a-z]/{exit} f' "$wf")"
-  [[ -n "$job" ]] || { echo "  ci.yaml has no ocm-version-validated job" >&2; return 1; }
-  assert_contains "$job" "name: ocm-version-validated" || return 1
-  assert_contains "$job" "devcontainers/ci@" "runs in the devcontainer" || return 1
-  assert_contains "$job" "runCmd: make ocm-version-check" || return 1
-  # The check must turn red: neither the job nor its check step may continue on error.
-  assert_not_contains "$(sed -n '1,/steps:/p' <<<"$job")" "continue-on-error" || return 1
-  step="$(awk '/- name: Check OCM CLI version/{f=1; print; next} f && /- name:/{exit} f' <<<"$job")"
-  [[ -n "$step" ]] || { echo "  no 'Check OCM CLI version' step" >&2; return 1; }
-  assert_not_contains "$step" "continue-on-error" || return 1
-  # The test job does not depend on it.
-  assert_not_contains "$(awk '/^  test:/{f=1; next} f && /^  [a-z]/{exit} f' "$wf")" "ocm-version-validated" || return 1
-}
-
-test_docs_document_ocm_version_validation() {
-  local section check
-  section="$(doc_section "OCM version validation")"
-  [[ -n "$section" ]] || { echo "  docs have no 'OCM version validation' section" >&2; return 1; }
-  for check in "test/ocm-versions.tsv" "make ocm-version-check" "ocm-version-validated" "SKIP" "required"; do
-    assert_contains "$section" "$check" "OCM version validation section contains: $check" || return 1
-  done
-}
-
 test_renovate_updates_flux_sha256() {
   local df="$ROOT/.devcontainer/Dockerfile" rv="$ROOT/renovate.json"
   local flux_version arch sha
@@ -3019,7 +2886,7 @@ TABLE
 
 test_readme_documents_signing_and_verification() {
   local tmp="$1" section t algo norm hash want_norm
-  want_norm="$(_ocm_expect default_norm)" || return $?
+  want_norm="jsonNormalisation/v4alpha3"
   section="$(doc_section "Signing and verification")"
   [[ -n "$section" ]] || { echo "  README has no '## Signing and verification' section" >&2; return 1; }
   assert_contains "$section" "https://ocm.software/docs/concepts/signing-and-verification/" || return 1
@@ -3628,7 +3495,7 @@ test_readme_documents_sboms() {
 
 test_product_references_application() {
   local tmp="$1" product_ctf cv_json ref_json norm
-  norm="$(_ocm_expect default_norm)" || return $?
+  norm="jsonNormalisation/v4alpha3"
   product_ctf="$(_build_product "$tmp")"
   cv_json="$("$OCM" get cv "$(_product_ref "$product_ctf")" -o json)"
 
@@ -4844,7 +4711,7 @@ _pki_fingerprint() {
 
 test_pki_signature_is_pem_encoded() {
   local tmp="$1" sig value first norm
-  norm="$(_ocm_expect default_norm)" || return $?
+  norm="jsonNormalisation/v4alpha3"
   _pki_env "$tmp"
   bash "$ROOT/scripts/pki.sh" >/dev/null 2>&1 || return 1
 
@@ -5010,7 +4877,7 @@ test_pki_own_pki_uses_supplied_files() {
 
 test_pki_show_reports_chain() {
   local tmp="$1" out norm
-  norm="$(_ocm_expect default_norm)" || return $?
+  norm="jsonNormalisation/v4alpha3"
   _pki_env "$tmp"
   out="$(bash "$ROOT/scripts/pki.sh" 2>/dev/null)" || return 1
   out="$(bash "$ROOT/scripts/pki.sh" show 2>/dev/null)" || return 1
@@ -5086,6 +4953,20 @@ _git_env() {
   export GIT_DEMO_CTF="$tmp/git-ctf" GIT_DEMO_OUT="$tmp/git" OCM="$GIT_OCM"
 }
 _build_git() { _git_env "$1"; bash "$ROOT/scripts/git.sh" build; }
+# _gitdemo_serve: serves the demo repository over git:// for direct ocm calls (OCM 0.24.0 rejects file:// access).
+_gitdemo_serve() {
+  bash "$ROOT/scripts/git.sh" serve >/dev/null 2>&1 &
+  _gitdemo_daemon=$!
+  trap 'kill "$_gitdemo_daemon" 2>/dev/null || true; wait "$_gitdemo_daemon" 2>/dev/null || true' EXIT
+  local i
+  for i in $(seq 50); do
+    kill -0 "$_gitdemo_daemon" 2>/dev/null || { echo "  git serve exited on port $GIT_DEMO_PORT" >&2; return 1; }
+    (exec 3<>"/dev/tcp/127.0.0.1/$GIT_DEMO_PORT") 2>/dev/null && return 0
+    sleep 0.1
+  done
+  echo "  git serve did not listen on port $GIT_DEMO_PORT" >&2
+  return 1
+}
 _gitdemo_ref() { echo "ctf::${1}//github.com/lioramilbaum/git-demo:${VERSION}"; }
 _gitdemo_json() { "$OCM" get cv "$(_gitdemo_ref "$1")" -o json </dev/null; }
 _gitdemo_upstream_commit() { GIT_CONFIG_GLOBAL=/dev/null git --git-dir "$1/git/upstream.git" rev-parse 'v0.1.0^{commit}'; }
@@ -5161,6 +5042,7 @@ test_git_ref_pinned_at_build_time() {
     "$(_gitdemo_upstream_commit "$tmp")" "tracked commit pinned at build time" || return 1
 
   _gitdemo_commit_on "$tmp/git/upstream.git" main "<p>main moved on</p>" >/dev/null || return 1
+  _gitdemo_serve || return 1
   "$OCM" download resource --identity name=hello-world-source-tracked --output "$tmp/tracked.tgz" \
     "$(_gitdemo_ref "$tmp/git-ctf")" </dev/null >/dev/null 2>&1 || {
     echo "  tracked download should survive a moved branch" >&2
@@ -5198,7 +5080,7 @@ test_git_snapshot_matches_commit_tree() {
 test_git_digest_covers_tree_not_commit() {
   local tmp="$1" other want
   _git_env "$tmp"
-  want="$(_ocm_expect git_tree_mismatch)" || return $?
+  want="digest-mismatch"
   _build_git "$tmp" >/dev/null 2>&1 || return 1
   bash "$ROOT/scripts/git.sh" sign >/dev/null 2>&1 || return 1
 
@@ -5212,7 +5094,7 @@ test_git_digest_covers_tree_not_commit() {
     echo "  a commit with a different tree should fail to download" >&2
     return 1
   fi
-  # OCM binds the download to the descriptor digest (test/ocm-versions.tsv: git_tree_mismatch).
+  # OCM binds the download to the descriptor digest.
   assert_contains "$out" "download failed ($want)" "different tree is rejected" || return 1
 }
 
@@ -5325,6 +5207,7 @@ configurations:
   - type: localblob.uploader.transfer.config.ocm.software/v1alpha1
     match: resource.access.isType("Git")
 EOF
+  _gitdemo_serve || return 1
   "$OCM" transfer cv --config "$cfg" "$(_gitdemo_ref "$tmp/git-ctf")" "ctf::$tmp/git-uploader-ctf" </dev/null >/dev/null 2>&1 || {
     echo "  an uploader rule matching Git/v1 access should succeed" >&2
     return 1
@@ -5333,6 +5216,41 @@ EOF
   trk_type="$("$OCM" get cv "$(_gitdemo_ref "$tmp/git-uploader-ctf")" -o json \
     | jq -r '.[0].component.resources[] | select(.name=="hello-world-source-tracked") | .access.type')"
   assert_eq "$trk_type" "LocalBlob/v1" "tracked converted to LocalBlob" || return 1
+}
+
+test_git_access_uses_remote_url() {
+  local tmp="$1" commit repos
+  _build_git "$tmp" >/dev/null 2>&1 || return 1
+  repos="$(_gitdemo_json "$tmp/git-ctf" | jq -r '.[0].component | (.sources[], .resources[]) | select(.access.type=="Git/v1") | .access.repository')"
+  assert_eq "$(wc -l <<<"$repos" | tr -d ' ')" "2" "source and tracked use Git/v1 access" || return 1
+  assert_not_contains "$repos" "file://" || return 1
+  [[ "$(grep -vc '^git://127\.0\.0\.1:[0-9]*/upstream\.git$' <<<"$repos")" == 0 ]] || { echo "  demo access is not served over git://127.0.0.1: $repos" >&2; return 1; }
+
+  # A local own repository given as a plain path is served the same way.
+  commit="$(_gitdemo_own_repo "$tmp/own")" || return 1
+  GIT_DEMO_REPO="$tmp/own" GIT_DEMO_COMMIT="$commit" GIT_DEMO_CTF="$tmp/own-ctf" \
+    bash "$ROOT/scripts/git.sh" build >/dev/null 2>&1 || return 1
+  repos="$(_gitdemo_json "$tmp/own-ctf" | jq -r '.[0].component | (.sources[], .resources[]) | select(.access.type=="Git/v1") | .access.repository')"
+  [[ "$(grep -vc '^git://127\.0\.0\.1:[0-9]*/own$' <<<"$repos")" == 0 ]] || { echo "  own repository access is not served over git://: $repos" >&2; return 1; }
+}
+
+test_git_own_repo_rejects_missing_path() {
+  local tmp="$1" out
+  _git_env "$tmp"
+  if out="$(GIT_DEMO_REPO="$tmp/missing" GIT_DEMO_COMMIT="$(printf 'a%.0s' {1..40})" bash "$ROOT/scripts/git.sh" build 2>&1)"; then
+    echo "  a missing repository path should fail" >&2; return 1
+  fi
+  assert_contains "$out" "GIT_DEMO_REPO is not a directory"
+}
+
+test_git_own_repo_rejects_unsafe_name() {
+  local tmp="$1" out
+  _git_env "$tmp"
+  mkdir -p "$tmp/bad name"
+  if out="$(GIT_DEMO_REPO="$tmp/bad name" GIT_DEMO_COMMIT="$(printf 'a%.0s' {1..40})" bash "$ROOT/scripts/git.sh" build 2>&1)"; then
+    echo "  a repository directory name with a space should fail" >&2; return 1
+  fi
+  assert_contains "$out" "GIT_DEMO_REPO directory name must match"
 }
 
 test_git_own_repo_requires_both_vars() {
@@ -5494,7 +5412,7 @@ _gpg_ref() { echo "ctf::${1}//github.com/lioramilbaum/gpg-demo:${VERSION}"; }
 test_gpg_signature_is_openpgp() {
   local tmp="$1" sig value norm
   _gpg_env "$tmp"
-  norm="$(_ocm_expect default_norm)" || return $?
+  norm="jsonNormalisation/v4alpha3"
   bash "$ROOT/scripts/gpg.sh" >/dev/null 2>&1 || return 1
   sig="$("$OCM" get cv "$(_gpg_ref "$tmp/gpg-ctf")" -o json </dev/null | jq -c '.[0].signatures[] | select(.name=="gpg")')"
   [[ -n "$sig" ]] || { echo "  no 'gpg' signature on the component" >&2; return 1; }
@@ -5739,7 +5657,7 @@ test_gpg_own_keys_use_supplied_files() {
 test_gpg_show_reports_key() {
   local tmp="$1" out norm
   _gpg_env "$tmp"
-  norm="$(_ocm_expect default_norm)" || return $?
+  norm="jsonNormalisation/v4alpha3"
   bash "$ROOT/scripts/gpg.sh" >/dev/null 2>&1 || return 1
   out="$(bash "$ROOT/scripts/gpg.sh" show 2>/dev/null)" || return 1
   assert_eq "$(wc -l <<<"$out" | tr -d ' ')" "4" "show prints 4 lines" || return 1
@@ -5780,10 +5698,9 @@ test_gpg_timestamp_rfc3161() {
 }
 
 test_gpg_timestamp_survives_transfer() {
-  local tmp="$1" want
+  local tmp="$1"
   _gpg_env "$tmp"
   _gpg_tsa_env
-  want="$(_ocm_expect tsa_label_transfer)" || return $?
   bash "$ROOT/scripts/gpg.sh" timestamp >/dev/null 2>&1 || return 1
   # The timestamp script stops the TSA; the copy must verify with it stopped.
   assert_fails curl -fsS -o /dev/null --max-time 2 "http://127.0.0.1:18462/-/ready" || return 1
@@ -5792,23 +5709,12 @@ test_gpg_timestamp_survives_transfer() {
   "$OCM" transfer cv --config "$tmp/gpg/verify-tsa.ocmconfig" \
     "$(_gpg_ref "$tmp/gpg/timestamp-ctf")" "ctf::$tmp/gpg-timestamp-transferred" \
     </dev/null >"$tmp/transfer.out" 2>"$tmp/transfer.err" || rc=$?
-  if [[ "$want" == fail ]]; then
-    # Upstream bug (test/ocm-versions.tsv: tsa_label_transfer=fail): the component-descriptor
-    # schema rejects OCM's own TSA label (url.tsa.ocm.software/gpg, version: v1alpha1) because it
-    # requires version ~= ^v[0-9]+$. Assert the failure and its cause so a fix is detectable.
-    [[ $rc -ne 0 ]] || { echo "  expected transfer to fail (TSA label bug) but it succeeded" >&2; return 1; }
-    assert_contains "$(cat "$tmp/transfer.err")" "v1alpha1" \
-      "transfer fails with TSA label schema rejection" || return 1
-  else
-    [[ $rc -eq 0 ]] || { cat "$tmp/transfer.err" >&2; return 1; }
-    local err
-    err="$("$OCM" verify cv --config "$tmp/gpg/verify-tsa.ocmconfig" --signature gpg \
-      "$(_gpg_ref "$tmp/gpg-timestamp-transferred")" </dev/null 2>&1 >/dev/null)" || {
-      echo "  transferred copy does not verify with the TSA root" >&2
-      return 1
-    }
-    assert_contains "$err" "trusted=true" "transferred copy is trusted" || return 1
-  fi
+  # Upstream bug: the component-descriptor schema rejects OCM's own TSA label
+  # (url.tsa.ocm.software/gpg, version: v1alpha1) because it requires version ~= ^v[0-9]+$.
+  # The assertion pins today's upstream failure; update it when upstream fixes the TSA label bug.
+  [[ $rc -ne 0 ]] || { echo "  expected transfer to fail (TSA label bug) but it succeeded" >&2; return 1; }
+  assert_contains "$(cat "$tmp/transfer.err")" "v1alpha1" \
+    "transfer fails with TSA label schema rejection" || return 1
 }
 
 test_make_gpg_target() {
@@ -6379,8 +6285,7 @@ test_plugin_scenarios_malformed_response() {
   _plugin_env "$tmp"
   # <ocm>,<check>: whether OCM itself rejects tampered plugin bytes (open-component-model#4085)
   # or only the script's own digest check does.
-  tampered="$(_ocm_expect plugin_tampered)" || return $?
-  tampered="tampered-content${tab}${tampered/,/$tab}${tab}digest-mismatch"
+  tampered="tampered-content${tab}fail${tab}-${tab}digest-mismatch"
   out="$(bash "$ROOT/scripts/plugin.sh" scenarios malformed-capabilities malformed-response \
     plugin-error unsupported-location tampered-content)" || return 1
   expected="$(printf '%s\n' \
@@ -7196,8 +7101,8 @@ test_normalisation_reimplementation_matches_each_variant() {
 test_normalisation_rejects_legacy_v1() {
   local tmp="$1" out norm want reason
   _normalisation_env "$tmp"
-  norm="$(_ocm_expect default_norm)" || return $?
-  want="$(_ocm_expect v1_sign_rejection)" || return $?
+  norm="jsonNormalisation/v4alpha3"
+  want="expected one of"
   out="$(bash "$ROOT/scripts/normalisation.sh" algorithms </dev/null 2>/dev/null)" || return 1
   assert_contains "$out" "jsonNormalisation/v1" || return 1
   assert_contains "$out" "$norm"$'\tsupported' "default algorithm is listed" || return 1
@@ -8217,8 +8122,12 @@ test_sourcectl_bundle_writes_offline_bundle() {
 
   # Charts are pulled at the versions scripts/controller.sh pins
   local helm_log; helm_log="$(cat "$tmp/helm.log")"
-  assert_contains "$helm_log" "pull oci://ghcr.io/open-component-model/kubernetes/controller/chart --version 0.23.0" || return 1
-  assert_contains "$helm_log" "pull oci://registry.k8s.io/kro/charts/kro --version 0.9.4" || return 1
+  local ocm_ver; ocm_ver=$(sed -n 's/^OCM_CONTROLLER_CHART_VERSION="\([^"]*\)"/\1/p' "$ROOT/scripts/controller.sh")
+  local kro_ver; kro_ver=$(sed -n 's/^KRO_CHART_VERSION="\([^"]*\)"/\1/p' "$ROOT/scripts/controller.sh")
+  kro_ver="${kro_ver#v}"  # the chart tag has no v prefix
+  [[ -n "$ocm_ver" && -n "$kro_ver" ]] || { echo "  chart versions not found in controller.sh" >&2; return 1; }
+  assert_contains "$helm_log" "pull oci://ghcr.io/open-component-model/kubernetes/controller/chart --version $ocm_ver" || return 1
+  assert_contains "$helm_log" "pull oci://registry.k8s.io/kro/charts/kro --version $kro_ver" || return 1
   [[ -f "$bundle/charts/ocm-k8s-toolkit.tgz" && -f "$bundle/charts/kro.tgz" ]] || { echo "  chart archives missing" >&2; return 1; }
 
   assert_contains "$(cat "$tmp/flux.log")" "install --export --version v2.10.0" || return 1
@@ -9222,12 +9131,6 @@ run_test "renovate groups Flux updates"             test_renovate_groups_flux_up
 run_test "renovate OCM CLI rule scoped to Dockerfile" test_renovate_ocm_cli_rule_scoped
 run_test "e2e workflow isolates deploy" test_e2e_workflow_isolates_deploy
 run_test "workflows pin runner image" test_workflows_pin_runner_image
-run_test "ocm versions table is well formed" test_ocm_versions_table_is_well_formed
-run_test "ocm version check rejects unlisted" test_ocm_version_check_rejects_unlisted
-run_test "ocm version check accepts validated" test_ocm_version_check_accepts_validated
-run_test "ocm version-specific tests skip unlisted" test_ocm_version_specific_tests_skip_unlisted
-run_test "ci checks ocm version separately" test_ci_checks_ocm_version_separately
-run_test "docs document ocm version validation" test_docs_document_ocm_version_validation
 run_test "publish passes registry credentials via ocm config" test_publish_passes_registry_credentials_via_ocm_config
 run_test "publish does not write registry secret" test_publish_does_not_write_registry_secret
 run_test "publish without registry credentials uses discovery" test_publish_without_registry_credentials_uses_discovery
@@ -9357,6 +9260,9 @@ run_test "git audit requires signature" test_git_audit_requires_signature
 run_test "git scenarios" test_git_scenarios
 run_test "git transfer carries snapshot only" test_git_transfer_carries_snapshot_only
 run_test "git uploader cannot copy git access" test_git_uploader_cannot_copy_git_access
+run_test "git access uses remote url" test_git_access_uses_remote_url
+run_test "git own repo rejects missing path" test_git_own_repo_rejects_missing_path
+run_test "git own repo rejects unsafe name" test_git_own_repo_rejects_unsafe_name
 run_test "git own repo requires both vars" test_git_own_repo_requires_both_vars
 run_test "git own repo uses supplied repository" test_git_own_repo_uses_supplied_repository
 run_test "git rejects sha256 repository" test_git_rejects_sha256_repository
@@ -9577,9 +9483,5 @@ run_test "docs document bootstrap" test_docs_document_bootstrap
 run_test "no stale bootstrap manifest names" test_no_stale_bootstrap_manifest_names
 
 echo ""
-_ocm_v="$(ocm_installed_version)"
-if ! ocm_expectation "$_ocm_v" version >/dev/null 2>&1; then
-  echo "NOTE: OCM ${_ocm_v:-<unknown version>} not validated: version-specific tests were skipped; add a row to test/ocm-versions.tsv (make ocm-version-check)"
-fi
 echo "Results: $PASS passed, $FAIL failed, $SKIP skipped"
 [[ $FAIL -eq 0 ]]

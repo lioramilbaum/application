@@ -9,11 +9,11 @@ SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 # *_SHA256_* ARGs, in one PR (see renovate.json). Each
 # "# renovate: <tool>-linux-<arch> <version>" marker must sit directly above its
 # ARG and equal that tool's *_VERSION.
-ARG OCM_CLI_VERSION=v0.23.0
-# renovate: ocm-linux-amd64 v0.23.0
-ARG OCM_SHA256_LINUX_AMD64=b44c498d11fe102f1677ce097ed30039375b71e90f07450efeb14ce4b26d6ed5
-# renovate: ocm-linux-arm64 v0.23.0
-ARG OCM_SHA256_LINUX_ARM64=b8312c5a676968269d564ada71be4da1c2983ce11811c90ff94813495abf02bd
+ARG OCM_CLI_VERSION=v0.24.0
+# renovate: ocm-linux-amd64 v0.24.0
+ARG OCM_SHA256_LINUX_AMD64=a5a08137f694b9629799d5183c1b26f60e0c7aeb71f55c940de583e7e9dd71d2
+# renovate: ocm-linux-arm64 v0.24.0
+ARG OCM_SHA256_LINUX_ARM64=53161354e245674115a42c7b78e42d3703097d43e82f76a3b0b50c76ac2c1bb4
 ARG KIND_VERSION=v0.33.0
 # renovate: kind-linux-amd64 v0.33.0
 ARG KIND_SHA256_LINUX_AMD64=aee6151561422756b764a4ae28e7f44cda5af5a9eead3cc9985112b1de8d8e0d
