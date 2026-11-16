@@ -78,7 +78,7 @@ Set `GIT_DEMO_REPO` and `GIT_DEMO_COMMIT` together to build from a repository yo
 GIT_DEMO_REPO=/path/to/repo GIT_DEMO_COMMIT=<40-char commit SHA> make git
 ```
 
-Setting only one of them fails. `GIT_DEMO_COMMIT` must be a 40-character SHA-1 commit. A 64-character SHA-256 object name is rejected before the build. OCM 0.19.1 reads SHA-1 repositories only, so a SHA-256 repository fails with `mismatched algorithms` (#3794). `GIT_DEMO_REF` (default `refs/heads/main`) sets the ref that the tracked resource follows at build time. `make git` with your own repository does not create `build/git/upstream.git`. The `scenarios` and `upstream` commands need the generated repository.
+Setting only one of them fails. A local path is served over `git://` the same way as the generated repository, a remote URL is used as is, and a path that is not a directory fails. The last component of a local path becomes the `git://` path, so it must match `[A-Za-z0-9._-]+`; other names fail. `GIT_DEMO_COMMIT` must be a 40-character SHA-1 commit. A 64-character SHA-256 object name is rejected before the build. OCM 0.19.1 reads SHA-1 repositories only, so a SHA-256 repository fails with `mismatched algorithms` (#3794). `GIT_DEMO_REF` (default `refs/heads/main`) sets the ref that the tracked resource follows at build time. `make git` with your own repository does not create `build/git/upstream.git`. The `scenarios` and `upstream` commands need the generated repository.
 
 ### Scenarios
 
@@ -96,7 +96,7 @@ The snapshot is a `LocalBlob/v1` in the component, so it downloads in every row.
 ### Limitations
 
 - `make git` needs OCM CLI ≥ 0.19.0 (`Git/v1` input and access) and `git` 2.32 or newer. The script refuses to run with an older OCM CLI.
-- The demo uses `file://` repositories only. Remote repositories need `GitCredentials/v1` for private ones.
+- Local repositories are served over `git://127.0.0.1:18471` (`GIT_DEMO_PORT`) by `git daemon`, because OCM 0.24.0 rejects `file://` and local paths in a `Git/v1` access (open-component-model#4151). The demo stays offline. CTFs built earlier with `file://` accesses must be rebuilt. Remote repositories need `GitCredentials/v1` for private ones.
 - The source is not verifiable, and its commit is not signed. The snapshot's label is the only signed link to a commit.
 - `srcRefs` is not signed and this component does not use it.
 - Copying `Git/v1` access in a transfer arrives in v0.20.0-rc.1 (#3709).

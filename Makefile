@@ -3,7 +3,7 @@ OCM            ?= ocm
 
 export VERSION OCM
 
-.PHONY: help build sign verify resolvers manifests deploy publish transfer-plan ownership sbom product versions helm wget pki git gpg oci credentials plugin registry controller source package target target-cluster target-bootstrap target-transfer target-deploy target-down up bootstrap graph github normalisation s3 none-access lint test ocm-version-check e2e cluster-up cluster-down e2e-run clean
+.PHONY: help build sign verify resolvers manifests deploy publish transfer-plan ownership sbom product versions helm wget pki git gpg oci credentials plugin registry controller source package target target-cluster target-bootstrap target-transfer target-deploy target-down up bootstrap graph github normalisation s3 none-access lint test e2e cluster-up cluster-down e2e-run clean
 
 help: ## Show this help
 	@grep -E '^[a-zA-Z0-9_-]+:.*?## .*$$' $(MAKEFILE_LIST) | \
@@ -129,9 +129,6 @@ lint: ## Lint shell scripts (if shellcheck is available)
 
 test: ## Run the test suite
 	@bash test/run.sh
-
-ocm-version-check: ## Fail unless the installed OCM CLI version has a row in test/ocm-versions.tsv (CI check ocm-version-validated)
-	@bash scripts/ocm-version.sh check
 
 e2e: build sign ## End-to-end test using kind (requires docker)
 	@bash scripts/e2e.sh

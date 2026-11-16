@@ -10,7 +10,7 @@ KIND_CLUSTER="${KIND_CLUSTER:-ocm-controller}"
 export KUBECONFIG="${E2E_KUBECONFIG:-$BUILD_DIR/controller/kubeconfig}"
 export KIND_CLUSTER
 
-OCM_CONTROLLER_CHART_VERSION="0.23.0"
+OCM_CONTROLLER_CHART_VERSION="0.24.0"
 # Renovate tracks kro release tags (v0.9.4); the chart is published as 0.9.4, so the v is dropped for helm
 KRO_CHART_VERSION="v0.9.4"
 FLUX_VERSION="v2.10.0"

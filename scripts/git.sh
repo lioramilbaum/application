@@ -40,8 +40,26 @@ if [[ -n "${GIT_DEMO_REPO:-}" || -n "${GIT_DEMO_COMMIT:-}" ]]; then
   fi
   [[ "$GIT_DEMO_COMMIT" =~ ^[0-9a-f]{40}$ ]] || die "GIT_DEMO_COMMIT must be a 40-char git commit SHA (got: '$GIT_DEMO_COMMIT')"
   OWN_REPO=1
-else
-  GIT_DEMO_REPO="file://$UPSTREAM"
+fi
+GIT_DEMO_PORT="${GIT_DEMO_PORT:-18471}"
+if ! [[ "$GIT_DEMO_PORT" =~ ^[0-9]+$ ]] || (( 10#$GIT_DEMO_PORT < 1 || 10#$GIT_DEMO_PORT > 65535 )); then
+  die "GIT_DEMO_PORT must be a number from 1 to 65535 (got: '$GIT_DEMO_PORT')"
+fi
+GIT_DEMO_PORT=$((10#$GIT_DEMO_PORT))
+# OCM 0.24.0 rejects a local repository (file:// or a path) in a Git/v1 access, so local
+# repositories are served over git:// on 127.0.0.1 by git daemon.
+_SERVE_DIR=""
+if (( ! OWN_REPO )); then
+  _SERVE_DIR="$UPSTREAM"
+elif [[ "$GIT_DEMO_REPO" == file://* || ( "$GIT_DEMO_REPO" != *://* && "$GIT_DEMO_REPO" != *@*:* ) ]]; then
+  _SERVE_DIR="${GIT_DEMO_REPO#file://}"
+  [[ -d "$_SERVE_DIR" ]] || die "GIT_DEMO_REPO is not a directory: $_SERVE_DIR"
+  _SERVE_DIR="$(cd "$_SERVE_DIR" && pwd)"
+fi
+if [[ -n "$_SERVE_DIR" ]]; then
+  _SERVE_NAME="$(basename "$_SERVE_DIR")"
+  [[ "$_SERVE_NAME" =~ ^[A-Za-z0-9._-]+$ ]] || die "GIT_DEMO_REPO directory name must match [A-Za-z0-9._-]: $_SERVE_NAME"
+  GIT_DEMO_REPO="git://127.0.0.1:${GIT_DEMO_PORT}/$_SERVE_NAME"
 fi
 export ROOT VERSION GIT_DEMO_REPO GIT_DEMO_REF
 
@@ -121,10 +139,10 @@ _classify() {
   if grep -q 'git archive digest mismatch' <<<"$text"; then
     echo archive-mismatch
   # OCM 0.19.1 — go-git transport when the pinned commit is not in the repository
-  elif grep -q 'server sent no packfile' <<<"$text"; then
+  elif grep -q -e 'server sent no packfile' -e 'not our ref' <<<"$text"; then
     echo missing-commit
   # OCM 0.19.1
-  elif grep -q 'repository not found' <<<"$text"; then
+  elif grep -q -e 'repository not found' -e 'no such repository' <<<"$text"; then
     echo repository-not-found
   # OCM 0.19.1
   elif grep -q 'digest mismatch' <<<"$text"; then
@@ -172,7 +190,7 @@ _audit() {
   local AUDIT_DIR
   AUDIT_DIR="$(mktemp -d "$GIT_DEMO_OUT/.audit.XXXXXX")"
   # shellcheck disable=SC2064
-  trap "rm -rf '$AUDIT_DIR'" EXIT
+  trap "rm -rf '$AUDIT_DIR'; _daemon_stop" EXIT
   _fetch "$GIT_DEMO_CTF" "$SNAPSHOT" "$AUDIT_DIR/snapshot.tgz" "$AUDIT_DIR/fetch.stderr" \
     || die "$SNAPSHOT: download failed ($(_classify "$AUDIT_DIR/fetch.stderr"))"
   [[ "$(sha256 "$AUDIT_DIR/snapshot.tgz")" == "$digest" ]] || die "$SNAPSHOT: archive does not match the signed digest"
@@ -266,6 +284,40 @@ _show() {
 }
 
 mkdir -p "$GIT_DEMO_OUT"
+
+_daemon_pid=""
+_daemon_stop() { [[ -z "$_daemon_pid" ]] || { kill "$_daemon_pid" 2>/dev/null || true; wait "$_daemon_pid" 2>/dev/null || true; }; }
+_daemon_up() { (exec 3<>"/dev/tcp/127.0.0.1/$GIT_DEMO_PORT") 2>/dev/null; }
+_daemon_cmd() {
+  local base
+  base="$(dirname "$_SERVE_DIR")"
+  GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_PARAMETERS="'uploadpack.allowreachablesha1inwant=true'" \
+    exec "$(git --exec-path)/git-daemon" --reuseaddr --listen=127.0.0.1 --port="$GIT_DEMO_PORT" \
+    --base-path="$base" --export-all --informative-errors "$_SERVE_DIR"
+}
+_daemon_ensure() {
+  [[ -n "$_SERVE_DIR" ]] || return 0
+  ! _daemon_up || die "port $GIT_DEMO_PORT is in use; set GIT_DEMO_PORT"
+  _daemon_cmd >"$GIT_DEMO_OUT/daemon.log" 2>&1 &
+  _daemon_pid=$!
+  trap _daemon_stop EXIT
+  # Check the child before the port: a foreign listener must not pass for our daemon.
+  for _ in $(seq 50); do
+    kill -0 "$_daemon_pid" 2>/dev/null || break
+    _daemon_up && return 0
+    sleep 0.1
+  done
+  die "git daemon failed to start on port $GIT_DEMO_PORT"$'\n'"$(tail -n 5 "$GIT_DEMO_OUT/daemon.log")"
+}
+case "${1:-}" in
+  serve)
+    [[ -n "$_SERVE_DIR" ]] || die "nothing to serve"
+    _daemon_cmd
+    exit
+    ;;
+  show|sign|verify|upstream) ;;
+  *) _daemon_ensure ;;
+esac
 
 case "${1:-}" in
   upstream)
