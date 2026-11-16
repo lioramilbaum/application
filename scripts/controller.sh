@@ -12,7 +12,7 @@ export KIND_CLUSTER
 
 OCM_CONTROLLER_CHART_VERSION="0.24.0"
 # Renovate tracks kro release tags (v0.9.4); the chart is published as 0.9.4, so the v is dropped for helm
-KRO_CHART_VERSION="v0.9.4"
+KRO_CHART_VERSION="v0.10.0"
 FLUX_VERSION="v2.10.0"
 
 OCM_CONTROLLER_REPO="${OCM_CONTROLLER_REPO:-ghcr.io/lioramilbaum/ocm}"
