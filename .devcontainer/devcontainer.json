@@ -2,7 +2,7 @@
   "name": "ocm-application",
   "build": { "dockerfile": "Dockerfile" },
   "features": {
-    "ghcr.io/devcontainers/features/docker-outside-of-docker:1.10.2": {
+    "ghcr.io/devcontainers/features/docker-outside-of-docker:1.10.3": {
       "moby": false,
       "installDockerBuildx": false,
       "dockerDashComposeVersion": "none"

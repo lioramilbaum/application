@@ -1,4 +1,4 @@
-FROM mcr.microsoft.com/devcontainers/base:3.0.13-ubuntu24.04
+FROM mcr.microsoft.com/devcontainers/base:3.0.14-ubuntu24.04
 RUN apt-get update && export DEBIAN_FRONTEND=noninteractive \
     && apt-get install -y --no-install-recommends make shellcheck jq curl openssl ca-certificates python3 python3-yaml \
     && rm -rf /var/lib/apt/lists/*
@@ -36,15 +36,15 @@ RUN set -eux; arch="$(dpkg --print-architecture)"; \
     ocm version; \
     kind version
 
-ARG FLUX_VERSION=v2.10.0
+ARG FLUX_VERSION=v2.10.1
 # Renovate bumps FLUX_VERSION (here and in scripts/controller.sh) and both
 # FLUX_SHA256_* ARGs in one PR (see renovate.json). Each
 # "# renovate: flux-linux-<arch> <version>" marker must sit directly above its
 # ARG and equal FLUX_VERSION.
-# renovate: flux-linux-amd64 v2.10.0
-ARG FLUX_SHA256_LINUX_AMD64=208dd7012c04fedeed5b2d0b6e63df3b15b1c34a381527811685c098bc9f8659
-# renovate: flux-linux-arm64 v2.10.0
-ARG FLUX_SHA256_LINUX_ARM64=c3c435052e5e18156858bc73f26bcadb62821a6e30951b4b302beb4e65a532c2
+# renovate: flux-linux-amd64 v2.10.1
+ARG FLUX_SHA256_LINUX_AMD64=967365ff84aabc97871827ff33713ef0c09f62dd83c18759e3a5e39adcea9285
+# renovate: flux-linux-arm64 v2.10.1
+ARG FLUX_SHA256_LINUX_ARM64=da18ddb25c9614405d9e2f13ad014fd660bfcbe7218674cabf9325db73f811e2
 
 RUN set -eux; \
     arch="$(dpkg --print-architecture)"; \
