@@ -32,24 +32,36 @@ bash scripts/registry.sh stop   # remove the container and its data
 
 ### Push
 
-`scripts/registry.sh build` writes the component to `build/registry-ctf` with `ocm add cv`. `scripts/registry.sh push` copies it into the registry with `ocm transfer cv`:
+`scripts/registry.sh build` writes the component to `build/registry-ctf` with `ocm add cv`. `scripts/registry.sh push` copies it into the registry with `ocm transfer cv`. The command reads the plain-HTTP config that `build` writes to `build/registry/plain-http.ocmconfig`:
 
 ```bash
-ocm transfer cv ctf::build/registry-ctf//github.com/lioramilbaum/registry-demo:0.1.0 oci::http://127.0.0.1:5055/ocm
+ocm transfer cv --config build/registry/plain-http.ocmconfig ctf::build/registry-ctf//github.com/lioramilbaum/registry-demo:0.1.0 oci::127.0.0.1:5055/ocm
 ```
 
 The registry has no authentication, so no credentials are needed. Authenticated registries need a consumer configuration; see [Credential system](credentials.md#credential-system).
 
 ### Repository identity
 
-The registry address for the component is `oci::http://127.0.0.1:5055/ocm//github.com/lioramilbaum/registry-demo:0.1.0`:
+The registry address for the component is `oci::127.0.0.1:5055/ocm//github.com/lioramilbaum/registry-demo:0.1.0`:
 
 - `oci::` is the optional repository type prefix.
-- `http://` selects plain HTTP. Without it OCM uses HTTPS, which fails against this registry.
 - `127.0.0.1:5055` is the registry host and port.
 - `/ocm` is the base path. It is part of the repository identity.
 - `//` separates the repository from the component name.
 - `:0.1.0` is the component version. OCI stores it as the tag `0.1.0` of `ocm/component-descriptors/github.com/lioramilbaum/registry-demo`.
+
+The address has no scheme. Plain HTTP comes from the `plainHTTP` setting in `http.config.ocm.software/v1alpha1`, which `scripts/registry.sh` writes to `build/registry/plain-http.ocmconfig`. Without that setting OCM uses HTTPS and fails against this registry:
+
+```text
+type: generic.config.ocm.software/v1
+configurations:
+  - type: http.config.ocm.software/v1alpha1
+    hosts:
+      "127.0.0.1:5055":
+        plainHTTP: true
+```
+
+The host key is matched exactly as `host:port`. OCM 0.25.0 and later no longer take plain HTTP from an `http://` prefix. Without `plainHTTP` for the host, an `http://` address is an error. With it, OCM only prints a deprecation warning. Once any `--config` is passed, OCM ignores `OCM_CONFIG`, so every command against the registry passes the file explicitly.
 
 The registry catalog lists that repository:
 
@@ -110,7 +122,7 @@ resources:
       digest: ${REGISTRY_LAYER_DIGEST}
 ```
 
-- `ref` is the repository without a tag, `http://127.0.0.1:PORT/ocm/layers/release-notes`. The `http://` scheme is required for the local registry, which serves plain HTTP. The layer is addressed by `digest`, so no tag is needed.
+- `ref` is the repository without a tag, `127.0.0.1:PORT/ocm/layers/release-notes`. The local registry serves plain HTTP, which the plain-HTTP config enables for its host (see [Repository identity](#repository-identity)). The layer is addressed by `digest`, so no tag is needed.
 - `size` is not set. OCM reads the layer when the component is added and fills in the size.
 - OCM also accepts the legacy alias `ociBlob/v1` for `OCIImageLayer/v1`. This demo uses the canonical name.
 

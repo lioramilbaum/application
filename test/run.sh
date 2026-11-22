@@ -74,9 +74,10 @@ assert_eq() {
   fi
 }
 
+# Bash pattern match, not grep: a needle with newlines must match as one block, not line by line.
 assert_contains() {
   local haystack="$1" needle="$2" msg="${3:-}"
-  if ! grep -qF -e "$needle" <<< "$haystack"; then
+  if [[ "$haystack" != *"$needle"* ]]; then
     echo "  assert_contains failed${msg:+ ($msg)}: '$needle' not found in output" >&2
     return 1
   fi
@@ -275,7 +276,7 @@ KUBECTL_STUB_EOF
 }
 
 # Test doubles for the bootstrap path. docker reports 172.18.0.9 for the registry and fails
-# crictl inspecti for $STUB_MISSING_IMAGE. The ocm wrapper serves oci::http://172.18.0.9:5000/ocm
+# crictl inspecti for $STUB_MISSING_IMAGE. The ocm wrapper serves oci::172.18.0.9:5000/ocm
 # from $dir/ctf, records transfers into it without copying, and reports every resource in
 # `get cv -o json` as a local blob, as a bundle that has inlined its resources would.
 # STUB_TAMPER_RESOURCE appends a byte to that resource after it is downloaded.
@@ -332,7 +333,7 @@ printf 'ocm %s | %s\n' "$*" "$(env | grep -i '_proxy=' | sort | tr '\n' ' ')" >>
 if [[ "$*" == *"application-platform"* || "$*" == *"platform-images/component-constructor"* ]]; then
   exec python3 -I "$STATE_DIR/stub-bin/platform_ocm.py" "$STATE_DIR" "$@"
 fi
-REGISTRY_PREFIX="oci::http://172.18.0.9:5000/ocm"
+REGISTRY_PREFIX="oci::172.18.0.9:5000/ocm"
 if [[ " $* " == *" transfer cv "* ]]; then
   positional=()
   seen=0
@@ -950,8 +951,8 @@ test_manifests_is_idempotent() {
 test_cv_ref_honours_component_repo() {
   local tmp="$1" ref expected
   # shellcheck disable=SC2016
-  ref="$(OCM_COMPONENT_REPO=oci::http://localhost:5001 bash -c 'source "$1"; cv_ref' _ "$ROOT/scripts/lib.sh")"
-  expected="oci::http://localhost:5001//${ROOT_COMPONENT}:${VERSION:-0.1.0}"
+  ref="$(OCM_COMPONENT_REPO=oci::localhost:5001 bash -c 'source "$1"; cv_ref' _ "$ROOT/scripts/lib.sh")"
+  expected="oci::localhost:5001//${ROOT_COMPONENT}:${VERSION:-0.1.0}"
   assert_eq "$ref" "$expected" "cv_ref with OCM_COMPONENT_REPO" || return 1
 
   # shellcheck disable=SC2016
@@ -4182,13 +4183,14 @@ resources:
       helmChart: hello-world:0.1.0
 YAML
 
-  local out
-  if out="$("$OCM" add cv --repository "ctf::$tmp/access-ctf" --constructor "$constructor" 2>&1)"; then
+  # OCM >= 0.25.0 refuses an http:// Helm repository unless its host is plainHTTP; with it, add cv fetches the index.
+  local out cfg="$tmp/plain-http.ocmconfig"
+  plain_http_config "$cfg" "127.0.0.1:1"
+  if out="$("$OCM" add cv --repository "ctf::$tmp/access-ctf" --constructor "$constructor" --config "$cfg" 2>&1)"; then
     echo "  add cv should fail when the Helm repository is unreachable" >&2
     return 1
   fi
-  # error message may vary across OCM versions
-  assert_contains "$out" "repository index"
+  assert_contains "$out" "error downloading repository index"
 }
 
 test_helm_transfer_keeps_chart_local() {
@@ -6368,7 +6370,7 @@ _registry_fresh() {
 }
 
 _registry_ref() {
-  echo "oci::http://${REGISTRY_HOST:-127.0.0.1}:${REGISTRY_PORT:-5056}/ocm//github.com/lioramilbaum/registry-demo:${VERSION:-0.1.0}"
+  echo "oci::${REGISTRY_HOST:-127.0.0.1}:${REGISTRY_PORT:-5056}/ocm//github.com/lioramilbaum/registry-demo:${VERSION:-0.1.0}"
 }
 
 _registry_ctf_ref() {
@@ -6427,7 +6429,7 @@ test_registry_get_cv_from_registry() {
   _registry_fresh "$tmp" || return $?
   bash "$ROOT/scripts/registry.sh" build >/dev/null 2>&1 || return 1
   bash "$ROOT/scripts/registry.sh" push >/dev/null 2>&1 || return 1
-  cv="$("$OCM" get cv "$(_registry_ref)" -o json 2>/dev/null)" || return 1
+  cv="$("$OCM" get cv --config "$REGISTRY_DEMO_OUT/plain-http.ocmconfig" "$(_registry_ref)" -o json 2>/dev/null)" || return 1
   assert_eq "$(jq -r '.[0].component.name' <<<"$cv")" "github.com/lioramilbaum/registry-demo" "name" || return 1
   assert_eq "$(jq -r '.[0].component.version' <<<"$cv")" "${VERSION:-0.1.0}" "version" || return 1
   assert_eq "$(jq -r '.[0].component.provider' <<<"$cv")" "github.com/lioramilbaum" "provider" || return 1
@@ -6443,7 +6445,7 @@ test_registry_sign_in_registry() {
   bash "$ROOT/scripts/registry.sh" push >/dev/null 2>&1 || return 1
   bash "$ROOT/scripts/registry.sh" sign >/dev/null 2>&1 || return 1
 
-  sigs="$("$OCM" get cv "$(_registry_ref)" -o json 2>/dev/null | jq -r '[.[0].signatures[]?.name] | join(",")')" || return 1
+  sigs="$("$OCM" get cv --config "$REGISTRY_DEMO_OUT/plain-http.ocmconfig" "$(_registry_ref)" -o json 2>/dev/null | jq -r '[.[0].signatures[]?.name] | join(",")')" || return 1
   assert_eq "$sigs" "default" "registry descriptor signature" || return 1
 
   ctf_sigs="$("$OCM" get cv "$(_registry_ctf_ref)" -o json 2>/dev/null | jq -r '(.[0].signatures // []) | length')" || return 1
@@ -6482,7 +6484,7 @@ test_registry_pull_downloads_resource() {
 
   assert_eq "$(cat "$REGISTRY_DEMO_OUT/download/release-notes")" \
     "github.com/lioramilbaum/registry-demo ${VERSION:-0.1.0}" "release notes content" || return 1
-  desc="$("$OCM" get cv "$(_registry_ref)" -o json 2>/dev/null | jq -r '.[0].component.resources[] | select(.name=="release-notes") | .digest.value')" || return 1
+  desc="$("$OCM" get cv --config "$REGISTRY_DEMO_OUT/plain-http.ocmconfig" "$(_registry_ref)" -o json 2>/dev/null | jq -r '.[0].component.resources[] | select(.name=="release-notes") | .digest.value')" || return 1
   actual="$(shasum -a 256 "$REGISTRY_DEMO_OUT/download/release-notes" | cut -d' ' -f1)"
   assert_eq "$actual" "$desc" "downloaded sha256 matches descriptor" || return 1
 
@@ -6507,7 +6509,7 @@ test_registry_stop_removes_container() {
   bash "$ROOT/scripts/registry.sh" stop >/dev/null || { echo "  second stop should exit 0" >&2; return 1; }
   bash "$ROOT/scripts/registry.sh" start >/dev/null || return 1
   # Registry data is lost with the container, so the component is gone.
-  if "$OCM" get cv "$(_registry_ref)" -o json >/dev/null 2>&1 </dev/null; then
+  if "$OCM" get cv --config "$REGISTRY_DEMO_OUT/plain-http.ocmconfig" "$(_registry_ref)" -o json >/dev/null 2>&1 </dev/null; then
     echo "  component should not survive stop and start" >&2
     return 1
   fi
@@ -6525,7 +6527,7 @@ test_registry_push_idempotent() {
   bash "$ROOT/scripts/registry.sh" sign >/dev/null 2>&1 || return 1
   bash "$ROOT/scripts/registry.sh" push >/dev/null 2>&1 || return 1
   # OCM 0.19.1: re-pushing from the unsigned CTF drops the registry signature.
-  sigs="$("$OCM" get cv "$(_registry_ref)" -o json 2>/dev/null | jq -r '(.[0].signatures // []) | length')" || return 1
+  sigs="$("$OCM" get cv --config "$REGISTRY_DEMO_OUT/plain-http.ocmconfig" "$(_registry_ref)" -o json 2>/dev/null | jq -r '(.[0].signatures // []) | length')" || return 1
   assert_eq "$sigs" "0" "re-push drops signature" || return 1
 
   if out="$(bash "$ROOT/scripts/registry.sh" verify 2>&1)"; then
@@ -6544,13 +6546,13 @@ test_registry_transfer_preserves_resources() {
 
   jq_digest='.[0].component.resources[] | select(.name=="release-notes") | .digest.value'
   ctf_digest="$("$OCM" get cv "$(_registry_ctf_ref)" -o json 2>/dev/null | jq -r "$jq_digest")" || return 1
-  reg_digest="$("$OCM" get cv "$(_registry_ref)" -o json 2>/dev/null | jq -r "$jq_digest")" || return 1
+  reg_digest="$("$OCM" get cv --config "$REGISTRY_DEMO_OUT/plain-http.ocmconfig" "$(_registry_ref)" -o json 2>/dev/null | jq -r "$jq_digest")" || return 1
   pulled_digest="$("$OCM" get cv "$(_registry_pulled_ref)" -o json 2>/dev/null | jq -r "$jq_digest")" || return 1
   assert_eq "$reg_digest" "$ctf_digest" "registry resource digest" || return 1
   assert_eq "$pulled_digest" "$ctf_digest" "pulled resource digest" || return 1
 
   jq_sig='.[0].signatures[] | select(.name=="default") | .digest.value'
-  reg_sig="$("$OCM" get cv "$(_registry_ref)" -o json 2>/dev/null | jq -r "$jq_sig")" || return 1
+  reg_sig="$("$OCM" get cv --config "$REGISTRY_DEMO_OUT/plain-http.ocmconfig" "$(_registry_ref)" -o json 2>/dev/null | jq -r "$jq_sig")" || return 1
   pulled_sig="$("$OCM" get cv "$(_registry_pulled_ref)" -o json 2>/dev/null | jq -r "$jq_sig")" || return 1
   assert_eq "$pulled_sig" "$reg_sig" "pulled signature digest"
 }
@@ -6578,26 +6580,38 @@ test_registry_unsigned_verify_fails() {
 }
 
 test_registry_oci_url_format() {
-  local tmp="$1" out
+  local tmp="$1" out cfg ref="127.0.0.1:5056/ocm//github.com/lioramilbaum/registry-demo:${VERSION:-0.1.0}"
   _registry_fresh "$tmp" || return $?
   out="$(bash "$ROOT/scripts/registry.sh" start 2>/dev/null)" || return 1
-  assert_eq "$out" "oci::http://127.0.0.1:5056/ocm" "start prints repository" || return 1
+  assert_eq "$out" "oci::127.0.0.1:5056/ocm" "start prints repository" || return 1
+  cfg="$REGISTRY_DEMO_OUT/plain-http.ocmconfig"
+  assert_contains "$(cat "$cfg")" "http.config.ocm.software/v1alpha1" || return 1
+  assert_contains "$(cat "$cfg")" $'"127.0.0.1:5056":\n        plainHTTP: true' || return 1
   bash "$ROOT/scripts/registry.sh" build >/dev/null 2>&1 || return 1
   bash "$ROOT/scripts/registry.sh" push >/dev/null 2>&1 || return 1
 
-  # Without http:// OCM assumes HTTPS and fails.
-  if out="$("$OCM" get cv "oci::127.0.0.1:5056/ocm//github.com/lioramilbaum/registry-demo:${VERSION:-0.1.0}" -o json 2>&1 </dev/null)"; then
-    echo "  scheme-less oci:: URL should fail" >&2
+  # plainHTTP for the host reaches the registry; the oci:: prefix is optional.
+  "$OCM" get cv --config "$cfg" "oci::$ref" -o json >/dev/null 2>&1 </dev/null || \
+    { echo "  oci:: URL with plainHTTP should succeed" >&2; return 1; }
+  "$OCM" get cv --config "$cfg" "$ref" -o json >/dev/null 2>&1 </dev/null || \
+    { echo "  URL without oci:: should succeed" >&2; return 1; }
+
+  # Without plainHTTP OCM uses HTTPS and fails.
+  if out="$("$OCM" get cv --config "$BUILD_DIR/verify.ocmconfig" "oci::$ref" -o json 2>&1 </dev/null)"; then
+    echo "  URL without plainHTTP should fail" >&2
     return 1
   fi
-  assert_contains "$out" "https://" "scheme-less URL falls back to https" || return 1
+  assert_contains "$out" "https://" "no plainHTTP falls back to https" || return 1
 
-  # The http:// scheme alone is enough without the oci:: prefix.
-  "$OCM" get cv "http://127.0.0.1:5056/ocm//github.com/lioramilbaum/registry-demo:${VERSION:-0.1.0}" -o json >/dev/null 2>&1 </dev/null || \
-    { echo "  http:// URL without oci:: should succeed" >&2; return 1; }
+  # OCM 0.25.0: an http:// prefix no longer selects plain HTTP; without plainHTTP it is an error.
+  if out="$("$OCM" get cv --config "$BUILD_DIR/verify.ocmconfig" "oci::http://$ref" -o json 2>&1 </dev/null)"; then
+    echo "  http:// prefix without plainHTTP should fail" >&2
+    return 1
+  fi
+  assert_contains "$out" "plain HTTP is not enabled" || return 1
 
   # Another path is another, empty repository.
-  if "$OCM" get cv "oci::http://127.0.0.1:5056/other//github.com/lioramilbaum/registry-demo:${VERSION:-0.1.0}" -o json >/dev/null 2>&1 </dev/null; then
+  if "$OCM" get cv --config "$cfg" "oci::127.0.0.1:5056/other//github.com/lioramilbaum/registry-demo:${VERSION:-0.1.0}" -o json >/dev/null 2>&1 </dev/null; then
     echo "  component under another path should not exist" >&2
     return 1
   fi
@@ -6665,7 +6679,9 @@ test_readme_documents_local_oci_registry() {
   section="$(doc_section "Local OCI registry")"
 
   local checks=(
-    "oci::http://127.0.0.1:5055/ocm"
+    "oci::127.0.0.1:5055/ocm"
+    "plainHTTP"
+    "http.config.ocm.software/v1alpha1"
     "component-descriptors"
     "ocm transfer cv"
     "ocm sign cv"
@@ -7774,6 +7790,7 @@ test_controller_sh_applies_deploy_manifest_and_checks_app() {
     OCM_CONTROLLER_REPO="ghcr.io/example/ocm" \
     bash "$ROOT/scripts/controller.sh" apply || return 1
   grep -q "baseUrl: ghcr.io/example/ocm" "$tmp/kubectl-stdin.log" || return 1
+  assert_not_contains "$(cat "$tmp/kubectl-stdin.log")" "ocm-plain-http" || return 1
   grep -q "kind: NamespacedDeployer" "$tmp/kubectl-stdin.log" || return 1
   grep -q "wait --for=condition=Ready" "$tmp/kubectl.log" || return 1
   grep -q "namespaceddeployer/hello-world" "$tmp/kubectl.log" || return 1
@@ -8045,11 +8062,13 @@ test_controller_sh_apply_localizes_with_guards() {
   local tmp="$1" drift
   _stub_kind "$tmp" > /dev/null
   _stub_controller_tools "$tmp"
-  STUB_LOG_DIR="$tmp" OCM_CONTROLLER_REPO="http://172.18.0.9:5000/ocm" OCM_CONTROLLER_INSECURE=true \
+  STUB_LOG_DIR="$tmp" OCM_CONTROLLER_REPO="172.18.0.9:5000/ocm" OCM_CONTROLLER_INSECURE=true \
     TARGET_ARCH=arm64 KUBECTL="$tmp/kubectl" KUBECONFIG="$tmp/kubeconfig" \
     bash "$ROOT/scripts/controller.sh" apply >/dev/null 2>&1 || { echo "  apply failed with overrides" >&2; return 1; }
   local stdin; stdin="$(cat "$tmp/kubectl-stdin.log")"
-  assert_contains "$stdin" "baseUrl: http://172.18.0.9:5000/ocm" || return 1
+  assert_contains "$stdin" "baseUrl: 172.18.0.9:5000/ocm" || return 1
+  assert_contains "$stdin" $'ocmConfig:\n  - kind: ConfigMap\n    name: ocm-plain-http' || return 1
+  assert_contains "$stdin" $'"172.18.0.9:5000":\n            plainHTTP: true' || return 1
   assert_contains "$stdin" "architecture: arm64" || return 1
   assert_contains "$stdin" "insecure: true" || return 1
   assert_not_contains "$stdin" "ghcr.io/lioramilbaum/ocm" || return 1
@@ -8130,7 +8149,9 @@ test_sourcectl_bundle_writes_offline_bundle() {
   assert_contains "$helm_log" "pull oci://registry.k8s.io/kro/charts/kro --version $kro_ver" || return 1
   [[ -f "$bundle/charts/ocm-k8s-toolkit.tgz" && -f "$bundle/charts/kro.tgz" ]] || { echo "  chart archives missing" >&2; return 1; }
 
-  assert_contains "$(cat "$tmp/flux.log")" "install --export --version v2.10.0" || return 1
+  local flux_ver; flux_ver=$(sed -n 's/^FLUX_VERSION="\([^"]*\)"/\1/p' "$ROOT/scripts/controller.sh")
+  [[ -n "$flux_ver" ]] || { echo "  FLUX_VERSION not found in controller.sh" >&2; return 1; }
+  assert_contains "$(cat "$tmp/flux.log")" "install --export --version $flux_ver" || return 1
   [[ -f "$bundle/flux/install.yaml" ]] || { echo "  flux/install.yaml missing" >&2; return 1; }
 
   local images; images="$(cat "$bundle/images.txt")"
@@ -8498,10 +8519,15 @@ test_targetctl_transfer_publishes_verified_component() {
   transfer_line="$(grep -n ' transfer cv ' <<< "$ocm_order" | head -1 | cut -d: -f1)"
   [[ -n "$verify_line" && -n "$transfer_line" && "$verify_line" -lt "$transfer_line" ]] || \
     { echo "  bundle was not verified before the transfer" >&2; return 1; }
-  assert_contains "$ocm_order" "oci::http://172.18.0.9:5000/ocm --recursive" || return 1
-  # Each hello-world-image architecture gets its own tag in the registry
-  assert_contains "$ocm_order" "--config $ROOT/transfer.ocmconfig transfer cv" || return 1
-  assert_contains "$(sed -n "$((transfer_line + 1)),\$p" <<< "$ocm_order")" "verify cv --config $tmp/bootstrap-verify.ocmconfig --signature default oci::http://172.18.0.9:5000/ocm//" || return 1
+  assert_contains "$ocm_order" "oci::172.18.0.9:5000/ocm --recursive" || return 1
+  # Each hello-world-image architecture gets its own tag in the registry; the registry is reached over plain HTTP
+  assert_contains "$ocm_order" "--config $tmp/target-transfer.ocmconfig transfer cv" || return 1
+  local xfer_want xfer_got
+  xfer_want="$(cat "$ROOT/transfer.ocmconfig")"
+  xfer_got="$(cat "$tmp/target-transfer.ocmconfig")"
+  [[ "$xfer_got" == "$xfer_want"* ]] || { echo "  target-transfer.ocmconfig does not start with transfer.ocmconfig" >&2; return 1; }
+  assert_contains "$(cat "$tmp/target-transfer.ocmconfig")" $'"172.18.0.9:5000":\n        plainHTTP: true' || return 1
+  assert_contains "$(sed -n "$((transfer_line + 1)),\$p" <<< "$ocm_order")" "verify cv --config $tmp/bootstrap-verify.ocmconfig --config $tmp/target-registry.ocmconfig --signature default oci::172.18.0.9:5000/ocm//" || return 1
 
   # Only the component moves: no cluster, no stack, no apply
   [[ ! -e "$tmp/helm.log" ]] || { echo "  transfer ran helm" >&2; return 1; }
@@ -8524,11 +8550,12 @@ test_targetctl_deploy_applies_application_from_registry() {
 
   # The component's deploy manifest and instance point at the registry copy over plain HTTP
   local stdin; stdin="$(cat "$tmp/kubectl-stdin.log")"
-  assert_contains "$stdin" "baseUrl: http://172.18.0.9:5000/ocm" || return 1
+  assert_contains "$stdin" "baseUrl: 172.18.0.9:5000/ocm" || return 1
+  assert_contains "$stdin" "name: ocm-plain-http" || return 1
   assert_contains "$stdin" "insecure: true" || return 1
   assert_contains "$stdin" "architecture: $TARGET_ARCH" || return 1
   # The registry copy is verified again; nothing is transferred, installed or started
-  assert_contains "$(cat "$tmp/ocm-args.log")" "verify cv --config $tmp/bootstrap-verify.ocmconfig --signature default oci::http://172.18.0.9:5000/ocm//" || return 1
+  assert_contains "$(cat "$tmp/ocm-args.log")" "verify cv --config $tmp/bootstrap-verify.ocmconfig --config $tmp/target-registry.ocmconfig --signature default oci::172.18.0.9:5000/ocm//" || return 1
   assert_not_contains "$(cat "$tmp/ocm-args.log")" "transfer cv" || return 1
   [[ ! -e "$tmp/helm.log" ]] || { echo "  deploy ran helm" >&2; return 1; }
   assert_not_contains "$(cat "$tmp/docker.log")" "run -d" || return 1

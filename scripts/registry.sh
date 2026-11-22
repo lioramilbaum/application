@@ -16,8 +16,9 @@ REGISTRY_PORT="${REGISTRY_PORT:-5055}"
 REGISTRY_PATH="${REGISTRY_PATH:-ocm}"
 REGISTRY_DEMO_CTF="${REGISTRY_DEMO_CTF:-$BUILD_DIR/registry-ctf}"
 REGISTRY_DEMO_OUT="${REGISTRY_DEMO_OUT:-$BUILD_DIR/registry}"
-REGISTRY_REPO="oci::http://${REGISTRY_HOST}:${REGISTRY_PORT}/${REGISTRY_PATH}"
+REGISTRY_REPO="oci::${REGISTRY_HOST}:${REGISTRY_PORT}/${REGISTRY_PATH}"
 REGISTRY_DEMO_CONSTRUCTOR="$REGISTRY_DEMO_OUT/component-constructor.yaml"
+REGISTRY_HTTP_CONFIG="$REGISTRY_DEMO_OUT/plain-http.ocmconfig"
 REGISTRY_LAYER_COMPONENT="github.com/lioramilbaum/registry-layer-demo"
 REGISTRY_LAYER_REPO="${REGISTRY_PATH}/layers/release-notes"
 REGISTRY_LAYER_CTF="${REGISTRY_LAYER_CTF:-$BUILD_DIR/registry-layer-ctf}"
@@ -39,7 +40,7 @@ _ctf_ref() {
 }
 
 _registry_ref() {
-  echo "oci::http://${REGISTRY_HOST}:${REGISTRY_PORT}/${REGISTRY_PATH}//${REGISTRY_COMPONENT}:${VERSION}"
+  echo "oci::${REGISTRY_HOST}:${REGISTRY_PORT}/${REGISTRY_PATH}//${REGISTRY_COMPONENT}:${VERSION}"
 }
 
 _running() {
@@ -107,21 +108,21 @@ _push() {
   _wait_ready
   # OCM 0.19.1: re-pushing from an unsigned CTF drops signatures added in the registry.
   "$OCM" transfer cv \
-    --config "$BUILD_DIR/verify.ocmconfig" \
+    --config "$BUILD_DIR/verify.ocmconfig" --config "$REGISTRY_HTTP_CONFIG" \
     "$(_ctf_ref)" "$REGISTRY_REPO" </dev/null >/dev/null
   _registry_ref
 }
 
 _sign() {
   "$OCM" sign cv \
-    --config "$BUILD_DIR/sign.ocmconfig" \
+    --config "$BUILD_DIR/sign.ocmconfig" --config "$REGISTRY_HTTP_CONFIG" \
     --signature "$REGISTRY_SIGNATURE" \
     "$(_registry_ref)" </dev/null >/dev/null
 }
 
 _verify() {
   "$OCM" verify cv \
-    --config "${VERIFY_CONFIG:-$BUILD_DIR/verify.ocmconfig}" \
+    --config "${VERIFY_CONFIG:-$BUILD_DIR/verify.ocmconfig}" --config "$REGISTRY_HTTP_CONFIG" \
     --signature "$REGISTRY_SIGNATURE" \
     "$(_registry_ref)" </dev/null
 }
@@ -131,13 +132,13 @@ _pull() {
   local stage
   stage="$(mktemp -d)"
   trap 'rm -rf "$stage"' RETURN
-  "$OCM" download resource \
+  "$OCM" download resource --config "$REGISTRY_HTTP_CONFIG" \
     --identity name=release-notes \
     --output "$stage/release-notes" \
     "$(_registry_ref)" </dev/null >/dev/null
   # Verify digest
   local desc_digest actual_digest
-  desc_digest="$("$OCM" get cv "$(_registry_ref)" -o json </dev/null \
+  desc_digest="$("$OCM" get cv --config "$REGISTRY_HTTP_CONFIG" "$(_registry_ref)" -o json </dev/null \
     | jq -r '.[0].component.resources[] | select(.name=="release-notes") | .digest.value')"
   actual_digest="$(shasum -a 256 "$stage/release-notes" | cut -d' ' -f1)"
   [[ "$desc_digest" == "$actual_digest" ]] || die "digest mismatch: expected $desc_digest got $actual_digest"
@@ -146,7 +147,7 @@ _pull() {
   mv "$stage" "$REGISTRY_DEMO_OUT/download"
   # Transfer back to CTF
   rm -rf "${REGISTRY_DEMO_OUT:?}/pulled-ctf"
-  "$OCM" transfer cv "$(_registry_ref)" "ctf::$REGISTRY_DEMO_OUT/pulled-ctf" </dev/null >/dev/null
+  "$OCM" transfer cv --config "$REGISTRY_HTTP_CONFIG" "$(_registry_ref)" "ctf::$REGISTRY_DEMO_OUT/pulled-ctf" </dev/null >/dev/null
   echo "$REGISTRY_DEMO_OUT/download/release-notes"
   echo "ctf::$REGISTRY_DEMO_OUT/pulled-ctf"
 }
@@ -158,13 +159,14 @@ _show() {
     tags="$(curl -fsS "$base/v2/$repo/tags/list" | jq -r '(.tags // []) | join(",")')"
     printf 'oci\t%s\t%s\n' "$repo" "$tags"
   done
-  cv_json="$("$OCM" get cv "$(_registry_ref)" -o json </dev/null)"
+  cv_json="$("$OCM" get cv --config "$REGISTRY_HTTP_CONFIG" "$(_registry_ref)" -o json </dev/null)"
   jq -r '.[0].component | ["component", .name, .version, .provider] | @tsv' <<<"$cv_json"
   jq -r '.[0].component.resources[] | ["resource", .name, .type, .access.type, ("sha256:" + .digest.value)] | @tsv' <<<"$cv_json"
   jq -r '.[0].signatures[]? | ["signature", .name, .signature.algorithm, .digest.value] | @tsv' <<<"$cv_json"
 }
 
 mkdir -p "$REGISTRY_DEMO_OUT"
+plain_http_config "$REGISTRY_HTTP_CONFIG" "$REGISTRY_HOST:$REGISTRY_PORT"
 
 # _blob_push <repo> <file> <digest> — upload a blob with the OCI distribution API
 _blob_push() {
@@ -237,7 +239,7 @@ _layer() {
   _wait_ready
   REGISTRY_LAYER_DIGEST="$(_layer_push)"
   export REGISTRY_LAYER_DIGEST
-  export REGISTRY_LAYER_REF="http://$REGISTRY_HOST:$REGISTRY_PORT/$REGISTRY_LAYER_REPO"
+  export REGISTRY_LAYER_REF="$REGISTRY_HOST:$REGISTRY_PORT/$REGISTRY_LAYER_REPO"
   local layer_size
   layer_size="$(wc -c < "$REGISTRY_DEMO_OUT/layer/release-notes.txt" | tr -d ' ')"
 
@@ -246,7 +248,7 @@ _layer() {
   "$OCM" add cv \
     --repository "ctf::$REGISTRY_LAYER_CTF" \
     --constructor "$REGISTRY_LAYER_CONSTRUCTOR" \
-    --config "$BUILD_DIR/verify.ocmconfig" </dev/null >/dev/null
+    --config "$BUILD_DIR/verify.ocmconfig" --config "$REGISTRY_HTTP_CONFIG" </dev/null >/dev/null
   "$OCM" sign cv --config "$BUILD_DIR/sign.ocmconfig" --signature default \
     "$(_layer_ctf_ref)" </dev/null >/dev/null
   "$OCM" verify cv --config "$BUILD_DIR/verify.ocmconfig" "$(_layer_ctf_ref)" </dev/null >/dev/null
@@ -256,7 +258,7 @@ _layer() {
   out="$REGISTRY_DEMO_OUT/layer-download"
   rm -rf "${out:?}"
   mkdir -p "$out"
-  "$OCM" download resource \
+  "$OCM" download resource --config "$REGISTRY_HTTP_CONFIG" \
     --identity name=release-notes-layer \
     --output "$out/release-notes-layer" \
     "$(_layer_ctf_ref)" </dev/null >/dev/null
@@ -278,7 +280,7 @@ configurations:
     match: resource.access.isType("OCIImageLayer")
 EOF
   rm -rf "${copied:?}"
-  "$OCM" --config "$cfg" transfer cv "$(_layer_ctf_ref)" "ctf::$copied" </dev/null >/dev/null
+  "$OCM" --config "$cfg" --config "$REGISTRY_HTTP_CONFIG" transfer cv "$(_layer_ctf_ref)" "ctf::$copied" </dev/null >/dev/null
   "$OCM" verify cv --config "$BUILD_DIR/verify.ocmconfig" --signature default \
     "ctf::$copied//$REGISTRY_LAYER_COMPONENT:$VERSION" </dev/null >/dev/null
   local copied_type
@@ -293,7 +295,7 @@ EOF
   if REGISTRY_LAYER_DIGEST="$fake" "$OCM" add cv \
       --repository "ctf::$REGISTRY_DEMO_OUT/layer-missing-ctf" \
       --constructor "$REGISTRY_LAYER_CONSTRUCTOR" \
-      --config "$BUILD_DIR/verify.ocmconfig" </dev/null >/dev/null 2>"$err_file"; then
+      --config "$BUILD_DIR/verify.ocmconfig" --config "$REGISTRY_HTTP_CONFIG" </dev/null >/dev/null 2>"$err_file"; then
     rm -f "$err_file"
     die "ocm add cv accepted a layer digest the registry does not hold"
   fi

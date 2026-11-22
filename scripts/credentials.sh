@@ -11,6 +11,9 @@ CREDENTIALS_DEMO_OUT="${CREDENTIALS_DEMO_OUT:-$BUILD_DIR/credentials}"
 CREDENTIALS_DEMO_PORT="${CREDENTIALS_DEMO_PORT:-18441}"
 CREDENTIALS_DEMO_CONSTRUCTOR="$ROOT/components/credentials/component-constructor.yaml"
 CREDENTIALS_OCI_LAYOUT="$ROOT/components/oci/hello-oci-multiarch.oci.tar"
+# The OCI probes target the recording server over plain HTTP. OCM >= 0.25.0 needs plainHTTP for that host; the
+# oci::http:// prefix stays so the request carries scheme=http, which the consumer identities match on.
+CREDENTIALS_HTTP_CONFIG="$CREDENTIALS_DEMO_OUT/plain-http.ocmconfig"
 
 _cred_ref() {
   echo "ctf::${CREDENTIALS_DEMO_CTF}//${CREDENTIALS_COMPONENT}:${VERSION}"
@@ -177,7 +180,7 @@ _probe_oci() {
   local dir="$1" subpath="$2" config="$3"
   mkdir -p "$dir"
   : > "$CREDENTIALS_DEMO_OUT/requests.log"
-  "$OCM" transfer cv --config "$config" "$(_cred_ref)" \
+  "$OCM" transfer cv --config "$config" --config "$CREDENTIALS_HTTP_CONFIG" "$(_cred_ref)" \
     "oci::http://127.0.0.1:${CREDENTIALS_DEMO_PORT}/${subpath}" </dev/null >/dev/null 2>"$dir/stderr" || true
   cp "$CREDENTIALS_DEMO_OUT/requests.log" "$dir/requests.log"
   _selected_from "$dir/requests.log"
@@ -345,6 +348,7 @@ $(_consumer wget team-a-wild "path=team-a/*")" "$CREDENTIALS_DEMO_OUT/scenarios/
 
 mkdir -p "$CREDENTIALS_DEMO_OUT"
 _empty_config
+plain_http_config "$CREDENTIALS_HTTP_CONFIG" "127.0.0.1:${CREDENTIALS_DEMO_PORT}"
 
 case "${1:-}" in
   build)     _build ;;

@@ -99,7 +99,7 @@ Nothing of the application is transferred or applied. Running `bootstrap` again 
 2. Verify the bundle CTF against `public.pem`.
 3. Check that the bundle is self-contained: every resource must be a local blob. A resource that refers to an outside location fails the run and is named in the message.
 4. Find the registry on the `kind` network. Without it, `transfer` fails and says to run `make target-bootstrap`.
-5. Transfer the bundle CTF to `oci::http://<ip>:5000/ocm` with `publish.sh` and `transfer.ocmconfig`. The uploaders store each local OCI image as an OCI artifact the kubelet can pull. `transfer.ocmconfig` gives each `hello-world-image` architecture its own tag (`1.31-alpine-amd64`, `1.31-alpine-arm64`). Without it, both variants would share one tag, and the last upload would win.
+5. Transfer the bundle CTF to `oci::<ip>:5000/ocm` with `publish.sh` and `build/target-transfer.ocmconfig`. That file is `transfer.ocmconfig` plus a `plainHTTP` entry for `<ip>:5000`, because OCM 0.25.0 reaches the registry over plain HTTP only through `http.config.ocm.software/v1alpha1`. The uploaders store each local OCI image as an OCI artifact the kubelet can pull. `transfer.ocmconfig` gives each `hello-world-image` architecture its own tag (`1.31-alpine-amd64`, `1.31-alpine-arm64`). Without it, both variants would share one tag, and the last upload would win.
 6. Verify the registry copy.
 
 ## Deploy
@@ -109,7 +109,7 @@ Nothing of the application is transferred or applied. Running `bootstrap` again 
 1. Find the registry, and check that it holds the component. Without the registry, `deploy` fails and says to run `make target-bootstrap`. Without the component, it says to run `make target-transfer`.
 2. Verify the registry copy against `public.pem` again. `transfer` and `deploy` are separate commands, so the registry may have changed in between.
 3. Download `hello-world-deploy` and `hello-world-instance` from the registry copy, and compare each file's SHA-256 with its descriptor digest.
-4. Apply them with `scripts/controller.sh apply`, with `OCM_CONTROLLER_REPO=http://<ip>:5000/ocm` and `OCM_CONTROLLER_INSECURE=true`.
+4. Apply them with `scripts/controller.sh apply`, with `OCM_CONTROLLER_REPO=<ip>:5000/ocm` and `OCM_CONTROLLER_INSECURE=true`.
 5. Run `scripts/controller.sh check`, then check that every running `hello-world` pod uses an image that starts with `<ip>:5000/`.
 
 The application image is never staged on the nodes. It has to come through the component, so `deploy` can only run it from the registry copy.
@@ -118,7 +118,7 @@ The application image is never staged on the nodes. It has to come through the c
 
 The registry is a container on the `kind` network, so the nodes reach it at its bridge address. The devcontainer uses the host network and can route to that address too, but it cannot resolve container names, so the target side uses the IP address. `scripts/registry.sh` does not serve this path: it publishes on `127.0.0.1` on the default bridge, which the nodes cannot reach.
 
-Plain HTTP is used on purpose. The registry has no TLS certificate, and `hosts.toml` declares the endpoint as `http://<ip>:5000`. The `Repository` and the `HelloWorld` instance carry `http://<ip>:5000/ocm`. `OCM_CONTROLLER_INSECURE=true` sets `insecure: true` on the instance, so the Flux `OCIRepository` also reads the registry over HTTP.
+Plain HTTP is used on purpose. The registry has no TLS certificate, and `hosts.toml` declares the endpoint as `http://<ip>:5000`. The OCM CLI reaches the registry through `build/target-registry.ocmconfig`, which holds a `plainHTTP` entry for `<ip>:5000`. The `Repository` carries `<ip>:5000/ocm` and references the ConfigMap `ocm-plain-http` through `spec.ocmConfig`, which gives the controller the same entry. `OCM_CONTROLLER_INSECURE=true` sets `insecure: true` on the `HelloWorld` instance, so the Flux `OCIRepository` also reads the registry over HTTP.
 
 The component is moved in two hops. The first is the bundle, an archive on disk that crosses the gap. The second is `transfer`, which runs `publish.sh` from the bundle to the registry. The controller then reads the component from the registry copy, so no step needs the original CTF.
 

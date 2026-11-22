@@ -29,6 +29,8 @@ invalidate the signature. See [Signing and verification](signing.md#signing-and-
 Separate the decision from the execution: generate the transfer graph with `--dry-run`,
 review it, then replay the exact same graph with `--transfer-spec` (`make publish` sets this from `TRANSFER_SPEC`):
 
+OCM 0.25.0 and later no longer take plain HTTP from an `http://` prefix. A registry on plain HTTP, such as `localhost:5001`, needs a `plainHTTP` entry for its host in `http.config.ocm.software/v1alpha1` (see [Repository identity](local-oci-registry.md#repository-identity)).
+
 ```sh
 # 1. Dry-run to localhost:5001 — writes build/transfer-plan.json and prints a summary
 make transfer-plan OCM_REPO=oci::http://localhost:5001
@@ -67,6 +69,8 @@ Uploader configs require OCM ≥ 0.19.0; earlier versions load the config file w
 This repository ships `transfer.ocmconfig`, which routes the two `hello-world-image`
 architecture variants to distinct tags by suffixing the tag with `resource.extraIdentity.architecture`. Without it, both variants push to the same
 `nginx:1.31-alpine` tag (last write wins):
+
+OCM 0.25.0 and later no longer take plain HTTP from an `http://` prefix. A registry on plain HTTP, such as `localhost:5001`, needs a `plainHTTP` entry for its host in `http.config.ocm.software/v1alpha1` (see [Repository identity](local-oci-registry.md#repository-identity)).
 
 ```sh
 make transfer-plan OCM_REPO=oci::http://localhost:5001 TRANSFER_CONFIG=transfer.ocmconfig

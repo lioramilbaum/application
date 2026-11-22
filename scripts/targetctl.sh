@@ -27,7 +27,11 @@ BOOTSTRAP_REGISTRY_NAME="${BOOTSTRAP_REGISTRY_NAME:-ocm-bootstrap-registry}"
 # request to the internet fails at once.
 BOOTSTRAP_OFFLINE_PROXY="http://127.0.0.1:9"
 
-registry_ref() { echo "oci::http://$1:5000/ocm//$ROOT_COMPONENT:$VERSION"; }
+registry_ref() { echo "oci::$1:5000/ocm//$ROOT_COMPONENT:$VERSION"; }
+# OCM config that reaches the registry over plain HTTP (OCM >= 0.25.0 ignores an http:// prefix), written by transfer and deploy
+TARGET_REGISTRY_CONFIG="$BUILD_DIR/target-registry.ocmconfig"
+# transfer.ocmconfig plus that plain-HTTP entry: publish.sh loads one TRANSFER_CONFIG
+TARGET_TRANSFER_CONFIG="$BUILD_DIR/target-transfer.ocmconfig"
 
 # _offline_proxy [REGISTRY_IP]: exports the proxy for the host-side tools that the offline subcommands run. NO_PROXY keeps
 # localhost, the API server named in the kubeconfig and the registry reachable. Go clients (ocm, helm, kubectl)
@@ -265,16 +269,18 @@ _transfer() {
   _require_registry
   _offline_proxy "$REGISTRY_IP"
   _wait_registry "$REGISTRY_IP"
+  plain_http_config "$TARGET_REGISTRY_CONFIG" "$REGISTRY_IP:5000"
+  { cat "$ROOT/transfer.ocmconfig"; plain_http_entry "$REGISTRY_IP:5000"; } > "$TARGET_TRANSFER_CONFIG"
 
   # 5. Publish the bundle CTF to the registry. publish.sh inlines the local blobs as OCI artifacts;
   # transfer.ocmconfig gives each hello-world-image architecture its own tag, so variants do not overwrite each other.
-  OCM_COMPONENT_REPO="ctf::$BOOTSTRAP_BUNDLE_DIR/ctf" OCM_REPO="oci::http://$REGISTRY_IP:5000/ocm" \
-    TRANSFER_CONFIG="$ROOT/transfer.ocmconfig" \
+  OCM_COMPONENT_REPO="ctf::$BOOTSTRAP_BUNDLE_DIR/ctf" OCM_REPO="oci::$REGISTRY_IP:5000/ocm" \
+    TRANSFER_CONFIG="$TARGET_TRANSFER_CONFIG" \
     bash "$ROOT/scripts/publish.sh"
 
   # 6. Verify the registry copy
   reg="$(registry_ref "$REGISTRY_IP")"
-  "$OCM" verify cv --config "$verify_cfg" --signature default "$reg" </dev/null >/dev/null \
+  "$OCM" verify cv --config "$verify_cfg" --config "$TARGET_REGISTRY_CONFIG" --signature default "$reg" </dev/null >/dev/null \
     || die "registry copy does not verify against $BOOTSTRAP_BUNDLE_DIR/public.pem"
   echo "transfer verified: $ROOT_COMPONENT:$VERSION in $REGISTRY_IP:5000/ocm"
 }
@@ -295,14 +301,15 @@ _deploy() {
   _require_registry
   _offline_proxy "$REGISTRY_IP"
   _wait_registry "$REGISTRY_IP"
+  plain_http_config "$TARGET_REGISTRY_CONFIG" "$REGISTRY_IP:5000"
   reg="$(registry_ref "$REGISTRY_IP")"
-  "$OCM" get cv "$reg" -o json </dev/null >/dev/null 2>&1 || \
+  "$OCM" get cv --config "$TARGET_REGISTRY_CONFIG" "$reg" -o json </dev/null >/dev/null 2>&1 || \
     die "component $ROOT_COMPONENT:$VERSION is not in the registry at $REGISTRY_IP:5000 (transfer it first: make target-transfer)"
 
   # 3. The registry copy is still signed by the bundled key: its descriptor digests are trusted below
   verify_cfg="$BOOTSTRAP_VERIFY_CONFIG"
   _verify_config "$BOOTSTRAP_BUNDLE_DIR/public.pem" "$verify_cfg"
-  "$OCM" verify cv --config "$verify_cfg" --signature default "$reg" </dev/null >/dev/null \
+  "$OCM" verify cv --config "$verify_cfg" --config "$TARGET_REGISTRY_CONFIG" --signature default "$reg" </dev/null >/dev/null \
     || die "registry copy does not verify against $BOOTSTRAP_BUNDLE_DIR/public.pem"
 
   # 4. Take the controller manifests from the registry copy and check each against its descriptor digest
@@ -310,8 +317,8 @@ _deploy() {
   rm -rf "$work"
   mkdir -p "$work"
   for name in hello-world-deploy hello-world-instance; do
-    "$OCM" download resource "$reg" --identity "name=$name" --output "$work/$name.yaml" </dev/null >/dev/null
-    desc="$("$OCM" get cv "$reg" -o json </dev/null \
+    "$OCM" download resource --config "$TARGET_REGISTRY_CONFIG" "$reg" --identity "name=$name" --output "$work/$name.yaml" </dev/null >/dev/null
+    desc="$("$OCM" get cv --config "$TARGET_REGISTRY_CONFIG" "$reg" -o json </dev/null \
       | jq -r --arg n "$name" '.[0].component.resources[] | select(.name==$n) | .digest.value')"
     actual="$(sha256 "$work/$name.yaml")"
     [[ -n "$desc" && "$actual" == "$desc" ]] || \
@@ -319,7 +326,7 @@ _deploy() {
   done
 
   # 5. Apply the component's deploy manifest and instance, with the controller pointed at the registry
-  OCM_CONTROLLER_REPO="http://$REGISTRY_IP:5000/ocm" OCM_CONTROLLER_INSECURE=true \
+  OCM_CONTROLLER_REPO="$REGISTRY_IP:5000/ocm" OCM_CONTROLLER_INSECURE=true \
     DEPLOY_FILE="$work/hello-world-deploy.yaml" \
     INSTANCE_FILE="$work/hello-world-instance.yaml" \
     E2E_KUBECONFIG="$KUBECONFIG" \
