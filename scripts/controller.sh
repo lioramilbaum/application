@@ -13,7 +13,7 @@ export KIND_CLUSTER
 OCM_CONTROLLER_CHART_VERSION="0.25.0"
 # Renovate tracks kro release tags (v0.9.4); the chart is published as 0.9.4, so the v is dropped for helm
 KRO_CHART_VERSION="v0.10.0"
-FLUX_VERSION="v2.10.0"
+FLUX_VERSION="v2.10.1"
 
 OCM_CONTROLLER_REPO="${OCM_CONTROLLER_REPO:-ghcr.io/lioramilbaum/ocm}"
 # Chart registry references. A local .tgz path installs offline (scripts/sourcectl.sh reads these two constants).
