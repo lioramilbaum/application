@@ -58,8 +58,28 @@ require_darwin_arm64() {
 cv_ref() {
   local component="${1:-$ROOT_COMPONENT}"
   # OCM_COMPONENT_REPO overrides the CTF for registry-sourced components,
-  # e.g. OCM_COMPONENT_REPO=oci::http://localhost:5001
+  # e.g. OCM_COMPONENT_REPO=oci::localhost:5001
   echo "${OCM_COMPONENT_REPO:-ctf::${CTF}}//${component}:${VERSION}"
+}
+
+# plain_http_entry HOST:PORT...: prints an http.config.ocm.software/v1alpha1 list item that reaches each
+# HOST:PORT over plain HTTP. OCM >= 0.25.0 takes plain HTTP only from this config; an http:// prefix
+# on a registry reference is deprecated and, without plainHTTP for its host, an error.
+plain_http_entry() {
+  local host
+  printf '  - type: http.config.ocm.software/v1alpha1\n    hosts:\n'
+  for host in "$@"; do
+    [[ "$host" =~ ^[A-Za-z0-9.:_-]+$ ]] || die "plain HTTP host must be host[:port], got '$host'"
+    printf '      "%s":\n        plainHTTP: true\n' "$host"
+  done
+}
+
+# plain_http_config OUT HOST:PORT...: writes an OCM config holding only plain_http_entry
+plain_http_config() {
+  local out="$1"
+  shift
+  mkdir -p "$(dirname "$out")"
+  { printf 'type: generic.config.ocm.software/v1\nconfigurations:\n'; plain_http_entry "$@"; } > "$out"
 }
 
 die() {

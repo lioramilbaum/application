@@ -52,6 +52,8 @@ The chart resource is an OCI image manifest stored as a local blob:
 | `input: type: helm/v1` (`path:`) | `helmChart` | A local chart directory with a `Chart.yaml` | Packages the directory into a `LocalBlob/v1` artifact |
 | `access: type: Helm/v1` (`helmRepository:`, `helmChart:`) | `helmChart` | A chart in a Helm repository | Fetches the repository index; the build fails with `error downloading repository index` if the repository is unreachable |
 
+An `http://` `helmRepository` needs plain HTTP for its host from OCM 0.25.0 on. Without `plainHTTP` for that host in `http.config.ocm.software/v1alpha1`, `ocm add cv` fails. See [Local OCI registry](local-oci-registry.md#repository-identity) for the config format.
+
 Use an absolute `path` (`${ROOT}/…`) in the constructor. OCM before 0.21 resolves a relative `helm/v1` path against the process working directory and ignores `--working-directory` (fixed upstream in #3901).
 
 ### Consuming the chart

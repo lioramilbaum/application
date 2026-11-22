@@ -10,7 +10,7 @@ KIND_CLUSTER="${KIND_CLUSTER:-ocm-controller}"
 export KUBECONFIG="${E2E_KUBECONFIG:-$BUILD_DIR/controller/kubeconfig}"
 export KIND_CLUSTER
 
-OCM_CONTROLLER_CHART_VERSION="0.24.0"
+OCM_CONTROLLER_CHART_VERSION="0.25.0"
 # Renovate tracks kro release tags (v0.9.4); the chart is published as 0.9.4, so the v is dropped for helm
 KRO_CHART_VERSION="v0.10.0"
 FLUX_VERSION="v2.10.0"
@@ -27,7 +27,8 @@ DEPLOY_FILE="${DEPLOY_FILE:-$ROOT/k8s/controller/deploy.yaml}"
 INSTANCE_FILE="${INSTANCE_FILE:-$ROOT/k8s/controller/instance.yaml}"
 # Controller RBAC, applied by install on both the online and the air-gapped path
 CONTROLLER_RBAC_FILE="$ROOT/k8s/controller/rbac.yaml"
-# OCM_CONTROLLER_INSECURE=true sets insecure: true on the HelloWorld instance (plain-HTTP registry).
+# OCM_CONTROLLER_INSECURE=true sets insecure: true on the HelloWorld instance, and plain HTTP for the host of
+# OCM_CONTROLLER_REPO through the ocm-plain-http ConfigMap the Repository references (plain-HTTP registry).
 OCM_CONTROLLER_INSECURE="${OCM_CONTROLLER_INSECURE:-false}"
 
 _install() {
@@ -102,23 +103,40 @@ _assert_rendered() {
     die "$file does not render $kind $name with '$line': its patch target matched nothing, or the file no longer carries the shipped values (see docs/controller.md)"
 }
 
+# ConfigMap the Repository references for a plain-HTTP registry (OCM_CONTROLLER_INSECURE=true)
+PLAIN_HTTP_CONFIGMAP="ocm-plain-http"
+
+# _plain_http_configmap HOST[:PORT]: prints the ConfigMap whose .ocmconfig enables plain HTTP for HOST[:PORT].
+# Its namespace is the Repository's in k8s/controller/deploy.yaml.
+_plain_http_configmap() {
+  printf 'apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: %s\n  namespace: default\ndata:\n  .ocmconfig: |\n' "$PLAIN_HTTP_CONFIGMAP"
+  { printf 'type: generic.config.ocm.software/v1\nconfigurations:\n'; plain_http_entry "$1"; } | sed 's/^/    /'
+}
+
 _apply() {
   require "$KUBECTL" jq
-  local render="$BUILD_DIR/controller/render" insecure_ops='[]'
+  local render="$BUILD_DIR/controller/render" insecure_ops='[]' repo_ops='[]' plain_host="" plain_cm=""
   local deploy_patches instance_patches deploy_rendered instance_rendered
   [[ "$OCM_CONTROLLER_INSECURE" == true || "$OCM_CONTROLLER_INSECURE" == false ]] || \
     die "OCM_CONTROLLER_INSECURE must be true or false (got: $OCM_CONTROLLER_INSECURE)"
   if [[ "$OCM_CONTROLLER_INSECURE" == true ]]; then
     insecure_ops='[{"op":"add","path":"/spec/insecure","value":true}]'
+    # OCM >= 0.25.0 reaches a registry over plain HTTP only when its HTTP config says so; an http:// prefix
+    # on baseUrl alone is rejected. The Repository reads that config from a ConfigMap, and the Component and
+    # Resources inherit it (ocmConfig policy Propagate).
+    plain_host="${OCM_CONTROLLER_REPO#*://}"
+    plain_host="${plain_host%%/*}"
+    plain_cm="$(_plain_http_configmap "$plain_host")"
+    repo_ops="$(jq -cn --arg cm "$PLAIN_HTTP_CONFIGMAP" '[{op: "add", path: "/spec/ocmConfig", value: [{kind: "ConfigMap", name: $cm}]}]')"
   fi
   # Each patch tests the shipped value before it replaces it, so a manifest that drifted
   # from the defaults fails the render instead of being applied unchanged.
-  deploy_patches="$(jq -cn --arg repo "$OCM_CONTROLLER_REPO" '[{
+  deploy_patches="$(jq -cn --arg repo "$OCM_CONTROLLER_REPO" --argjson extra "$repo_ops" '[{
     target: {kind: "Repository", name: "application-repository"},
     patch: ([
       {op: "test", path: "/spec/repositorySpec/baseUrl", value: "ghcr.io/lioramilbaum/ocm"},
       {op: "replace", path: "/spec/repositorySpec/baseUrl", value: $repo}
-    ] | tojson)
+    ] + $extra | tojson)
   }]')"
   instance_patches="$(jq -cn --arg arch "$TARGET_ARCH" --argjson extra "$insecure_ops" '[{
     target: {kind: "HelloWorld", name: "hello-world"},
@@ -135,9 +153,11 @@ _apply() {
   _assert_rendered "$instance_rendered" "$INSTANCE_FILE" HelloWorld hello-world "architecture: $TARGET_ARCH"
   if [[ "$OCM_CONTROLLER_INSECURE" == true ]]; then
     _assert_rendered "$instance_rendered" "$INSTANCE_FILE" HelloWorld hello-world "insecure: true"
+    _assert_rendered "$deploy_rendered" "$DEPLOY_FILE" Repository application-repository "name: $PLAIN_HTTP_CONFIGMAP"
   fi
 
-  printf '%s\n' "$deploy_rendered" | "$KUBECTL" apply -f -
+  # The plain-HTTP ConfigMap goes first, so the Repository finds it on its first reconcile
+  { [[ -z "$plain_cm" ]] || printf '%s\n---\n' "$plain_cm"; printf '%s\n' "$deploy_rendered"; } | "$KUBECTL" apply -f -
   "$KUBECTL" wait --for=condition=Ready \
     repository/application-repository \
     component/application \
